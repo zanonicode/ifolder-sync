@@ -126,7 +126,7 @@ class ICloudClient:
     def connect(self, interactive: bool = True, fresh: bool = False) -> None:
         """Authenticate and, if needed, run 2FA. The trusted session (cookies +
         trust token) lives in state_dir, so after one successful 2FA the daemon
-        connects without a code (Apple trusts the session ~30 days). Password comes
+        connects without a code (Apple trusts the session ~90 days observed). Password
         from env IFOLDER_SYNC_PASSWORD, the Keychain, or a prompt, in that order; a
         prompt-sourced password is stored in the Keychain for the non-interactive
         daemon.

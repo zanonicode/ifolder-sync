@@ -6,34 +6,41 @@ folder — **every X seconds** (remote polling) **and on every local change** (r
 FSEvents watcher). Built for an **Obsidian vault**, with safe handling of the
 `.obsidian/` config folder.
 
-## Why this is not trivial (read first)
+> Imagine you're on a Mac signed into one user account, and you'd really like a
+> *single specific folder* from a **different iCloud account** to stay in sync right
+> there — without signing that whole account in, creating another macOS user, or
+> syncing its entire iCloud Drive. That's the itch ifolder-sync was built to scratch.
 
-macOS only natively syncs the iCloud Drive of the **Apple ID signed into the system**.
-There is no way to locally mount the Drive of a *second* account. So this project
-reaches the other account through the **unofficial iCloud web API**, via
-[`pyicloud`](https://github.com/picklepete/pyicloud):
+> [!WARNING]
+> **Read before using.**
+>
+> - This is **not** an official Obsidian plugin. It is not affiliated with, endorsed
+>   or reviewed by the Obsidian team (nor by Apple).
+> - This daemon is **alpha software**, built for the author's personal use, and has
+>   **not been widely validated**.
+> - **Do not point it at a vault you don't have a full backup of.** Bidirectional
+>   sync over a reverse-engineered API can fail in unforeseen ways; there is no way
+>   to guarantee a sync will never misbehave, so **there are no guarantees of any
+>   kind** (see the MIT license).
+> - **Use at your own risk.**
+>
+> That said, the engine is built defensively: soft-delete trash on both sides,
+> `--dry-run` previews, a mass-deletion threshold, and abort-on-partial-visibility
+> guards — see [Safety & resilience](#safety--resilience).
 
-- You authenticate with the **Apple ID + password + 2FA** of the account to sync.
-- The session (cookies + trust token) is saved, so 2FA is asked **once** (Apple trusts
-  the session for ~30 days).
-- **Honest limitations:** this is reverse-engineered Apple API — it can break when
-  Apple changes things, has no SLA or official support, and is subject to rate
-  limiting. Use it with an account you control and keep a backup.
+## Requirements
 
-### Change detection
-
-| Side | How it is detected | Latency |
-|------|--------------------|---------|
-| **Local** | FSEvents watcher (`watchdog`), debounced | near-instant |
-| **Remote (iCloud)** | polling every `interval_seconds` | up to the interval |
-
-There is no iCloud webhook — remote changes only appear on the next poll. Because the
-watcher catches local edits almost instantly, the poll only needs to detect remote
-(phone) changes, so an aggressive interval is rarely useful (`>=30s` recommended).
+- **macOS** (developed and tested on macOS 26 only; earlier versions untested).
+- **Python ≥ 3.9** (the system Python works).
+- An **Apple ID you control**, with two-factor authentication and its **primary
+  password** (app-specific passwords do not work — see [Password](#password)).
 
 ## Install
 
+Not yet published on PyPI — install from source:
+
 ```bash
+git clone https://github.com/zanonicode/ifolder-sync.git
 cd ifolder-sync
 python3 -m venv .venv
 source .venv/bin/activate
@@ -44,6 +51,62 @@ pip install -e ".[dev]"
 
 > The system Python (3.9, LibreSSL) emits a harmless `NotOpenSSLWarning`. To silence
 > it, use a Homebrew/pyenv Python built against OpenSSL.
+
+## Quick start
+
+Three commands after installing:
+
+```bash
+ifolder-sync init --obsidian   # interactive setup: Apple ID, iCloud folder, local folder
+                               # (drop --obsidian if the folder is not an Obsidian vault)
+ifolder-sync auth              # log into that iCloud account — one-time 2FA, then the
+                               # session is trusted (~90 days observed)
+ifolder-sync start --background
+```
+
+That's it — **set it up once and forget it**. The last command hands the daemon to
+**launchd**, macOS's own service manager, so it now **survives logouts, reboots and
+crashes** on its own: it starts at every login (`RunAtLoad`), gets restarted if it ever
+crashes (`KeepAlive`), and there is no extra "add to startup" step. The only thing that
+turns it off is you: `ifolder-sync stop`.
+
+```bash
+ifolder-sync status            # is it running? session valid? when was the last sync?
+ifolder-sync logs -f           # watch it work in real time
+ifolder-sync stop              # stop it (also disables the automatic start at login)
+```
+
+> **Where to put the vault:** not under `~/Downloads`, `~/Desktop` or `~/Documents` —
+> macOS privacy protection (TCC) blocks background daemons from reading those folders.
+> Use something like `~/vaults/<name>`.
+
+## Why this is not trivial
+
+macOS only natively syncs the iCloud Drive of the **Apple ID signed into the system**.
+There is no way to locally mount the Drive of a *second* account. So this project
+reaches the other account through the **unofficial iCloud web API**, via
+[`pyicloud`](https://github.com/picklepete/pyicloud):
+
+- You authenticate with the **Apple ID + password + 2FA** of the account to sync.
+- The session (cookies + trust token) is saved, so 2FA is asked **once** (Apple trusts
+  the session for roughly **90 days**, as observed).
+- **Honest limitations:** this is reverse-engineered Apple API — it can break when
+  Apple changes things, has no SLA or official support, and is subject to rate
+  limiting. Use it with an account you control and keep a backup.
+- **Advanced Data Protection (ADP) is incompatible:** enabling ADP on the Apple ID
+  ends web-API access to iCloud Drive entirely (this affects every tool in this
+  space, not just this one).
+
+### Change detection
+
+| Side | How it is detected | Latency |
+|------|--------------------|---------|
+| **Local** | FSEvents watcher (`watchdog`), debounced | near-instant |
+| **Remote (iCloud)** | polling every `interval_seconds` (faster while changes flow) | seconds to the interval |
+
+There is no iCloud webhook — remote changes only appear on the next poll. Polling is
+adaptive: while changes flowed recently the daemon polls every
+`interval_active_seconds` (default 20s), then settles back to `interval_seconds`.
 
 ## Usage
 
@@ -58,11 +121,11 @@ ifolder-sync sync --force-delete  # apply deletions even past the safety thresho
 ifolder-sync start                # run the daemon in foreground (poll + watch)
 ifolder-sync start --background   # run it detached via launchd (returns your terminal)
 ifolder-sync stop                 # stop the background (launchd) daemon
-ifolder-sync status               # show ALL profiles' state (one in detail with --profile)
+ifolder-sync status               # show every profile's state (--profile <name> for just one)
 ifolder-sync logs -f              # tail the daemon log and keep following (Ctrl-C stops)
 ifolder-sync rebaseline           # reset the baseline (backup first) after the vault moved/drifted
 ifolder-sync purge-trash          # empty the local soft-delete trash
-ifolder-sync install-agent        # generate a launchd LaunchAgent to run at login
+ifolder-sync install-agent        # generate the launchd LaunchAgent without loading it
 ```
 
 ### Password
@@ -80,19 +143,15 @@ The password is **not** stored in a file. Resolution order:
 > with iCloud Drive via pyicloud (they are only accepted by legacy IMAP/CalDAV/CardDAV)
 > — Apple rejects them in the web/SRP flow used here.
 
-### Where the 2FA code shows up (important)
+### Where the 2FA code shows up
 
 Apple's 6-digit 2FA code **does not arrive by SMS or email** by default. It appears as
 a **system pop-up** ("Sign-In Request") on the Apple devices signed into this account —
 tap **"Allow"** to see the digits. (An SMS fallback is available too.)
 
-> **⚠️ Apple change (~iOS 26 / early 2026):** on API logins (like this one) Apple
-> **stopped auto-sending the code** after login. The client must **request the push
-> explicitly** — and pyicloud 2.0.1 does not, which caused the "asks for a code but
-> none arrives" symptom. `ifolder-sync` now **triggers the push itself** when starting
-> 2FA (`PUT .../verify/trusteddevice/securitycode`).
-
-Run `ifolder-sync auth`. The 2FA flow is interactive:
+Run `ifolder-sync auth`. The 2FA flow is interactive — and ifolder-sync requests the
+push itself, so the classic "asks for a code but none ever arrives" failure of
+API-based logins is already handled:
 
 ```
 2FA code | [r]esend push | [s]ms | [d]iag | Enter=cancel:
@@ -103,12 +162,6 @@ Run `ifolder-sync auth`. The 2FA flow is interactive:
 - **`s`** = send the code by **SMS** to a trusted phone (fallback when the pop-up never
   appears — e.g. no Apple device nearby);
 - **`d`** = diagnostics (`hsaVersion`, 2fa/2sa flags, trusted session, trusted phones).
-
-If it gets stuck ("invalid code too many times", or a stale session interfering):
-
-```bash
-ifolder-sync auth --fresh   # discard the saved session and log in from scratch
-```
 
 ## Obsidian: how `.obsidian/` is handled
 
@@ -136,7 +189,11 @@ desirable (desktop and mobile often want different appearance/layout).
 > **Obsidian config is opt-in (`obsidian: true`).** When enabled, the volatile patterns
 > are applied automatically *on top of* your `ignore` list (not stored in it) — see
 > `Config.effective_ignore`. Enable with `ifolder-sync init --obsidian`, or add
-> `"obsidian": true` to an existing `config.json`.
+> `"obsidian": true` to an existing config.
+>
+> Some plugins keep **live per-device state** in their `data.json` and treat any
+> external writer as corruption (e.g. Iconic). If a plugin complains after device
+> switches, exclude its state per vault: add `plugins/<id>/data.json*` to `ignore`.
 
 ## Ignored files (`ignore`)
 
@@ -155,15 +212,15 @@ Patterns apply on **both sides** and match at **any depth** (root *and* subfolde
 | `.trash/` | `.trash/old.md`, `notes/.trash/x/y.md` | `.trashcan/x` |
 | `*.icloud` | `a/b/foo.icloud` | `notes/icloud.md` |
 
-**Default patterns:** `.DS_Store`, `.Trash`, `*.icloud`, `*.conflict-*`, plus the
-Obsidian config-local set listed above.
+**Default patterns:** `.DS_Store`, `.Trash`, `*.icloud`, `*.conflict-*`, `*.part`,
+plus the Obsidian config-local set listed above when `obsidian: true`.
 
 ## Conflict policy
 
 When **both sides change** the same file between two syncs:
 
 - `newer` (default): the newer `mtime` wins; the loser is saved as
-  `name.conflict-YYYYMMDD-HHMMSS.ext`.
+  `name.conflict-YYYYMMDD-HHMMSS.ext` (locally, never synced) — nothing is lost.
 - `local` / `remote`: the chosen side always wins.
 - `both`: keep both (the remote version becomes a `.conflict-…` file).
 
@@ -172,7 +229,7 @@ When **both sides change** the same file between two syncs:
 - **Walk guard (both sides):** if the remote listing fails (network/auth) **or the
   local scan hits a permission error / missing vault root**, the pass aborts with
   **zero deletions** instead of mistaking partial visibility for "everything was
-  deleted". (macOS TCC blindness used to look exactly like a mass local delete.)
+  deleted".
 - **Vault identity marker:** a local-only `.ifolder-sync-vault` file ties the baseline
   to the folder it was built from. If the vault is moved or recreated, the daemon stops
   with "vault identity mismatch" instead of deriving phantom deletions — recover with
@@ -193,15 +250,17 @@ When **both sides change** the same file between two syncs:
 - **Download tempfiles:** in-flight `*.part` files are engine-ignored and can never be
   uploaded back to iCloud.
 - **Soft-delete (recoverable):** local deletions move to a trash under
-  `~/.config/ifolder-sync/state/trash/` (outside the vault). Remote deletions go to
-  iCloud's "Recently Deleted" (`remote_trash`, default on). `status` shows the local
-  trash count; `purge-trash` empties it.
+  `~/.config/ifolder-sync/state/<profile>/trash/` (outside the vault). Remote deletions
+  go to iCloud's "Recently Deleted" (`remote_trash`, default on; recoverable ~30 days).
+  `status` shows the local trash count; `purge-trash` empties it.
 - **Retries:** transient iCloud / rate-limit errors are retried with exponential
   backoff (`max_retries`, default 3).
-- **Single-instance lock:** a PID lockfile (`state/daemon.lock`) stops two daemons from
-  racing the baseline; a lock left by a dead process is reclaimed automatically.
-- **Credential perms:** the session/cookie files are set to `0600` (bearer credentials);
-  downloads are path-traversal safe (a remote name cannot escape the vault root).
+- **Single-instance lock:** a PID lockfile (`state/<profile>/daemon.lock`) stops two
+  daemons from racing the baseline; a lock left by a dead process is reclaimed
+  automatically. A manual `sync` refuses to run while the daemon is up.
+- **Credential perms:** the session/cookie files are kept `0600` in a `0700` directory
+  (bearer credentials); downloads are path-traversal safe (a remote name cannot escape
+  the vault root).
 
 > Full component map, sync-pass sequence diagram, safety model and performance model:
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -209,21 +268,19 @@ When **both sides change** the same file between two syncs:
 ## How the bidirectional sync works
 
 The engine keeps a **three-way baseline** in SQLite
-(`~/.config/ifolder-sync/state/baseline.sqlite3`): the signature (size + mtime) of each
-file **as it was at the last sync**, per side. Each pass compares the current state of
-each side against that baseline:
+(`~/.config/ifolder-sync/state/<profile>/baseline.sqlite3`): the signature
+(size + mtime) of each file **as it was at the last sync**, per side. Each pass
+compares the current state of each side against that baseline:
 
 - changed on one side only → copy to the other;
 - changed on both sides → **conflict** (resolved by policy);
 - gone from one side without having changed → propagate the deletion.
 
 That is what tells "new file here" apart from "file deleted there" — without the
-baseline, the two would look identical.
-
-Each pass **decides** every action first, then **applies** them. This is what makes
-`--dry-run` (decide, don't apply), the delete threshold (count deletes before
-applying), and soft-delete possible. Uploads stamp the remote mtime = local mtime, so
-no extra `stat()` round-trip is needed and there is no upload→download ping-pong.
+baseline, the two would look identical. Each pass **decides** every action first, then
+**applies** them (enabling `--dry-run` and the delete threshold). Remote scans are
+cheap: iCloud folder etags fingerprint whole subtrees, so unchanged folders are served
+from cache and a no-change pass costs about one network call.
 
 ## Profiles (sync multiple folders)
 
@@ -242,50 +299,48 @@ Layout:
 ```
 ~/.config/ifolder-sync/
   profiles/<name>.json        # one config per profile
-  state/<name>/               # per-profile baseline.sqlite3, trash/, daemon.lock
+  state/<name>/               # per-profile baseline.sqlite3, trash/, daemon.lock, logs/
   state/sessions/             # iCloud sessions, shared and keyed by Apple ID
 ```
 
 - **Isolation:** a failed scan or crash in one profile never touches another's baseline.
 - **Sessions are shared per Apple ID:** profiles on the same account reuse one trusted
   session (one 2FA); different accounts get separate sessions automatically.
-- **launchd:** `install-agent --profile work` generates `com.ifolder-sync.work.plist`.
 - **Back-compat:** a pre-profiles setup (`config.json` + `state/`) is migrated **once,
-  automatically** to the `default` profile on the next command — your session and
-  baseline are preserved.
+  automatically** to the `default` profile on the next command.
 
-## Run in the background / at boot (launchd)
+## Run in the background (launchd details)
 
-Foreground `start` is great for debugging. To detach the daemon — it keeps running after
-you close the terminal, restarts on crash (launchd `KeepAlive`), and starts again at each
-login (`RunAtLoad`) — hand it to launchd:
+`start --background` (see [Quick start](#quick-start)) generates
+`~/Library/LaunchAgents/com.ifolder-sync.<profile>.plist` and `launchctl load`s it —
+one agent per profile. Logs go to `~/.config/ifolder-sync/state/<profile>/logs/`.
 
-```bash
-ifolder-sync auth                 # IMPORTANT: authenticate FIRST (the daemon runs non-interactively)
-ifolder-sync start --background   # generate the LaunchAgent + launchctl load, in one step
-ifolder-sync stop                 # unload it (stops now and at future logins)
-```
-
-`start --background` generates `~/Library/LaunchAgents/com.ifolder-sync.<profile>.plist`
-(label `com.ifolder-sync.default` for the default profile) and loads it. Logs go to
-`~/.config/ifolder-sync/state/<profile>/logs/`. `install-agent` does the same generation
-*without* loading, if you prefer to drive `launchctl` yourself.
-
-> **Vault location matters:** do NOT keep the vault under `~/Downloads`, `~/Desktop`
-> or `~/Documents`. macOS TCC blocks launchd daemons from reading those folders (a
-> Terminal-started daemon works, which masks the problem). Use e.g. `~/vaults/<name>`,
-> or grant the daemon Full Disk Access. `init` and `start --background` warn about this.
+- **Survives logouts and reboots:** the agent is registered with launchd, so after any
+  reboot the cycle is simply *boot → log in → it's already running*. Technically it
+  starts at **login**, not at raw boot — LaunchAgents run inside your user session,
+  which is deliberate: the daemon needs your login Keychain (Apple ID password) and
+  your user's file permissions. `stop` disables it persistently until the next
+  `start --background`.
+- `install-agent` does the same generation *without* loading, if you prefer to drive
+  `launchctl` yourself.
+- **Authenticate first** (`ifolder-sync auth`): the background daemon runs
+  non-interactively and cannot answer a 2FA prompt; it exits cleanly (with a logged
+  error) when it cannot authenticate.
+- The vault-location (TCC) restriction from [Quick start](#quick-start) applies
+  especially here.
 
 ## Configuration
 
-Each profile's config lives at `~/.config/ifolder-sync/profiles/<name>.json` (see Profiles):
+Each profile's config lives at `~/.config/ifolder-sync/profiles/<name>.json`:
 
 | Field | Meaning | Default |
 |-------|---------|---------|
 | `apple_id` | Apple ID of the iCloud account to sync | — |
 | `remote_folder` | Subfolder inside iCloud Drive (empty = root) | `""` |
 | `local_folder` | Mirrored local folder | — |
-| `interval_seconds` | Remote poll interval (warns if `<30`) | `60` |
+| `interval_seconds` | Remote poll interval when idle (warns if `<30`) | `60` |
+| `interval_active_seconds` | Poll interval while changes flowed recently | `20` |
+| `active_window_seconds` | How long the fast cadence lasts after a change | `300` |
 | `watch_local` | Enable the real-time local FS watcher | `true` |
 | `debounce_seconds` | Quiet time before syncing after local events | `3.0` |
 | `conflict_policy` | `newer` \| `local` \| `remote` \| `both` | `newer` |
@@ -295,7 +350,39 @@ Each profile's config lives at `~/.config/ifolder-sync/profiles/<name>.json` (se
 | `remote_trash` | Remote delete → iCloud Recently Deleted | `true` |
 | `delete_threshold_pct` | Pause deletes above this % of tracked files | `50` |
 | `delete_threshold_count` | Pause deletes above this many files | `100` |
+| `walk_workers` | Concurrent remote folder listings (1 = serial) | `4` |
+| `full_walk_interval_seconds` | Max etag-cache age before a full remote walk (0 = no cache) | `600` |
 | `ignore` | Patterns ignored on both sides (see above) | see defaults |
+
+## Troubleshooting
+
+- **Is it actually running?** `ifolder-sync status` (daemon liveness + session
+  validity) and `ifolder-sync logs -f` (live activity).
+- **2FA stuck / "invalid code too many times" / no code arrives:**
+  `ifolder-sync auth --fresh` discards the saved session and logs in from scratch.
+- **Moved or recreated the vault folder** (or "vault identity mismatch"):
+  `ifolder-sync rebaseline`, then `sync --dry-run` to preview the recovery.
+- **Daemon sees nothing / permission errors:** the vault is probably under
+  `~/Downloads`, `~/Desktop` or `~/Documents` (TCC) — move it.
+- Before trusting any big operation: `ifolder-sync sync --dry-run`.
+
+## Uninstall / upgrade
+
+```bash
+# upgrade (from the clone)
+git pull && pip install -e .
+ifolder-sync stop && ifolder-sync start --background   # reload the daemon
+
+# uninstall
+ifolder-sync stop                                  # per profile, if backgrounded
+rm -f ~/Library/LaunchAgents/com.ifolder-sync.*.plist
+rm -rf ~/.config/ifolder-sync                      # configs, state, sessions, local trash
+pip uninstall ifolder-sync
+```
+
+The Keychain entry (the Apple ID password saved by `auth`) can be removed with the
+Keychain Access app if desired. Your vault and the remote iCloud folder are never
+touched by uninstalling.
 
 ## Tests & development
 
@@ -308,22 +395,10 @@ Each profile's config lives at `~/.config/ifolder-sync/profiles/<name>.json` (se
 
 The suite uses an **in-memory fake iCloud** and covers the bidirectional matrix
 (create/edit/delete both sides, idempotence, conflict), the Obsidian taxonomy, and the
-safety guards (walk guard, delete threshold, path traversal, single-instance lock,
-soft-delete, dry-run, no post-upload stat).
+safety guards (walk guards, delete threshold, path traversal, locking, soft-delete,
+dry-run, settle guard, etag cache). Code layout and design rationale live in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Structure
+## License
 
-```
-ifolder_sync/
-  obsidian.py       # .obsidian taxonomy: volatile config vs shared assets
-  config.py         # JSON config in ~/.config/ifolder-sync/ + ignore defaults
-  state.py          # three-way baseline (SQLite) + status meta
-  icloud_client.py  # pyicloud wrapper: auth/2FA + Drive ops by path
-  syncer.py         # bidirectional engine (decide → apply) + conflict policy
-  retry.py          # exponential backoff for transient errors
-  trash.py          # local soft-delete (recoverable)
-  locking.py        # single-instance PID lock with stale reclaim
-  watcher.py        # local FSEvents watcher with debounce
-  daemon.py         # main loop: poll + watch, single lock, signals
-  cli.py            # init / auth / sync / start / status / purge-trash / install-agent
-```
+[MIT](LICENSE) — © 2026 Vitor Zanoni. Provided as-is, without warranty of any kind.
