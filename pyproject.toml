@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifolder-sync"
+version = "0.8.1"
+description = "Bidirectional sync daemon between a specific iCloud Drive folder and a local folder on macOS."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://github.com/zanonicode/ifolder-sync"
+dependencies = [
+    "pyicloud>=2.0.0",
+    "watchdog>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+    "black>=23.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+ifolder-sync = "ifolder_sync.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ifolder_sync*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
