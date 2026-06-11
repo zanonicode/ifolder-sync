@@ -188,6 +188,10 @@ class Config:
     # timeout=None by default, so one hung socket would wedge the daemon forever; a
     # timeout turns the hang into a retryable error. <=0 disables (no timeout).
     request_timeout_seconds: int = 60
+    # After each successful pass that changed something, the daemon snapshots the
+    # baseline DB into a ring of this many rotated copies (recovery net for corruption;
+    # never auto-recreated). 0 disables.
+    baseline_backups: int = 5
     # Remote walk = one listing call per folder; folders on the same depth level are
     # listed concurrently with this many workers (1 = serial).
     walk_workers: int = 4
@@ -240,6 +244,7 @@ class Config:
             "active_window_seconds",
             "full_walk_interval_seconds",
             "request_timeout_seconds",
+            "baseline_backups",
         ):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f"`{name}` must be an integer.")

@@ -24,12 +24,62 @@ class BaselineEntry:
     remote_mtime: float
 
 
+class CorruptBaselineError(RuntimeError):
+    """The baseline SQLite file is unreadable or fails an integrity check. It is never
+    silently re-created (an empty baseline reads as mass create/delete next pass);
+    recovery is an explicit `ifolder-sync rebaseline` (backup + fresh additive pass)."""
+
+
+_CORRUPT_HINT = "run `ifolder-sync rebaseline` to back it up and start a fresh baseline"
+
+
 class StateStore:
     def __init__(self, db_path: Path):
-        self.db_path = db_path
+        self.db_path = Path(db_path)
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+        try:
+            self._configure()
+            self._init_schema()
+        except sqlite3.DatabaseError as exc:
+            self.conn.close()
+            raise CorruptBaselineError(
+                f"baseline at {self.db_path} is unreadable ({exc}); {_CORRUPT_HINT}"
+            ) from exc
+
+    def _configure(self) -> None:
+        # WAL: a reader (`status`) never blocks the daemon's writer and vice-versa.
+        # busy_timeout: a brief lock during a checkpoint waits instead of raising the
+        # raw "database is locked" that used to crash `status`.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+
+    def quick_check(self) -> None:
+        """Raise CorruptBaselineError if the database fails SQLite's integrity check.
+        Run at daemon start so a silently-corrupted baseline stops the daemon (with a
+        rebaseline hint) instead of being read as empty (which would mass create/delete)."""
+        try:
+            rows = self.conn.execute("PRAGMA quick_check").fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise CorruptBaselineError(
+                f"baseline at {self.db_path} failed its integrity check ({exc}); {_CORRUPT_HINT}"
+            ) from exc
+        if not (len(rows) == 1 and rows[0][0] == "ok"):
+            detail = "; ".join(str(r[0]) for r in rows[:3])
+            raise CorruptBaselineError(
+                f"baseline at {self.db_path} failed its integrity check ({detail}); {_CORRUPT_HINT}"
+            )
+
+    def backup_to(self, dest: Path) -> None:
+        """Write a consistent copy of the baseline to `dest` (SQLite online-backup API,
+        WAL-safe even while the daemon writes). Used for the rotated recovery snapshots."""
+        self.conn.commit()
+        dst = sqlite3.connect(str(dest))
+        try:
+            with dst:
+                self.conn.backup(dst)
+        finally:
+            dst.close()
 
     def _init_schema(self) -> None:
         self.conn.execute(

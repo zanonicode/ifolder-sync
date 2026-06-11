@@ -779,3 +779,207 @@ def test_dangling_and_circular_symlinks_do_not_abort_the_pass(make_syncer, fake,
         assert link not in store.all()
     assert s.errors == 0, s.summary()
     store.close()
+
+
+# --- Phase C Batch 2: baseline durability ---------------------------------------
+
+
+def test_wal_and_busy_timeout_enabled(tmp_path):
+    """P1-7a: the baseline opens in WAL with a busy_timeout so `status` reads never
+    block (or crash on `database is locked`) while the daemon writes."""
+    with StateStore(tmp_path / "b.sqlite3") as s:
+        assert s.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert s.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
+def test_corrupt_baseline_raises_on_open(tmp_path):
+    """P1-7d: an unreadable baseline file surfaces as CorruptBaselineError (a clear,
+    rebaseline-pointing error), never a silent empty DB."""
+    from ifolder_sync.state import CorruptBaselineError
+
+    bad = tmp_path / "bad.sqlite3"
+    bad.write_bytes(b"this is definitely not a sqlite database " * 20)
+    with pytest.raises(CorruptBaselineError):
+        StateStore(bad)
+
+
+def test_quick_check_ok_on_fresh_db(tmp_path):
+    """P1-7e: a fresh/valid baseline passes its integrity check (no false positive)."""
+    with StateStore(tmp_path / "fresh.sqlite3") as s:
+        s.quick_check()  # must not raise
+
+
+def test_per_action_commit_during_pass(make_syncer, fake, local_dir):
+    """P1-7b: the apply loop commits after each action, not once at pass end."""
+    syncer, store = make_syncer()
+    for i in range(3):
+        write_file(local_dir, f"n{i}.md", b"x", mtime=1000)
+    commits = {"n": 0}
+    real = store.commit
+
+    def counted():
+        commits["n"] += 1
+        real()
+
+    store.commit = counted
+    syncer.sync_once()
+    assert commits["n"] >= 3  # at least one commit per uploaded file
+    store.close()
+
+
+def test_committed_rows_survive_midpass_crash(make_syncer, fake, local_dir):
+    """P1-7b: a hard abort mid-pass leaves the already-applied file's baseline row
+    durable (no rollback -> no spurious conflict next pass)."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "a.md", b"x", mtime=1000)
+    write_file(local_dir, "b.md", b"y", mtime=1000)
+    db_path = store.db_path
+    calls = {"n": 0}
+    real = syncer._apply_file
+
+    def flaky(relpath, op, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt  # escapes the per-file try/except, aborts the pass
+        return real(relpath, op, *a, **k)
+
+    syncer._apply_file = flaky
+    with pytest.raises(KeyboardInterrupt):
+        syncer.sync_once()
+    store.close()
+
+    with StateStore(db_path) as reopened:
+        rows = reopened.all()
+    assert len(rows) == 1  # exactly the first file, committed before the abort
+    assert "a.md" in rows or "b.md" in rows
+
+
+def test_stop_check_halts_apply_loop(make_syncer, fake, local_dir):
+    """P1-7c: a stop signal between actions breaks the apply loop promptly; what was
+    applied before the stop stays committed (durable, not rolled back)."""
+    syncer, store = make_syncer()
+    for i in range(3):
+        write_file(local_dir, f"n{i}.md", b"x", mtime=1000)
+    flags = {"n": 0}
+
+    def stop():
+        flags["n"] += 1
+        return flags["n"] > 1  # allow the first file, then stop
+
+    syncer._stop_check = stop
+    syncer.sync_once()
+    assert len(fake.files) == 1  # only one file uploaded before the stop
+    store.close()
+
+
+def test_mkdir_local_failure_is_caught(make_syncer, local_dir):
+    """P1-7c: a failed local mkdir (a file occupies the path) is caught, counted, and
+    leaves no baseline row for a directory that was not created."""
+    from ifolder_sync.syncer import SyncStats
+
+    syncer, store = make_syncer()
+    (local_dir / "d").write_bytes(b"x")  # a regular file occupies the dir path
+    stats = SyncStats()
+    syncer._apply_dir("d", "mkdir_local", stats, dry_run=False)
+    assert stats.errors == 1
+    assert "d" not in store.all()
+    store.close()
+
+
+def test_backup_to_creates_valid_copy(tmp_path):
+    """P1-7e: backup_to writes a consistent, integrity-clean copy of the baseline."""
+    from ifolder_sync.state import BaselineEntry
+
+    src = StateStore(tmp_path / "src.sqlite3")
+    src.upsert(BaselineEntry("x.md", "file", 5, 1.0, 5, 1.0))
+    src.commit()
+    dest = tmp_path / "copy.sqlite3"
+    src.backup_to(dest)
+    src.close()
+    with StateStore(dest) as copy:
+        assert "x.md" in copy.all()
+        copy.quick_check()
+
+
+def test_daemon_rotate_backup_keeps_n(tmp_path, monkeypatch):
+    """P1-7e: rotated baseline backups are ring-buffered to baseline_backups copies, and
+    the newest is a valid restorable baseline."""
+    from ifolder_sync.config import baseline_path
+    from ifolder_sync.state import BaselineEntry
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+    d.cfg.baseline_backups = 3
+    d.store.upsert(BaselineEntry("a.md", "file", 1, 1, 1, 1))
+    d.store.commit()
+    for _ in range(5):
+        d._rotate_backup()
+
+    bdir = baseline_path("preflight-test").parent / "baseline-backups"
+    backups = list(bdir.glob("autobak-*.sqlite3"))
+    assert len(backups) == 3
+    newest = max(backups, key=d._backup_index)
+    with StateStore(newest) as restored:
+        assert "a.md" in restored.all()
+    d.store.close()
+
+
+def test_daemon_construction_raises_on_corrupt_baseline(tmp_path, monkeypatch):
+    """P1-7d: a corrupt baseline is detected when the daemon opens its store (so it never
+    proceeds against a silently-empty DB)."""
+    from ifolder_sync.config import baseline_path
+    from ifolder_sync.daemon import Daemon
+    from ifolder_sync.state import CorruptBaselineError
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    bp = baseline_path("corrupt-test")
+    bp.parent.mkdir(parents=True, exist_ok=True)
+    bp.write_bytes(b"not a database " * 50)
+    cfg = Config(apple_id="x@y.com", local_folder=str(tmp_path / "v"))
+    with pytest.raises(CorruptBaselineError):
+        Daemon(cfg, "corrupt-test")
+
+
+def test_cmd_start_clean_exits_on_corrupt_baseline(tmp_path, monkeypatch, capsys):
+    """P1-7d: `start` on a corrupt baseline exits cleanly (no SystemExit, exit 0) with a
+    rebaseline hint -> launchd KeepAlive=SuccessfulExit:false does not crash-loop."""
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("corrupt"))
+    bp = baseline_path("corrupt")
+    bp.parent.mkdir(parents=True, exist_ok=True)
+    bp.write_bytes(b"garbage" * 50)
+
+    main(["start", "--profile", "corrupt"])  # must NOT raise SystemExit (clean exit 0)
+    assert "rebaseline" in capsys.readouterr().err
+
+
+def test_rebaseline_backup_survives_uncheckpointed_wal(tmp_path, monkeypatch):
+    """P1-7a/HIGH-1: under WAL, rebaseline must take a consistent copy (committed rows
+    can live only in -wal until a checkpoint). A raw file copy of the main DB would lose
+    them; the backup must preserve every committed row, and no -wal/-shm may be orphaned."""
+    from ifolder_sync.state import BaselineEntry, StateStore
+
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("work"))
+    db = baseline_path("work")
+
+    # Simulate a daemon SIGKILLed without a clean close: rows are committed but stay in
+    # the WAL (50 rows is far below the auto-checkpoint threshold) and the conn is left
+    # open, so nothing flushes them into the main file.
+    live = StateStore(db)
+    for i in range(50):
+        live.upsert(BaselineEntry(f"n{i}.md", "file", i, float(i), i, float(i)))
+    live.commit()
+
+    main(["rebaseline", "--profile", "work"])
+    live.close()
+
+    backups = list(db.parent.glob("baseline.sqlite3.bak-*"))
+    assert len(backups) == 1
+    with StateStore(backups[0]) as restored:
+        assert len(restored.all()) == 50  # rows preserved, not lost to the WAL
+    assert not db.exists()
+    assert not db.with_name(db.name + "-wal").exists()  # siblings not orphaned

@@ -24,7 +24,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .config import (
     VAULT_MARKER_NAME,
@@ -123,6 +123,7 @@ class Syncer:
         client: ICloudClient,
         store: StateStore,
         trash_dir: Optional[Path] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
     ):
         self.cfg = config
         self.client = client
@@ -131,6 +132,20 @@ class Syncer:
         self.trash_dir = trash_dir or default_trash_dir()
         self.ignore_patterns = config.effective_ignore
         self._symlink_warned: set[str] = set()
+        # The daemon passes its _stop predicate so a SIGTERM mid-apply breaks the loop
+        # promptly; per-action commits keep what was already applied durable.
+        self._stop_check = stop_check
+
+    def _should_stop(self) -> bool:
+        return bool(self._stop_check and self._stop_check())
+
+    def _commit(self, dry_run: bool) -> None:
+        """Per-action durability: with one commit only at pass end, a SIGKILL mid-pass
+        rolls back every transferred file's baseline row, turning each into a spurious
+        conflict next pass. Committing after each applied action makes progress survive
+        a crash (paired with WAL + the plist ExitTimeOut grace window)."""
+        if not dry_run:
+            self.store.commit()
 
     # ----------------------------------------------------------- snapshots ---
     def _ignored(self, relpath: str) -> bool:
@@ -319,14 +334,25 @@ class Syncer:
             )
 
         for relpath, op in dir_actions:
+            if self._should_stop():
+                break
             self._apply_dir(relpath, op, stats, dry_run)
+            self._commit(dry_run)
         for root in tree_roots:
+            if self._should_stop():
+                break
             self._delete_remote_tree(root, covered, stats, dry_run)
+            self._commit(dry_run)
         for relpath, op in file_actions:
+            if self._should_stop():
+                break
             if relpath in covered or (suppress_deletes and op in _FILE_DESTRUCTIVE):
                 continue
             self._apply_file(relpath, op, local, remote, stats, dry_run)
+            self._commit(dry_run)
         for relpath, cleanup_op in cleanup_actions:
+            if self._should_stop():
+                break
             if cleanup_op is None or relpath in covered:
                 continue
             if suppress_deletes and cleanup_op in _DIR_DESTRUCTIVE:
@@ -334,10 +360,15 @@ class Syncer:
             if cleanup_op in _DIR_DESTRUCTIVE and any(k.startswith(relpath + "/") for k in kept):
                 continue  # something below survives this pass; removing the dir would take it along
             self._apply_cleanup(relpath, cleanup_op, stats, dry_run)
+            self._commit(dry_run)
 
         if not dry_run:
             self.store.commit()
-            self.store.set_meta("last_sync", str(time.time()))
+            # A pass cut short by a stop signal is partial: don't advance last_sync (it
+            # would read as a clean completion in `status`); last_stats still reflects
+            # what was applied.
+            if not self._should_stop():
+                self.store.set_meta("last_sync", str(time.time()))
             self.store.set_meta("last_stats", stats.summary())
         return stats
 
@@ -560,7 +591,14 @@ class Syncer:
                     stats.errors += 1
                     return
         elif op == "mkdir_local" and not dry_run:
-            (self.local_root / relpath).mkdir(parents=True, exist_ok=True)
+            try:
+                (self.local_root / relpath).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                # e.g. a regular file already occupies the path (kind conflict). Record
+                # nothing: a dir that was not created must not enter the baseline.
+                log.error("local mkdir failed %s: %s", relpath, exc)
+                stats.errors += 1
+                return
         if not dry_run:
             self.store.upsert(BaselineEntry(relpath, "dir", 0, 0, 0, 0))
 

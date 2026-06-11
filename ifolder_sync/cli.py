@@ -267,6 +267,7 @@ def cmd_sync(args):
         client = ICloudClient.from_config(cfg)
         client.connect(interactive=not args.non_interactive)
         with StateStore(baseline_path(profile)) as store:
+            store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
             syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
             stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
         prefix = "Dry-run (no changes written)" if args.dry_run else "Sync done"
@@ -279,6 +280,7 @@ def cmd_sync(args):
 def cmd_start(args):
     from .daemon import Daemon
     from .locking import AlreadyRunning
+    from .state import CorruptBaselineError
 
     profile, cfg = _load_profile(args)
     if getattr(args, "background", False):
@@ -289,6 +291,11 @@ def cmd_start(args):
     except AlreadyRunning as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+    except CorruptBaselineError as exc:
+        # invariant 9: a corrupt baseline is operator-actionable (rebaseline), not
+        # transient. Clean exit (0) so launchd KeepAlive=SuccessfulExit:false does not
+        # crash-loop; the message tells the operator what to run.
+        print(f"Error: {exc}", file=sys.stderr)
 
 
 def _start_background(profile: str) -> None:
@@ -327,7 +334,7 @@ def _has_session(apple_id: str) -> bool:
 
 
 def _print_profile_status(profile: str) -> None:
-    from .state import StateStore
+    from .state import CorruptBaselineError, StateStore
 
     path = config_path(profile)
     if not path.exists():
@@ -352,10 +359,17 @@ def _print_profile_status(profile: str) -> None:
 
     db = baseline_path(profile)
     if db.exists():
-        with StateStore(db) as store:
-            last_sync = store.get_meta("last_sync")
-            last_error = store.get_meta("last_error")
-            last_stats = store.get_meta("last_stats")
+        try:
+            with StateStore(db) as store:
+                last_sync = store.get_meta("last_sync")
+                last_error = store.get_meta("last_error")
+                last_stats = store.get_meta("last_stats")
+        except CorruptBaselineError:
+            print(
+                f"Baseline:      {_color('corrupt', '31')} — run "
+                f"`ifolder-sync rebaseline --profile {profile}`"
+            )
+            return
         if last_sync:
             ts = datetime.fromtimestamp(float(last_sync)).strftime("%Y-%m-%d %H:%M:%S")
             print(f"Last sync:     {ts} ({last_stats or ''})")
@@ -420,6 +434,8 @@ def cmd_rebaseline(args):
     With an empty baseline the next pass is purely additive (downloads what is missing,
     uploads local-only files, never deletes) — the sanctioned recovery from drift.
     """
+    from .state import CorruptBaselineError, StateStore
+
     profile, cfg = _load_profile(args)
     pid = holder_pid(lock_path(profile))
     if pid:
@@ -433,8 +449,18 @@ def cmd_rebaseline(args):
     db = baseline_path(profile)
     if db.exists():
         bak = db.with_name(f"{db.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(db, bak)
-        db.unlink()
+        try:
+            # WAL-safe consistent copy: a raw file copy would miss committed rows still
+            # in the -wal of a daemon killed (SIGKILL) without a clean checkpoint.
+            with StateStore(db) as store:
+                store.backup_to(bak)
+        except CorruptBaselineError:
+            # The DB is unreadable anyway; salvage the raw bytes for forensics.
+            shutil.copy2(db, bak)
+        # Unlink the main file AND its WAL siblings: orphaned -wal/-shm would otherwise
+        # attach stale frames to the next (fresh) baseline.
+        for sib in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+            sib.unlink(missing_ok=True)
         print(f"Baseline backed up to {bak} and reset.")
     else:
         print("No baseline to reset (fresh profile).")

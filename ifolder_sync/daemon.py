@@ -34,7 +34,7 @@ from .config import (
 )
 from .icloud_client import PART_SUFFIX, ICloudClient
 from .locking import SingleInstanceLock
-from .state import StateStore
+from .state import CorruptBaselineError, StateStore
 from .syncer import LocalScanError, Syncer, VaultIdentityError
 from .watcher import LocalWatcher
 
@@ -45,14 +45,19 @@ class Daemon:
     def __init__(self, config: Config, profile: str = DEFAULT_PROFILE):
         self.cfg = config
         self.profile = profile
-        self.client = ICloudClient.from_config(config)
-        self.store = StateStore(baseline_path(profile))
-        self.syncer = Syncer(config, self.client, self.store, trash_dir=trash_dir(profile))
-        self.lock = SingleInstanceLock(lock_path(profile))
-
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._sync_lock = threading.Lock()
+        self.client = ICloudClient.from_config(config)
+        self.store = StateStore(baseline_path(profile))
+        self.syncer = Syncer(
+            config,
+            self.client,
+            self.store,
+            trash_dir=trash_dir(profile),
+            stop_check=self._stop.is_set,
+        )
+        self.lock = SingleInstanceLock(lock_path(profile))
         self.watcher: Optional[LocalWatcher] = None
 
         self._interval = max(10, int(config.interval_seconds))
@@ -116,13 +121,16 @@ class Daemon:
                 self._apply_passes += 1
             stats = self.syncer.sync_once(defer_deletes=defer_deletes)
             log.info("sync done (%s): %s", reason, stats.summary())
-            # A watch trigger implies local activity even when the pass moved nothing.
-            had_activity = reason == "watch" or bool(
+            changed = bool(
                 stats.uploaded or stats.downloaded or stats.deleted_local or stats.deleted_remote
             )
+            # A watch trigger implies local activity even when the pass moved nothing.
+            had_activity = reason == "watch" or changed
             if had_activity:
                 self._last_activity = time.time()
             self._track_drift(stats)
+            if changed and not stats.errors:
+                self._rotate_backup()
         except VaultIdentityError as exc:
             # Unrecoverable without operator action (rebaseline); retrying every
             # interval would only spam. Clean stop -> no launchd restart loop.
@@ -157,6 +165,14 @@ class Daemon:
             # caught before the broad RuntimeError below so it never stops the daemon.
             log.exception("sync failed (%s): %s", reason, exc)
             self._set_last_error(str(exc))
+        except CorruptBaselineError as exc:
+            # Operator-actionable (rebaseline), not transient; retrying would spin on a
+            # bad DB. Clean stop, same posture as auth expiry. Caught before RuntimeError
+            # (it subclasses it) so the message points at the baseline, not auth.
+            log.critical("%s — stopping daemon", exc)
+            self._set_last_error(str(exc))
+            self._stop.set()
+            self._wake.set()
         except RuntimeError as exc:
             # The connect/2FA helpers raise RuntimeError on auth-shaped failures; the
             # data path raises typed pyicloud/OS errors instead, so a RuntimeError here
@@ -200,6 +216,39 @@ class Daemon:
             self._trips = 0
             self._backoff = None
 
+    # --------------------------------------------------------- baseline backup ---
+    def _rotate_backup(self) -> None:
+        """Snapshot the baseline into a ring of `baseline_backups` rotated copies (a
+        recovery net for corruption; restored manually, never auto-loaded). Best-effort:
+        a failed backup must never fail the sync pass."""
+        n = max(0, int(getattr(self.cfg, "baseline_backups", 5)))
+        if n == 0:
+            return
+        bdir = baseline_path(self.profile).parent / "baseline-backups"
+        try:
+            bdir.mkdir(parents=True, exist_ok=True)
+
+            def ring() -> list:
+                # Ignore any file whose suffix is not a parseable index so junk can't
+                # skew the next index or the prune window.
+                items = [p for p in bdir.glob("autobak-*.sqlite3") if self._backup_index(p) >= 0]
+                return sorted(items, key=self._backup_index)
+
+            existing = ring()
+            nxt = (self._backup_index(existing[-1]) + 1) if existing else 1
+            self.store.backup_to(bdir / f"autobak-{nxt:06d}.sqlite3")
+            for old in ring()[:-n]:
+                old.unlink()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("baseline backup failed (non-fatal): %s", exc)
+
+    @staticmethod
+    def _backup_index(p) -> int:
+        try:
+            return int(p.stem.rsplit("-", 1)[1])
+        except (ValueError, IndexError):
+            return -1
+
     def _poll_timeout(self) -> int:
         """Drift backoff > active cadence > base interval. While changes are flowing
         between devices, poll faster so the other side's edits land sooner."""
@@ -221,6 +270,14 @@ class Daemon:
     def run(self):
         self.lock.acquire()  # raises AlreadyRunning if another instance holds it
         try:
+            # A corrupt baseline raises CorruptBaselineError -> propagates to the caller
+            # (cmd_start) which exits cleanly (0): launchd must not crash-loop on it, and
+            # an empty re-create would read as mass create/delete. Recovery is rebaseline.
+            try:
+                self.store.quick_check()
+            except CorruptBaselineError as exc:
+                self._set_last_error(str(exc))  # so `status` and logs show why it stopped
+                raise
             if not self._preflight():
                 # KeepAlive SuccessfulExit=false: launchd restarts only on a non-zero
                 # exit, so returning cleanly here cannot crash-loop a misconfigured
