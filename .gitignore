@@ -13,6 +13,8 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
 
 # macOS
 .DS_Store

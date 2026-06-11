@@ -29,7 +29,7 @@ import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from .config import (
     VAULT_MARKER_NAME,
@@ -38,11 +38,34 @@ from .config import (
     write_vault_marker,
 )
 from .config import trash_dir as default_trash_dir
-from .icloud_client import PART_SUFFIX, ICloudClient, RemoteEntry
+from .icloud_client import PART_SUFFIX, RemoteEntry
 from .state import BaselineEntry, StateStore
 from .trash import trash_local
 
 log = logging.getLogger("ifolder-sync.syncer")
+
+
+@runtime_checkable
+class SyncClient(Protocol):
+    """The exact iCloud surface the engine depends on, declared at the consumer.
+
+    The Syncer binds to this interface, not the concrete ICloudClient, so the layer that
+    transfers and deletes user files has a verifiable contract instead of an `Any`-typed
+    client. mypy checks structural conformance at every construction site (the real client
+    in cli.py/daemon.py) and against the in-memory test fake, so a renamed or
+    signature-drifted method fails type-checking rather than silently diverging.
+    """
+
+    def refresh(self) -> None: ...
+    def ensure_remote_root(self) -> None: ...
+    def walk(
+        self, is_ignored: Optional[Callable[[str], bool]] = None
+    ) -> dict[str, RemoteEntry]: ...
+    def download(self, relpath: str, dest: os.PathLike[str]) -> None: ...
+    def upload(self, relpath: str, src: os.PathLike[str], mtime: float) -> None: ...
+    def mkdir(self, relpath: str) -> None: ...
+    def delete(self, relpath: str) -> None: ...
+
 
 # Remote mtime tolerance: iCloud rounds to the second and its clock skews from the
 # local one, so a remote file within this window of the baseline is "unchanged".
@@ -177,11 +200,11 @@ class Syncer:
     def __init__(
         self,
         config: Config,
-        client: ICloudClient,
+        client: SyncClient,
         store: StateStore,
         trash_dir: Optional[Path] = None,
         stop_check: Optional[Callable[[], bool]] = None,
-    ):
+    ) -> None:
         self.cfg = config
         self.client = client
         self.store = store
@@ -190,6 +213,7 @@ class Syncer:
         self.ignore_patterns = config.effective_ignore
         self._symlink_warned: set[str] = set()
         self._nfc_active: Optional[bool] = None  # probed once (volume normalization)
+        self._resolved_root: Optional[Path] = None  # local_root.resolve() memoized once
         # relpath -> (remote_size, remote_mtime, consecutive_failures): backs off a
         # download that keeps failing against an unchanged remote (a broken iCloud blob).
         self._download_fail: dict[str, tuple[int, float, int]] = {}
@@ -273,13 +297,25 @@ class Syncer:
             log.warning("skipping symlink (symlinks are not synced): %s", rel)
         return True
 
+    def _root_resolved(self) -> Path:
+        """local_root.resolve() computed once and cached. The root is fixed for a
+        Syncer's life (a moved vault is caught by _preflight_local, not here), so the
+        realpath syscall need not repeat for every entry of every walk."""
+        if self._resolved_root is None:
+            self._resolved_root = self.local_root.resolve()
+        return self._resolved_root
+
     def _is_safe_rel(self, relpath: str) -> bool:
-        """True if local_root/relpath stays inside local_root (no traversal)."""
+        """True if local_root/relpath stays inside local_root — no traversal, and no
+        escape through a symlinked ancestor on disk (which a purely-lexical screen would
+        miss: a remote 'link/x' where local_root/link symlinks outside must be rejected).
+        resolve() follows symlinks and collapses '..'; the only per-entry cost trimmed
+        from the multi-thousand-file walk is the root realpath, now resolved once."""
         try:
             target = (self.local_root / relpath).resolve()
         except (OSError, ValueError, RuntimeError):
             return False
-        root = self.local_root.resolve()
+        root = self._root_resolved()
         return target == root or root in target.parents
 
     def _preflight_local(self, baseline: dict[str, BaselineEntry], dry_run: bool) -> None:
@@ -389,7 +425,12 @@ class Syncer:
         return abs(cur_mtime - base_mtime) > tol
 
     @staticmethod
-    def _is_dir(relpath, local, remote, baseline) -> bool:
+    def _is_dir(
+        relpath: str,
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        baseline: dict[str, BaselineEntry],
+    ) -> bool:
         if relpath in local:
             return local[relpath].kind == "dir"
         if relpath in remote:
@@ -456,8 +497,8 @@ class Syncer:
         )
 
         tree_roots: list[str] = []
-        covered: set = set()
-        kept: set = set()
+        covered: set[str] = set()
+        kept: set[str] = set()
         if not suppress_deletes:
             tree_roots, covered, kept = self._coalesce_remote_deletes(
                 dir_actions, file_actions, cleanup_actions
@@ -511,7 +552,7 @@ class Syncer:
         if not local_files and not remote_files:
             return
 
-        def fmt(entry) -> str:
+        def fmt(entry: "LocalEntry | RemoteEntry") -> str:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.mtime))
             return f"{entry.relpath} @ {ts}"
 
@@ -526,13 +567,20 @@ class Syncer:
             "local" if local_mtime >= remote_mtime else "remote",
         )
 
-    def _over_threshold(self, count: int, baseline) -> bool:
+    def _over_threshold(self, count: int, baseline: dict[str, BaselineEntry]) -> bool:
         if count > self.cfg.delete_threshold_count:
             return True
         tracked = len(baseline)
         return bool(tracked and (count / tracked) * 100 > self.cfg.delete_threshold_pct)
 
-    def _suppress_deletes(self, file_actions, defer_deletes, force_delete, baseline, stats) -> bool:
+    def _suppress_deletes(
+        self,
+        file_actions: list[tuple[str, Op]],
+        defer_deletes: bool,
+        force_delete: bool,
+        baseline: dict[str, BaselineEntry],
+        stats: SyncStats,
+    ) -> bool:
         """True = withhold every destructive op this pass. Two guards share the same
         mechanism: the bootstrap deferral (content first, destruction next pass) and
         the delete threshold. Baseline rows of withheld deletions are not touched, so
@@ -557,7 +605,11 @@ class Syncer:
         return False
 
     @staticmethod
-    def _coalesce_remote_deletes(dir_actions, file_actions, cleanup_actions):
+    def _coalesce_remote_deletes(
+        dir_actions: list[tuple[str, Op]],
+        file_actions: list[tuple[str, Op]],
+        cleanup_actions: list[tuple[str, Optional[Op]]],
+    ) -> tuple[list[str], set[str], set[str]]:
         """Collapse fully-deleted remote subtrees into one folder deletion each.
 
         iCloud's move-to-trash on a folder is recursive (one network call, and the
@@ -565,7 +617,7 @@ class Syncer:
         the topmost dir replaces one call per descendant. Only prunes a dir when
         NOTHING below it survives the pass. The threshold still counts per file.
         """
-        effective: dict[str, str] = {}
+        effective: dict[str, Op] = {}
         for p, op in dir_actions:
             effective[p] = op
         for p, op in file_actions:
@@ -589,7 +641,9 @@ class Syncer:
         covered = {p for d in roots for p in effective if under(d, p)} | set(roots)
         return roots, covered, kept
 
-    def _delete_remote_tree(self, root: str, covered: set, stats, dry_run):
+    def _delete_remote_tree(
+        self, root: str, covered: set[str], stats: SyncStats, dry_run: bool
+    ) -> None:
         items = [p for p in covered if p.startswith(root + "/")]
         stats.deleted_remote += len(items) + 1
         log.info("DEL_REMOTE %s/ (whole subtree, %d items, one call)", root, len(items) + 1)
@@ -605,7 +659,9 @@ class Syncer:
         for p in items:
             self.store.delete(p)
 
-    def _migrate_baseline_nfc(self, baseline: dict, dry_run: bool) -> dict:
+    def _migrate_baseline_nfc(
+        self, baseline: dict[str, BaselineEntry], dry_run: bool
+    ) -> dict[str, BaselineEntry]:
         """P1-2 one-time migration: re-key any baseline relpath that is not NFC so it
         aligns with the NFC-keyed scans. Without it, an accented file recorded by the old
         engine under its NFD name would not match the NFC scan key and read as a delete +
@@ -654,7 +710,7 @@ class Syncer:
             self.store.set_meta("ignore_hash", h)
         return prev is not None and prev != h
 
-    def _exclude_case_collisions(self, all_paths: set, stats) -> set:
+    def _exclude_case_collisions(self, all_paths: set[str], stats: SyncStats) -> set[str]:
         """P1-2: two distinct identity keys that casefold to the same value (local
         `note.md` vs remote `Note.md`) are a collision the engine cannot reconcile on
         case-insensitive macOS — guessing risks clobbering the local original. Skip every
@@ -676,7 +732,13 @@ class Syncer:
                 stats.errors += 1
         return all_paths - collided
 
-    def _exclude_kind_conflicts(self, all_paths: set, local, remote, stats) -> set:
+    def _exclude_kind_conflicts(
+        self,
+        all_paths: set[str],
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        stats: SyncStats,
+    ) -> set[str]:
         """P1-9: a path that is a file on one side and a directory on the other cannot be
         reconciled (downloading the dir would clobber the file, or the file decide would
         settle_wait forever on the dir's 0 bytes). Warn, count it, and drop it AND its
@@ -696,7 +758,9 @@ class Syncer:
             stats.errors += 1
         return {p for p in all_paths if not any(p == c or p.startswith(c + "/") for c in conflicts)}
 
-    def _escalate_settle(self, file_actions, dry_run):
+    def _escalate_settle(
+        self, file_actions: list[tuple[str, Op]], dry_run: bool
+    ) -> list[tuple[str, Op]]:
         """P1-10: a 0-byte remote husk shadowing a non-empty local file is deferred
         (settle_wait) so an in-flight upload is not trampled. But a genuinely-empty remote
         would livelock forever, and a one-shot `sync` could never resolve it. Count
@@ -705,7 +769,7 @@ class Syncer:
         counts = self._load_settle_counts()
         threshold = max(1, int(self.cfg.settle_max_passes))
         new_counts: dict[str, int] = {}
-        out = []
+        out: list[tuple[str, Op]] = []
         for relpath, op in file_actions:
             if op != Op.SETTLE_WAIT:
                 out.append((relpath, op))  # resolved/other -> its count drops out below
@@ -736,7 +800,13 @@ class Syncer:
             return {}
 
     # ------------------------------------------------------------ decisions ---
-    def _decide_file(self, relpath, local, remote, baseline) -> Op:
+    def _decide_file(
+        self,
+        relpath: str,
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        baseline: dict[str, BaselineEntry],
+    ) -> Op:
         lentry: Optional[LocalEntry] = local.get(relpath)
         rentry: Optional[RemoteEntry] = remote.get(relpath)
         base: Optional[BaselineEntry] = baseline.get(relpath)
@@ -808,7 +878,12 @@ class Syncer:
         return Op.DROP_BASELINE
 
     @staticmethod
-    def _decide_dir(relpath, local, remote, baseline) -> Op:
+    def _decide_dir(
+        relpath: str,
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        baseline: dict[str, BaselineEntry],
+    ) -> Op:
         in_local = relpath in local
         in_remote = relpath in remote
         if in_local and in_remote:
@@ -823,7 +898,12 @@ class Syncer:
         return Op.MKDIR_LOCAL
 
     @staticmethod
-    def _decide_dir_cleanup(relpath, local, remote, baseline) -> Optional[Op]:
+    def _decide_dir_cleanup(
+        relpath: str,
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        baseline: dict[str, BaselineEntry],
+    ) -> Optional[Op]:
         if relpath not in baseline:
             return None
         in_local = relpath in local
@@ -837,21 +917,36 @@ class Syncer:
         return None
 
     # ------------------------------------------------------------- apply io ---
-    def _apply_file(self, relpath, op, local, remote, stats, dry_run):
+    def _apply_file(
+        self,
+        relpath: str,
+        op: Op,
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        stats: SyncStats,
+        dry_run: bool,
+    ) -> None:
         lentry = local.get(relpath)
         rentry = remote.get(relpath)
         try:
+            # The decide layer guarantees which side(s) exist per op (e.g. a download
+            # implies a remote entry); the asserts both encode that contract and narrow
+            # the Optional lookups for the type checker. A violated invariant would be a
+            # bug — caught here as a counted error (the daemon does not crash on one path).
             if op == Op.UPLOAD:
                 self._do_upload(relpath, stats, dry_run)
             elif op == Op.DOWNLOAD:
+                assert rentry is not None
                 self._do_download(relpath, rentry, stats, dry_run)
             elif op == Op.CONFLICT:
+                assert lentry is not None and rentry is not None
                 self._resolve_conflict(relpath, lentry, rentry, stats, dry_run)
             elif op == Op.RESCUE_UPLOAD:
                 log.warning("remote deleted but local edited; re-uploading %s", relpath)
                 self._do_upload(relpath, stats, dry_run)
                 stats.conflicts += 1
             elif op == Op.RESCUE_DOWNLOAD:
+                assert rentry is not None
                 log.warning("local deleted but remote edited; downloading %s", relpath)
                 self._do_download(relpath, rentry, stats, dry_run)
                 stats.conflicts += 1
@@ -866,8 +961,10 @@ class Syncer:
                     relpath,
                 )
             elif op == Op.RECORD:
+                assert lentry is not None and rentry is not None
                 self._record(relpath, lentry, rentry, dry_run)
             elif op == Op.VERIFY_ADOPT:
+                assert lentry is not None and rentry is not None
                 self._verify_adopt(relpath, lentry, rentry, stats, dry_run)
             elif op == Op.DROP_BASELINE:
                 if not dry_run:
@@ -878,7 +975,7 @@ class Syncer:
             log.error("error reconciling %s: %s", relpath, exc)
             stats.errors += 1
 
-    def _apply_dir(self, relpath, op, stats, dry_run):
+    def _apply_dir(self, relpath: str, op: Op, stats: SyncStats, dry_run: bool) -> None:
         if op == Op.LEAVE_DIR:
             return
         if op == Op.MKDIR_REMOTE:
@@ -907,7 +1004,7 @@ class Syncer:
         if not dry_run:
             self.store.upsert(BaselineEntry(relpath, "dir", 0, 0, 0, 0))
 
-    def _apply_cleanup(self, relpath, op, stats, dry_run):
+    def _apply_cleanup(self, relpath: str, op: Op, stats: SyncStats, dry_run: bool) -> None:
         if op == Op.DROP_BASELINE_DIR:
             if not dry_run:
                 self.store.delete(relpath)
@@ -928,7 +1025,7 @@ class Syncer:
         else:
             raise ValueError(f"unhandled cleanup op {op!r}")
 
-    def _rmdir_local(self, relpath: str, stats) -> None:
+    def _rmdir_local(self, relpath: str, stats: SyncStats) -> None:
         """Remove a locally-surviving dir whose remote was deleted, dropping the baseline
         row ONLY when the dir is actually gone (P1-3). If it lingers with non-ignored
         entries, dropping the row would make it look new and resurrect the folder remotely
@@ -969,7 +1066,14 @@ class Syncer:
                 return False
         return True
 
-    def _verify_adopt(self, relpath, lentry: LocalEntry, rentry: RemoteEntry, stats, dry_run):
+    def _verify_adopt(
+        self,
+        relpath: str,
+        lentry: LocalEntry,
+        rentry: RemoteEntry,
+        stats: SyncStats,
+        dry_run: bool,
+    ) -> None:
         """Adopt-identical with proof: fetch the remote to a temp and byte-compare to the
         local file. Identical → record the baseline (no transfer; kills the rebaseline
         conflict storm). Different → resolve as a real conflict (preserve both). The fetch
@@ -993,7 +1097,14 @@ class Syncer:
             self._resolve_conflict(relpath, lentry, rentry, stats, dry_run)
 
     # ------------------------------------------------------------ conflicts ---
-    def _resolve_conflict(self, relpath, lentry: LocalEntry, rentry: RemoteEntry, stats, dry_run):
+    def _resolve_conflict(
+        self,
+        relpath: str,
+        lentry: LocalEntry,
+        rentry: RemoteEntry,
+        stats: SyncStats,
+        dry_run: bool,
+    ) -> None:
         stats.conflicts += 1
         policy = self.cfg.conflict_policy
         log.warning("CONFLICT on %s (policy=%s)", relpath, policy)
@@ -1039,7 +1150,7 @@ class Syncer:
         p = Path(relpath)
         return str(p.with_name(f"{p.stem}.conflict-{stamp}{p.suffix}"))
 
-    def _backup_local_then(self, relpath, action):
+    def _backup_local_then(self, relpath: str, action: Callable[[], None]) -> None:
         src = self.local_root / relpath
         if src.exists():
             bkp = self.local_root / self._conflict_name(relpath)
@@ -1047,7 +1158,9 @@ class Syncer:
             os.replace(src, bkp)
         action()
 
-    def _backup_remote_then(self, relpath, rentry, action):
+    def _backup_remote_then(
+        self, relpath: str, rentry: RemoteEntry, action: Callable[[], None]
+    ) -> None:
         bkp = self.local_root / self._conflict_name(relpath)
         bkp.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1086,7 +1199,7 @@ class Syncer:
         action()
 
     # -------------------------------------------------------------- actions ---
-    def _do_upload(self, relpath, stats, dry_run):
+    def _do_upload(self, relpath: str, stats: SyncStats, dry_run: bool) -> None:
         stats.uploaded += 1
         log.info("UP   %s", relpath)
         if dry_run:
@@ -1114,7 +1227,7 @@ class Syncer:
         )
 
     # --- download-failure backoff (a broken iCloud blob: 200 + Content-Length N + 0 bytes)
-    def _download_backed_off(self, relpath, rentry) -> bool:
+    def _download_backed_off(self, relpath: str, rentry: RemoteEntry) -> bool:
         prev = self._download_fail.get(relpath)
         return bool(
             prev
@@ -1123,14 +1236,16 @@ class Syncer:
             and prev[2] >= DOWNLOAD_MAX_FAILS
         )
 
-    def _note_download_failure(self, relpath, rentry) -> int:
+    def _note_download_failure(self, relpath: str, rentry: RemoteEntry) -> int:
         prev = self._download_fail.get(relpath)
         same = bool(prev and prev[0] == rentry.size and abs(prev[1] - rentry.mtime) <= MTIME_TOL)
         fails = (prev[2] if same and prev else 0) + 1
         self._download_fail[relpath] = (rentry.size, rentry.mtime, fails)
         return fails
 
-    def _do_download(self, relpath, rentry: RemoteEntry, stats, dry_run):
+    def _do_download(
+        self, relpath: str, rentry: RemoteEntry, stats: SyncStats, dry_run: bool
+    ) -> None:
         if self._download_backed_off(relpath, rentry):
             # The remote has failed to download repeatedly without changing (a broken
             # blob). Skip without re-attempting; auto-retries when the remote changes.
@@ -1155,6 +1270,18 @@ class Syncer:
                 )
             raise
         self._download_fail.pop(relpath, None)  # success clears the backoff
+        # Stamp the local file's mtime to the remote's, so Obsidian's recent-files and
+        # Dataview `file.mtime` show the real edit time vault-wide instead of the download
+        # instant (which would change on every device on every sync). This also mirrors the
+        # upload side (where remote mtime = local mtime). Re-stat AFTER utime and record the
+        # value actually written: the exact local-mtime comparison (MTIME_TOL_LOCAL = 0)
+        # then still reads "unchanged" next pass. A 0/unknown remote mtime is left as the
+        # download time rather than stamped to the 1970 epoch.
+        if rentry.mtime > 0:
+            try:
+                os.utime(dest, (rentry.mtime, rentry.mtime))
+            except OSError as exc:
+                log.debug("could not restore remote mtime on %s: %s", relpath, exc)
         st = dest.stat()
         self.store.upsert(
             BaselineEntry(
@@ -1162,7 +1289,7 @@ class Syncer:
             )
         )
 
-    def _delete_local(self, relpath, stats, dry_run):
+    def _delete_local(self, relpath: str, stats: SyncStats, dry_run: bool) -> None:
         stats.deleted_local += 1
         log.info("DEL_LOCAL %s", relpath)
         if dry_run:
@@ -1173,7 +1300,7 @@ class Syncer:
         # make the surviving file look new and resurrect it remotely next pass.
         self.store.delete(relpath)
 
-    def _delete_remote(self, relpath, stats, dry_run):
+    def _delete_remote(self, relpath: str, stats: SyncStats, dry_run: bool) -> None:
         stats.deleted_remote += 1
         log.info("DEL_REMOTE %s", relpath)
         if dry_run:
@@ -1181,7 +1308,7 @@ class Syncer:
         self.client.delete(relpath)
         self.store.delete(relpath)
 
-    def _record(self, relpath, lentry: LocalEntry, rentry: RemoteEntry, dry_run):
+    def _record(self, relpath: str, lentry: LocalEntry, rentry: RemoteEntry, dry_run: bool) -> None:
         if dry_run:
             return
         self.store.upsert(

@@ -56,5 +56,13 @@ select = ["E", "F", "W", "I", "B"]
 python_version = "3.10"
 ignore_missing_imports = true
 
+# The engine is the layer that transfers and deletes user files: check its untyped
+# function bodies too, so the decide/apply/coalesce code (now fully annotated) is held
+# to a stricter bar than the rest of the package.
+[[tool.mypy.overrides]]
+module = "ifolder_sync.syncer"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
