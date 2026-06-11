@@ -1,0 +1,19 @@
+# Pre-commit hooks mirroring the CI gates, so lint/format/type issues are caught locally.
+# Setup:  pip install pre-commit && pre-commit install
+# Run all: pre-commit run --all-files
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff           # lint (E, F, W, I, B) with autofix
+        args: [--fix]
+      - id: ruff-format    # formatter (line length 100)
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (ifolder_sync + tests)
+        entry: mypy ifolder_sync tests
+        language: system
+        pass_filenames: false
+        types: [python]

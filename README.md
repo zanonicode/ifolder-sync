@@ -53,6 +53,14 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
+Or with [uv](https://docs.astral.sh/uv/) (a committed `uv.lock` pins exact versions):
+
+```bash
+uv sync --extra dev      # create .venv and install from the lockfile
+uv run ifolder-sync --help
+# or install the CLI standalone:  uv tool install .
+```
+
 ## Quick start
 
 Three commands after installing:

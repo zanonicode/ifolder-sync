@@ -45,6 +45,10 @@ Changelog = "https://github.com/zanonicode/ifolder-sync/releases"
 [tool.setuptools.packages.find]
 include = ["ifolder_sync*"]
 
+# Ship the PEP 561 marker so downstream type-checkers honor ifolder_sync's inline types.
+[tool.setuptools.package-data]
+ifolder_sync = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
