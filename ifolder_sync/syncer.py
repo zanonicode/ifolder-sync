@@ -55,6 +55,12 @@ MTIME_TOL_LOCAL = 0.0
 _FILE_DESTRUCTIVE = {"delete_local", "delete_remote"}
 _DIR_DESTRUCTIVE = {"rmdir_local", "rmdir_remote"}
 
+# After this many consecutive download failures for an UNCHANGED remote signature, stop
+# re-attempting that file every pass. iCloud can serve a broken blob (HTTP 200 +
+# Content-Length N + 0 bytes); without a backoff the pass re-decides "download" forever,
+# each attempt writing a .part that re-triggers the local watcher — a tight retry loop.
+DOWNLOAD_MAX_FAILS = 3
+
 
 def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
@@ -148,6 +154,9 @@ class Syncer:
         self.ignore_patterns = config.effective_ignore
         self._symlink_warned: set[str] = set()
         self._nfc_active: Optional[bool] = None  # probed once (volume normalization)
+        # relpath -> (remote_size, remote_mtime, consecutive_failures): backs off a
+        # download that keeps failing against an unchanged remote (a broken iCloud blob).
+        self._download_fail: dict[str, tuple[int, float, int]] = {}
         # The daemon passes its _stop predicate so a SIGTERM mid-apply breaks the loop
         # promptly; per-action commits keep what was already applied durable.
         self._stop_check = stop_check
@@ -1039,13 +1048,36 @@ class Syncer:
         )
 
     def _do_download(self, relpath, rentry: RemoteEntry, stats, dry_run):
+        prev = self._download_fail.get(relpath)
+        same_remote = bool(
+            prev and prev[0] == rentry.size and abs(prev[1] - rentry.mtime) <= MTIME_TOL
+        )
+        fails = prev[2] if same_remote and prev else 0
+        if fails >= DOWNLOAD_MAX_FAILS:
+            # Backed off: this remote has failed to download repeatedly without changing
+            # (a broken blob). Skip without re-attempting; auto-retries when it changes.
+            log.debug("skipping %s: download backed off after %d failures", relpath, fails)
+            return
         stats.downloaded += 1
         log.info("DOWN %s", relpath)
         if dry_run:
             return
         dest = self.local_root / relpath
         dest.parent.mkdir(parents=True, exist_ok=True)
-        self.client.download(relpath, dest)
+        try:
+            self.client.download(relpath, dest)
+        except Exception:
+            self._download_fail[relpath] = (rentry.size, rentry.mtime, fails + 1)
+            if fails + 1 == DOWNLOAD_MAX_FAILS:
+                log.warning(
+                    "download of %s failed %d times against an unchanged remote (iCloud "
+                    "is serving fewer bytes than its listed size — a broken remote blob); "
+                    "backing off until the remote changes",
+                    relpath,
+                    fails + 1,
+                )
+            raise
+        self._download_fail.pop(relpath, None)  # success clears the backoff
         st = dest.stat()
         self.store.upsert(
             BaselineEntry(

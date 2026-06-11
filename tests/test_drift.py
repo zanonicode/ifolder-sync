@@ -1572,6 +1572,39 @@ def test_migration_collision_drops_both(make_syncer):
     store.close()
 
 
+def test_persistent_download_failure_backs_off(make_syncer, fake, local_dir):
+    """A remote whose download persistently fails against an UNCHANGED signature (a broken
+    iCloud blob: HTTP 200 + Content-Length N + 0 bytes) must back off after
+    DOWNLOAD_MAX_FAILS, not retry every pass forever (which hammers Apple + spams the log
+    + churns a .part that re-triggers the watcher)."""
+    from ifolder_sync.state import BaselineEntry
+    from ifolder_sync.syncer import DOWNLOAD_MAX_FAILS
+
+    syncer, store = make_syncer()
+    fake.put("broken.md", b"AAAA", mtime=2000.0)  # remote mtime != baseline -> decides download
+    write_file(local_dir, "broken.md", b"AAAA", mtime=1000.0)
+    store.upsert(BaselineEntry("broken.md", "file", 4, 1000.0, 4, 1000.0, ""))
+    store.commit()
+
+    attempts = {"n": 0}
+    real_dl = fake.download
+
+    def boom(relpath, dest):
+        if relpath == "broken.md":
+            attempts["n"] += 1
+            raise OSError("download size mismatch: got 0 bytes, expected 4")
+        return real_dl(relpath, dest)
+
+    fake.download = boom
+    for _ in range(6):
+        syncer.sync_once()
+
+    # Attempts are bounded to DOWNLOAD_MAX_FAILS, not one per pass.
+    assert attempts["n"] == DOWNLOAD_MAX_FAILS, attempts["n"]
+    assert (local_dir / "broken.md").read_bytes() == b"AAAA"  # local untouched, no data loss
+    store.close()
+
+
 def test_normalization_downgrade_defers_deletes_persistently(
     make_syncer, fake, local_dir, monkeypatch
 ):
