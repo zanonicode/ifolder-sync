@@ -1204,3 +1204,173 @@ def test_atomic_session_save_writes_valid_files(tmp_path):
     assert seen_modes and all(m == 0o600 for m in seen_modes)  # tmp born 0600, no leak window
     assert not list(sdir.glob("*.tmp"))  # tmps replaced/cleaned, none orphaned
     assert saved["n"] == 0  # the original save was replaced, not also called
+
+
+# --- Phase C Batch 4: decide/apply value logic ----------------------------------
+
+
+def test_local_mtime_is_exact_remote_tolerant(make_syncer, fake, local_dir):
+    """P1-11: a same-size local edit within 2s of the baseline IS detected (local
+    tolerance is exact); a remote mtime within 2s is NOT a change (remote keeps 2s)."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer()
+    write_file(local_dir, "n.md", b"AAA", mtime=1000.0)
+    fake.put("n.md", b"AAA", mtime=1000.0)
+    # Baseline: local mtime 1000, remote mtime 1000.
+    store.upsert(BaselineEntry("n.md", "file", 3, 1000.0, 3, 1000.0, ""))
+    store.commit()
+
+    # Local edited 1.0s later, same size (a checkbox toggle right after a pass).
+    write_file(local_dir, "n.md", b"BBB", mtime=1001.0)
+    s = syncer.sync_once()
+    assert s.uploaded == 1, s.summary()  # exact local tolerance caught the sub-2s edit
+    assert fake.files["n.md"]["content"] == b"BBB"
+
+    # A remote mtime 1.5s off baseline with same size+content is NOT a change.
+    syncer2, store2 = make_syncer()
+    write_file(local_dir, "m.md", b"CCC", mtime=2000.0)
+    fake.put("m.md", b"CCC", mtime=2000.0)
+    store2.upsert(BaselineEntry("m.md", "file", 3, 2000.0, 3, 2000.0, ""))
+    store2.commit()
+    fake.put("m.md", b"CCC", mtime=2001.5)  # remote mtime jitter within 2s
+    s2 = syncer2.sync_once()
+    assert s2.downloaded == 0 and s2.conflicts == 0, s2.summary()
+    store.close()
+    store2.close()
+
+
+def test_adopt_identical_kills_rebaseline_conflict_storm(make_syncer, fake, local_dir):
+    """P1-1: sync -> rebaseline (empty baseline) -> sync must be 0 conflicts, 0 uploads
+    (both sides already agree, so the baseline is adopted, not re-fought)."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "a.md", b"hello", mtime=1000.0)
+    write_file(local_dir, "sub/b.md", b"world", mtime=1000.0)
+    syncer.sync_once()  # uploads both, records baseline
+    assert set(fake.files) >= {"a.md", "sub/b.md"}
+
+    # Simulate rebaseline: wipe the baseline, keep local + remote as-is.
+    for rel in list(store.all()):
+        store.delete(rel)
+    store.commit()
+
+    s = syncer.sync_once()
+    assert s.conflicts == 0, s.summary()
+    assert s.uploaded == 0 and s.downloaded == 0, s.summary()
+    assert "a.md" in store.all() and "sub/b.md" in store.all()  # baseline re-adopted
+    store.close()
+
+
+def test_settle_wait_escalates_to_conflict(make_syncer, fake, local_dir):
+    """P1-10: a genuinely-empty remote husk that never gains content escalates from
+    settle_wait to a conflict after settle_max_passes (no permanent livelock)."""
+    syncer, store = make_syncer("local", settle_max_passes=3)
+    write_file(local_dir, "fire.md", b"CONTENT", mtime=2000.0 + FAR)
+    fake.put("fire.md", b"", mtime=2000.0)  # husk: 0-byte record, never fills
+
+    for i in range(2):
+        s = syncer.sync_once()
+        assert s.conflicts == 0 and s.uploaded == 0, f"pass {i}: {s.summary()}"
+        assert fake.files["fire.md"]["content"] == b""  # still deferred
+
+    s = syncer.sync_once()  # 3rd pass -> escalate
+    assert s.conflicts == 1, s.summary()
+    assert fake.files["fire.md"]["content"] == b"CONTENT"  # policy=local resolved it
+    store.close()
+
+
+def test_empty_remote_never_overwrites_local_under_newer(make_syncer, fake, local_dir):
+    """F1: under policy=newer with a husk whose mtime is NEWER than the local file (so
+    'newer' would otherwise pick the empty side), the escalated conflict must NOT empty
+    the local note — an empty side never wins a conflict."""
+    syncer, store = make_syncer("newer", settle_max_passes=2)
+    write_file(local_dir, "n.md", b"REALCONTENT", mtime=1000.0)
+    fake.put("n.md", b"", mtime=5000.0)  # husk mtime far newer than local
+
+    syncer.sync_once()  # settle_wait (count 1)
+    s = syncer.sync_once()  # count 2 -> escalate -> conflict -> empty-side-never-wins
+    assert s.conflicts == 1, s.summary()
+    assert (local_dir / "n.md").read_bytes() == b"REALCONTENT"  # NOT emptied
+    assert fake.files["n.md"]["content"] == b"REALCONTENT"  # local content kept on remote
+    store.close()
+
+
+def test_empty_local_never_overwrites_remote_under_newer(make_syncer, fake, local_dir):
+    """F1 (mirror): an empty LOCAL file never wins against non-empty remote content."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer("newer")
+    write_file(local_dir, "n.md", b"", mtime=5000.0)  # local emptied, newer mtime
+    fake.put("n.md", b"REMOTECONTENT", mtime=1000.0)
+    # Baseline so both sides read as changed (a genuine conflict, not a fresh create).
+    store.upsert(BaselineEntry("n.md", "file", 7, 100.0, 7, 100.0, ""))
+    store.commit()
+
+    s = syncer.sync_once()
+    assert s.conflicts == 1, s.summary()
+    assert (local_dir / "n.md").read_bytes() == b"REMOTECONTENT"  # remote content kept
+    store.close()
+
+
+def test_adopt_with_different_content_conflicts_not_records(make_syncer, fake, local_dir):
+    """F2: equal-size but DIFFERENT content on both sides (base None) must NOT be silently
+    recorded as identical — verify_adopt downloads, sees the bytes differ, and conflicts,
+    preserving both sides (policy=both)."""
+    syncer, store = make_syncer("both")
+    write_file(local_dir, "n.md", b"AAAA", mtime=1000.0)
+    fake.put("n.md", b"BBBB", mtime=1000.5)  # same size (4), mtime within 2s, different bytes
+
+    s = syncer.sync_once()
+    assert s.conflicts == 1, s.summary()  # a real conflict, not a silent adopt
+    backups = list(local_dir.glob("n.conflict-*.md"))
+    assert backups, "the remote content must be preserved, not frozen away"
+    assert {(local_dir / "n.md").read_bytes(), backups[0].read_bytes()} == {b"AAAA", b"BBBB"}
+    store.close()
+
+
+def test_settle_escalation_count_survives_failed_escalation(make_syncer, fake, local_dir):
+    """F5: a transiently-failed escalation must re-escalate next pass (the count is kept),
+    not restart the countdown."""
+    syncer, store = make_syncer("newer", settle_max_passes=2)
+    write_file(local_dir, "n.md", b"CONTENT", mtime=1000.0)
+    fake.put("n.md", b"", mtime=2000.0)
+    syncer.sync_once()  # count 1
+    syncer.sync_once()  # count 2 -> escalate; the count must remain >= 2 in meta
+    counts = json.loads(store.get_meta("settle_counts") or "{}")
+    assert counts.get("n.md", 0) >= 2  # not dropped on escalation
+    store.close()
+
+
+def test_remote_edit_husk_does_not_truncate_local(make_syncer, fake, local_dir):
+    """P1-10: when a baseline-known remote file briefly drops to 0 bytes (an edit
+    publishing its record before content), the local file is NOT truncated."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer()
+    write_file(local_dir, "n.md", b"LOCALDATA", mtime=1000.0)
+    fake.put("n.md", b"REMOTEDATA", mtime=1000.0)
+    store.upsert(BaselineEntry("n.md", "file", 9, 1000.0, 10, 1000.0, ""))
+    store.commit()
+
+    # Remote edit publishes a 0-byte husk (content still uploading from device B).
+    fake.put("n.md", b"", mtime=1001.0)
+    s = syncer.sync_once()
+    assert s.downloaded == 0, s.summary()  # husk not downloaded
+    assert (local_dir / "n.md").read_bytes() == b"LOCALDATA"  # local intact
+    store.close()
+
+
+def test_kind_conflict_file_vs_dir_is_skipped(make_syncer, fake, local_dir):
+    """P1-9: a path that is a file locally but a directory remotely (or vice versa) is
+    warned + counted + skipped (with its subtree), never silently mis-synced or deleted."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "x", b"i am a file", mtime=1000.0)  # local: file 'x'
+    fake.mkdir("x")  # remote: dir 'x'
+    fake.put("x/inside.md", b"child", mtime=1000.0)
+
+    s = syncer.sync_once()
+    assert s.errors >= 1, s.summary()  # kind conflict surfaced
+    assert (local_dir / "x").read_bytes() == b"i am a file"  # local file untouched
+    assert "x" in fake.files and fake.files["x"]["kind"] == "dir"  # remote dir untouched
+    assert "x" not in store.all()  # nothing recorded for the conflicted path
+    store.close()

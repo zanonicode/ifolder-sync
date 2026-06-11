@@ -16,7 +16,9 @@ not agree to the second.
 
 from __future__ import annotations
 
+import filecmp
 import fnmatch
+import json
 import logging
 import os
 import shutil
@@ -39,7 +41,14 @@ from .trash import trash_local
 
 log = logging.getLogger("ifolder-sync.syncer")
 
+# Remote mtime tolerance: iCloud rounds to the second and its clock skews from the
+# local one, so a remote file within this window of the baseline is "unchanged".
 MTIME_TOL = 2.0  # seconds
+# Local mtime tolerance is EXACT (0): the local side is the same filesystem we stamped,
+# so any mtime difference is a real edit. A 2s window here would silently miss a
+# same-size edit made within 2s of a pass (e.g. a checkbox toggle right after sync),
+# which would then be overwritten by the other side.
+MTIME_TOL_LOCAL = 0.0
 
 _FILE_DESTRUCTIVE = {"delete_local", "delete_remote"}
 _DIR_DESTRUCTIVE = {"rmdir_local", "rmdir_remote"}
@@ -274,10 +283,12 @@ class Syncer:
 
     # ----------------------------------------------------- change detection ---
     @staticmethod
-    def _changed(cur_size: int, cur_mtime: float, base_size: int, base_mtime: float) -> bool:
+    def _changed(
+        cur_size: int, cur_mtime: float, base_size: int, base_mtime: float, tol: float
+    ) -> bool:
         if cur_size != base_size:
             return True
-        return abs(cur_mtime - base_mtime) > MTIME_TOL
+        return abs(cur_mtime - base_mtime) > tol
 
     @staticmethod
     def _is_dir(relpath, local, remote, baseline) -> bool:
@@ -306,6 +317,7 @@ class Syncer:
         if defer_deletes:
             self._log_direction(local, remote)
         all_paths = set(local) | set(remote) | set(baseline)
+        all_paths = self._exclude_kind_conflicts(all_paths, local, remote, stats)
 
         dirs = sorted(
             (p for p in all_paths if self._is_dir(p, local, remote, baseline)),
@@ -316,6 +328,7 @@ class Syncer:
 
         dir_actions = [(p, self._decide_dir(p, local, remote, baseline)) for p in dirs]
         file_actions = [(p, self._decide_file(p, local, remote, baseline)) for p in files]
+        file_actions = self._escalate_settle(file_actions, dry_run)
         cleanup_actions = [
             (p, self._decide_dir_cleanup(p, local, remote, baseline))
             for p in sorted(dirs, key=lambda p: -p.count("/"))
@@ -475,6 +488,65 @@ class Syncer:
         for p in items:
             self.store.delete(p)
 
+    def _exclude_kind_conflicts(self, all_paths: set, local, remote, stats) -> set:
+        """P1-9: a path that is a file on one side and a directory on the other cannot be
+        reconciled (downloading the dir would clobber the file, or the file decide would
+        settle_wait forever on the dir's 0 bytes). Warn, count it, and drop it AND its
+        subtree from this pass — no transfer, no delete, baseline rows untouched — so the
+        user can rename one side. Surfacing it beats silently never-syncing it."""
+        conflicts = {p for p in (set(local) & set(remote)) if local[p].kind != remote[p].kind}
+        if not conflicts:
+            return all_paths
+        for c in sorted(conflicts):
+            log.warning(
+                "kind conflict at '%s' (local=%s, remote=%s); skipping it and its subtree "
+                "this pass — rename one side to resolve",
+                c,
+                local[c].kind,
+                remote[c].kind,
+            )
+            stats.errors += 1
+        return {p for p in all_paths if not any(p == c or p.startswith(c + "/") for c in conflicts)}
+
+    def _escalate_settle(self, file_actions, dry_run):
+        """P1-10: a 0-byte remote husk shadowing a non-empty local file is deferred
+        (settle_wait) so an in-flight upload is not trampled. But a genuinely-empty remote
+        would livelock forever, and a one-shot `sync` could never resolve it. Count
+        consecutive settle passes per path in the meta table; after settle_max_passes,
+        escalate to a conflict so the policy resolves it. Counts persist across runs."""
+        counts = self._load_settle_counts()
+        threshold = max(1, int(self.cfg.settle_max_passes))
+        new_counts: dict[str, int] = {}
+        out = []
+        for relpath, op in file_actions:
+            if op != "settle_wait":
+                out.append((relpath, op))  # resolved/other -> its count drops out below
+                continue
+            n = counts.get(relpath, 0) + 1
+            # Keep the count even when escalating: if the escalated conflict fails
+            # transiently and the path is still a husk next pass, it re-escalates at once
+            # rather than restarting the countdown (no re-livelock).
+            new_counts[relpath] = n
+            if n >= threshold:
+                log.warning(
+                    "%s stayed an empty/unsettled remote for %d passes; escalating to conflict",
+                    relpath,
+                    n,
+                )
+                out.append((relpath, "conflict"))
+            else:
+                out.append((relpath, op))
+        if not dry_run and new_counts != counts:
+            self.store.set_meta("settle_counts", json.dumps(new_counts))
+        return out
+
+    def _load_settle_counts(self) -> dict[str, int]:
+        try:
+            data = json.loads(self.store.get_meta("settle_counts") or "{}")
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
     # ------------------------------------------------------------ decisions ---
     def _decide_file(self, relpath, local, remote, baseline) -> str:
         lentry: Optional[LocalEntry] = local.get(relpath)
@@ -482,24 +554,48 @@ class Syncer:
         base: Optional[BaselineEntry] = baseline.get(relpath)
         local_changed = lentry is not None and (
             base is None
-            or self._changed(lentry.size, lentry.mtime, base.local_size, base.local_mtime)
+            or self._changed(
+                lentry.size, lentry.mtime, base.local_size, base.local_mtime, MTIME_TOL_LOCAL
+            )
         )
         remote_changed = rentry is not None and (
             base is None
-            or self._changed(rentry.size, rentry.mtime, base.remote_size, base.remote_mtime)
+            or self._changed(
+                rentry.size, rentry.mtime, base.remote_size, base.remote_mtime, MTIME_TOL
+            )
         )
         if lentry and rentry:
             if local_changed and remote_changed:
-                # Simultaneous create where the remote is an empty husk: iCloud
-                # publishes the record before the content finishes uploading from the
-                # other device. Judging now backs up 0 bytes and tramples the in-flight
-                # file — wait a pass for the remote to settle.
-                if base is None and rentry.size == 0 and lentry.size > 0:
-                    return "settle_wait"
+                if base is None:
+                    # First sight of a path present on both sides (prepopulated vault or
+                    # the post-rebaseline first pass). Adopt-identical kills the rebaseline
+                    # conflict storm — but only after VERIFYING the bytes match: equal
+                    # size + close mtime is not proof of equal content (same-length notes
+                    # collide), and recording a false "they agree" would freeze a real
+                    # divergence with no backup. verify_adopt downloads + byte-compares,
+                    # then records (truly identical) or resolves as a conflict (different).
+                    if lentry.size == rentry.size and abs(lentry.mtime - rentry.mtime) <= MTIME_TOL:
+                        return "verify_adopt"
+                    # Simultaneous create where the remote is an empty husk: iCloud
+                    # publishes the record before the content finishes uploading from the
+                    # other device. Wait rather than back up 0 bytes over the live file.
+                    if rentry.size == 0 and lentry.size > 0:
+                        return "settle_wait"
                 return "conflict"
             if local_changed:
                 return "upload"
             if remote_changed:
+                # Publish-before-content on an EDIT: the remote record dropped to 0 bytes
+                # while its new content uploads from another device. Downloading the husk
+                # now would truncate the local file — wait (settle escalation resolves it
+                # if the remote is genuinely empty).
+                if (
+                    rentry.size == 0
+                    and lentry.size > 0
+                    and base is not None
+                    and base.remote_size > 0
+                ):
+                    return "settle_wait"
                 return "download"
             if (
                 self.cfg.verify_remote_etag
@@ -583,6 +679,8 @@ class Syncer:
                 )
             elif op == "record":
                 self._record(relpath, lentry, rentry, dry_run)
+            elif op == "verify_adopt":
+                self._verify_adopt(relpath, lentry, rentry, stats, dry_run)
             elif op == "drop_baseline" and not dry_run:
                 self.store.delete(relpath)
         except Exception as exc:  # noqa: BLE001
@@ -638,12 +736,49 @@ class Syncer:
                     log.error("local dir delete failed %s: %s", relpath, exc)
                     stats.errors += 1
 
+    def _verify_adopt(self, relpath, lentry: LocalEntry, rentry: RemoteEntry, stats, dry_run):
+        """Adopt-identical with proof: fetch the remote to a temp and byte-compare to the
+        local file. Identical → record the baseline (no transfer; kills the rebaseline
+        conflict storm). Different → resolve as a real conflict (preserve both). The fetch
+        is verification only, not a vault write, so it is not counted as a download."""
+        if dry_run:
+            return
+        src = self.local_root / relpath
+        with tempfile.TemporaryDirectory(prefix="ifolder-sync-vfy-") as td:
+            tmp = Path(td) / "remote"
+            try:
+                self.client.download(relpath, tmp)
+                identical = src.exists() and filecmp.cmp(src, tmp, shallow=False)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("adopt verify failed for %s; resolving as conflict: %s", relpath, exc)
+                self._resolve_conflict(relpath, lentry, rentry, stats, dry_run)
+                return
+        if identical:
+            self._record(relpath, lentry, rentry, dry_run)
+        else:
+            log.warning("%s: equal size but different content; resolving as conflict", relpath)
+            self._resolve_conflict(relpath, lentry, rentry, stats, dry_run)
+
     # ------------------------------------------------------------ conflicts ---
     def _resolve_conflict(self, relpath, lentry: LocalEntry, rentry: RemoteEntry, stats, dry_run):
         stats.conflicts += 1
         policy = self.cfg.conflict_policy
         log.warning("CONFLICT on %s (policy=%s)", relpath, policy)
         if dry_run:
+            return
+        # Engine-wide safety invariant: a 0-byte side NEVER overwrites a non-empty side,
+        # regardless of policy or mtime. An empty file is almost always a publish-before-
+        # content husk or an accidental/observed truncation, and its mtime is set by the
+        # other device — so without this, `newer`/`remote` could download emptiness over a
+        # real note (content loss). A genuinely-cleared note can be re-cleared by the user;
+        # lost content cannot be recovered.
+        if rentry.size == 0 and lentry.size > 0:
+            log.warning("  remote is empty; keeping local content (an empty side never wins)")
+            self._do_upload(relpath, stats, False)
+            return
+        if lentry.size == 0 and rentry.size > 0:
+            log.warning("  local is empty; keeping remote content (an empty side never wins)")
+            self._do_download(relpath, rentry, stats, False)
             return
         if policy == "local":
             self._do_upload(relpath, stats, False)

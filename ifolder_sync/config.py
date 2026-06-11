@@ -205,6 +205,10 @@ class Config:
     interval_active_seconds: int = 20
     active_window_seconds: int = 300
     remote_trash: bool = True
+    # A 0-byte remote file shadowing a non-empty local file is usually a publish-before-
+    # content upload from another device, so the engine waits (settle_wait). If it stays
+    # empty this many passes it is judged genuinely empty and escalated to a conflict.
+    settle_max_passes: int = 3
     # Treat a same-size/same-mtime remote file whose iCloud etag differs from the
     # baseline as a remote change (download it). Safe: the loser is the local copy only
     # when local is otherwise unchanged, and the new etag is recorded so it cannot loop.
@@ -254,6 +258,7 @@ class Config:
             "full_walk_interval_seconds",
             "request_timeout_seconds",
             "baseline_backups",
+            "settle_max_passes",
         ):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f"`{name}` must be an integer.")
