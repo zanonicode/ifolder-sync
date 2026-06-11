@@ -7,6 +7,8 @@ carry behavior changes).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-11
+
 Phase D — refactor & performance, no behavior change beyond the items called out below.
 
 ### Added
@@ -81,7 +83,8 @@ Phase D — refactor & performance, no behavior change beyond the items called o
   installed no dependencies. Moved into `[project]`, added an SPDX license and a CI build
   gate (build + install across Python 3.10–3.14, ruff + mypy + pytest).
 
-[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.11.0
 [0.10.3]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.10.3
 [0.10.2]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.10.2
 [0.10.1]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.10.1
