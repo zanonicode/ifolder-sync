@@ -501,6 +501,17 @@ class Syncer:
                 return "upload"
             if remote_changed:
                 return "download"
+            if (
+                self.cfg.verify_remote_etag
+                and base is not None
+                and base.remote_etag
+                and rentry.etag
+                and base.remote_etag != rentry.etag
+            ):
+                # Same size+mtime but the iCloud etag moved: the remote content changed
+                # under an identical signature (a same-size edit, or publish-before-
+                # content). Rescue it; _do_download records the new etag so this fires once.
+                return "download"
             return "record"
         if lentry and not rentry:
             if base is None:
@@ -724,7 +735,9 @@ class Syncer:
         self.client.download(relpath, dest)
         st = dest.stat()
         self.store.upsert(
-            BaselineEntry(relpath, "file", st.st_size, st.st_mtime, rentry.size, rentry.mtime)
+            BaselineEntry(
+                relpath, "file", st.st_size, st.st_mtime, rentry.size, rentry.mtime, rentry.etag
+            )
         )
 
     def _delete_local(self, relpath, stats, dry_run):
@@ -750,5 +763,7 @@ class Syncer:
         if dry_run:
             return
         self.store.upsert(
-            BaselineEntry(relpath, "file", lentry.size, lentry.mtime, rentry.size, rentry.mtime)
+            BaselineEntry(
+                relpath, "file", lentry.size, lentry.mtime, rentry.size, rentry.mtime, rentry.etag
+            )
         )

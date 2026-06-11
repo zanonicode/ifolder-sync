@@ -205,6 +205,15 @@ class Config:
     interval_active_seconds: int = 20
     active_window_seconds: int = 300
     remote_trash: bool = True
+    # Treat a same-size/same-mtime remote file whose iCloud etag differs from the
+    # baseline as a remote change (download it). Safe: the loser is the local copy only
+    # when local is otherwise unchanged, and the new etag is recorded so it cannot loop.
+    verify_remote_etag: bool = True
+    # A folder listing whose item count is below iCloud's reported directChildrenCount
+    # may be silently truncated (would read as deletions). False = log a warning (the
+    # delete threshold still backstops mass deletion); True = abort the pass (zero
+    # deletions) like the rest of the walk guard.
+    strict_child_count: bool = False
     delete_threshold_pct: int = 50
     delete_threshold_count: int = 100
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))

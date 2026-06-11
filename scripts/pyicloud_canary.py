@@ -74,6 +74,21 @@ def main() -> int:
         ),
     )
 
+    # P1-6 atomic session save: the symbols the replacement of _save_session_data binds.
+    import pyicloud.session as pysession
+    from pyicloud.session import PyiCloudSession
+
+    check("PyiCloudSession._save_session_data", lambda: PyiCloudSession._save_session_data)
+    for prop in ("session_path", "cookiejar_path", "data"):
+        check(
+            f"PyiCloudSession.{prop} property",
+            lambda p=prop: require(isinstance(getattr(PyiCloudSession, p, None), property)),
+        )
+    check(
+        "session.NON_PERSISTED_SESSION_KEYS",
+        lambda: require(isinstance(pysession.NON_PERSISTED_SESSION_KEYS, frozenset)),
+    )
+
     import importlib.metadata as im
 
     version = im.version("pyicloud")

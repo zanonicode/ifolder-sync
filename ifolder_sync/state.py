@@ -22,6 +22,10 @@ class BaselineEntry:
     local_mtime: float
     remote_size: int
     remote_mtime: float
+    # iCloud entity tag of the remote file at last sync: a content fingerprint that
+    # catches a same-size/same-mtime remote edit (which size+mtime alone would miss).
+    # "" when unknown (dirs, or just-uploaded files whose new etag we did not fetch).
+    remote_etag: str = ""
 
 
 class CorruptBaselineError(RuntimeError):
@@ -90,12 +94,23 @@ class StateStore:
                 local_size   INTEGER NOT NULL DEFAULT 0,
                 local_mtime  REAL    NOT NULL DEFAULT 0,
                 remote_size  INTEGER NOT NULL DEFAULT 0,
-                remote_mtime REAL    NOT NULL DEFAULT 0
+                remote_mtime REAL    NOT NULL DEFAULT 0,
+                remote_etag  TEXT    NOT NULL DEFAULT ''
             )
             """
         )
         self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for baselines created by older versions. Safe and
+        idempotent: ADD COLUMN with a default never rewrites existing rows."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(baseline)")}
+        if "remote_etag" not in cols:
+            self.conn.execute(
+                "ALTER TABLE baseline ADD COLUMN remote_etag TEXT NOT NULL DEFAULT ''"
+            )
 
     def all(self) -> dict[str, BaselineEntry]:
         rows = self.conn.execute("SELECT * FROM baseline").fetchall()
@@ -110,19 +125,22 @@ class StateStore:
             local_mtime=r["local_mtime"],
             remote_size=r["remote_size"],
             remote_mtime=r["remote_mtime"],
+            remote_etag=r["remote_etag"],
         )
 
     def upsert(self, entry: BaselineEntry) -> None:
         self.conn.execute(
             """
-            INSERT INTO baseline (relpath, kind, local_size, local_mtime, remote_size, remote_mtime)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO baseline
+                (relpath, kind, local_size, local_mtime, remote_size, remote_mtime, remote_etag)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(relpath) DO UPDATE SET
                 kind=excluded.kind,
                 local_size=excluded.local_size,
                 local_mtime=excluded.local_mtime,
                 remote_size=excluded.remote_size,
-                remote_mtime=excluded.remote_mtime
+                remote_mtime=excluded.remote_mtime,
+                remote_etag=excluded.remote_etag
             """,
             (
                 entry.relpath,
@@ -131,6 +149,7 @@ class StateStore:
                 entry.local_mtime,
                 entry.remote_size,
                 entry.remote_mtime,
+                entry.remote_etag,
             ),
         )
 

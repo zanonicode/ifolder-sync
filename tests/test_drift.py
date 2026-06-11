@@ -7,8 +7,11 @@ snapshot must abort the pass with ZERO deletions on either side.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -236,6 +239,16 @@ class _FakeNode:
     def get_children(self):
         self.calls += 1
         return self._children
+
+
+def monkeypatch_navigate(client, node):
+    """Make client.download resolve relpath to `node` (bypass the real Drive tree)."""
+
+    class _Parent:
+        def __getitem__(self, name):
+            return node
+
+    client._navigate = lambda relpath, create_dirs=False: (_Parent(), "x")
 
 
 def test_parallel_walk_lists_tree_and_prunes(monkeypatch):
@@ -983,3 +996,211 @@ def test_rebaseline_backup_survives_uncheckpointed_wal(tmp_path, monkeypatch):
         assert len(restored.all()) == 50  # rows preserved, not lost to the WAL
     assert not db.exists()
     assert not db.with_name(db.name + "-wal").exists()  # siblings not orphaned
+
+
+# --- Phase C Batch 3: client resilience -----------------------------------------
+
+
+def test_baseline_remote_etag_column_migration(tmp_path):
+    """P1-15: a baseline created without the remote_etag column gains it (additive
+    ALTER TABLE) and round-trips the etag."""
+    import sqlite3
+
+    from ifolder_sync.state import BaselineEntry, StateStore
+
+    db = tmp_path / "old.sqlite3"
+    legacy = sqlite3.connect(str(db))
+    legacy.execute(
+        "CREATE TABLE baseline (relpath TEXT PRIMARY KEY, kind TEXT NOT NULL, "
+        "local_size INTEGER, local_mtime REAL, remote_size INTEGER, remote_mtime REAL)"
+    )
+    legacy.execute("INSERT INTO baseline VALUES ('old.md','file',1,1.0,1,1.0)")
+    legacy.commit()
+    legacy.close()
+
+    with StateStore(db) as store:  # opens -> migrates
+        assert store.all()["old.md"].remote_etag == ""  # legacy row defaults to ""
+        store.upsert(BaselineEntry("new.md", "file", 2, 2.0, 2, 2.0, "etag-xyz"))
+        store.commit()
+        assert store.all()["new.md"].remote_etag == "etag-xyz"
+
+
+def test_etag_divergence_triggers_download(make_syncer, fake, local_dir):
+    """P1-15: a remote file with the SAME size+mtime as the baseline but a DIFFERENT
+    iCloud etag is treated as a remote change and downloaded (catches same-size edits)."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer()
+    write_file(local_dir, "n.md", b"AAA", mtime=1000)
+    fake.put("n.md", b"AAA", mtime=1000, etag="e1")
+    # Seed a clean baseline directly (the both-sides-create adopt-identical case is P1-1,
+    # Batch 4; here we isolate the etag-divergence behavior).
+    store.upsert(BaselineEntry("n.md", "file", 3, 1000.0, 3, 1000.0, "e1"))
+    store.commit()
+
+    # Remote content changes but size+mtime are identical; only the etag moves.
+    fake.put("n.md", b"BBB", mtime=1000, etag="e2")
+    s = syncer.sync_once()
+    assert s.downloaded == 1, s.summary()
+    assert (local_dir / "n.md").read_bytes() == b"BBB"  # diverged content rescued
+    assert store.all()["n.md"].remote_etag == "e2"
+
+    s = syncer.sync_once()  # etags now match -> no repeat download (no loop)
+    assert s.downloaded == 0, s.summary()
+    store.close()
+
+
+def test_etag_divergence_disabled(make_syncer, fake, local_dir):
+    """P1-15: with verify_remote_etag off, an etag-only change is NOT acted on."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(verify_remote_etag=False)
+    write_file(local_dir, "n.md", b"AAA", mtime=1000)
+    fake.put("n.md", b"AAA", mtime=1000, etag="e1")
+    store.upsert(BaselineEntry("n.md", "file", 3, 1000.0, 3, 1000.0, "e1"))
+    store.commit()
+
+    fake.put("n.md", b"BBB", mtime=1000, etag="e2")
+    s = syncer.sync_once()
+    assert s.downloaded == 0, s.summary()
+    store.close()
+
+
+def test_download_size_mismatch_aborts_and_keeps_old_file(tmp_path):
+    """P1-15: a truncated download (bytes != listing size) raises and removes the .part
+    so no half-file is installed; the old local file is untouched."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    class _Resp:
+        def __init__(self, data):
+            self.raw = io.BytesIO(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Node:
+        def __init__(self, data, claimed_size):
+            self._data = data
+            self.size = claimed_size
+
+        def open(self, stream=True):
+            return _Resp(self._data)
+
+    c = ICloudClient("x@y.com", max_retries=1)
+    node = _Node(b"AB", claimed_size=99)  # only 2 bytes arrive, listing claims 99
+    monkeypatch_navigate(c, node)
+
+    dest = tmp_path / "f.md"
+    dest.write_bytes(b"OLD")
+    with pytest.raises(OSError):
+        c.download("f.md", dest)
+    assert dest.read_bytes() == b"OLD"  # old file untouched
+    assert not (tmp_path / "f.md.part").exists()  # truncated .part removed
+
+
+def test_download_size_match_installs(tmp_path):
+    """P1-15: a complete download (bytes == listing size) installs normally."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    class _Resp:
+        def __init__(self, data):
+            self.raw = io.BytesIO(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Node:
+        def __init__(self, data):
+            self._data = data
+            self.size = len(data)
+
+        def open(self, stream=True):
+            return _Resp(self._data)
+
+    c = ICloudClient("x@y.com", max_retries=1)
+    monkeypatch_navigate(c, _Node(b"HELLO"))
+    dest = tmp_path / "f.md"
+    c.download("f.md", dest)
+    assert dest.read_bytes() == b"HELLO"
+
+
+def test_strict_child_count_aborts_on_truncated_listing(monkeypatch):
+    """P1-17: with strict_child_count, a listing shorter than directChildrenCount raises
+    (walk guard -> zero deletions); off (default) it only warns."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    kids = [_FakeNode("a.md", "file", size=1), _FakeNode("b.md", "file", size=1)]
+    root = _FakeNode("root", "folder", kids)
+    root.data["directChildrenCount"] = 5  # claims 5, only 2 returned -> truncated
+
+    c = ICloudClient("x@y.com", strict_child_count=True)
+    monkeypatch.setattr(c, "_root_node", lambda: root)
+    with pytest.raises(RuntimeError):
+        c.walk(None)
+
+    c2 = ICloudClient("x@y.com", strict_child_count=False)
+    monkeypatch.setattr(c2, "_root_node", lambda: root)
+    res = c2.walk(None)  # default: warns, returns what it has (no abort)
+    assert set(res) == {"a.md", "b.md"}
+
+
+def test_atomic_session_save_writes_valid_files(tmp_path):
+    """P1-6: the installed atomic save writes the session JSON (minus non-persisted
+    keys) and the cookiejar via tmp + os.replace, at 0600, and is idempotent."""
+    import stat as stat_mod
+
+    from ifolder_sync.icloud_client import ICloudClient
+
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    spath = sdir / "acct.session"
+    cpath = sdir / "acct.cookiejar"
+
+    saved = {"n": 0}
+    seen_modes = []
+
+    class _Cookies:
+        filename = str(cpath)
+
+        def save(self, filename=None, **kw):
+            # write at the prevailing umask, then record the resulting mode: the atomic
+            # writer must have tightened the umask so even this tmp is born 0600 (no
+            # world-readable credential window — invariant 7).
+            Path(filename).write_text("#LWP-Cookies-2.0\nDUMMY\n")
+            seen_modes.append(stat_mod.S_IMODE(os.stat(filename).st_mode))
+
+    class _Session:
+        def __init__(self):
+            self.data = {"session_token": "tok", "trust_token": "trust", "salt": "DROP"}
+            self.session_path = str(spath)
+            self.cookiejar_path = str(cpath)
+            self.cookies = _Cookies()
+
+        def _save_session_data(self):
+            saved["n"] += 1
+
+    class _Api:
+        def __init__(self):
+            self.session = _Session()
+
+    c = ICloudClient("x@y.com")
+    c.api = _Api()
+    c._install_atomic_session_save()
+    c._install_atomic_session_save()  # idempotent: must not double-wrap
+
+    c.api.session._save_session_data()  # trigger an atomic write
+    data = json.loads(spath.read_text())
+    assert data["trust_token"] == "trust"
+    assert "salt" not in data  # NON_PERSISTED_SESSION_KEYS filtered out
+    assert cpath.exists()
+    assert stat_mod.S_IMODE(spath.stat().st_mode) == 0o600  # invariant 7 preserved
+    assert stat_mod.S_IMODE(cpath.stat().st_mode) == 0o600  # cookiejar also 0600
+    assert seen_modes and all(m == 0o600 for m in seen_modes)  # tmp born 0600, no leak window
+    assert not list(sdir.glob("*.tmp"))  # tmps replaced/cleaned, none orphaned
+    assert saved["n"] == 0  # the original save was replaced, not also called

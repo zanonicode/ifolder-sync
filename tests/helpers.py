@@ -46,7 +46,7 @@ class FakeICloud:
         for rel, m in self.files.items():
             if is_ignored is not None and is_ignored(rel):
                 continue
-            out[rel] = RemoteEntry(rel, m["kind"], m.get("size", 0), m["mtime"])
+            out[rel] = RemoteEntry(rel, m["kind"], m.get("size", 0), m["mtime"], m.get("etag", ""))
         return out
 
     def download(self, relpath, dest):
@@ -76,14 +76,15 @@ class FakeICloud:
         m = self.files.get(relpath)
         if not m:
             return None
-        return RemoteEntry(relpath, m["kind"], m.get("size", 0), m["mtime"])
+        return RemoteEntry(relpath, m["kind"], m.get("size", 0), m["mtime"], m.get("etag", ""))
 
-    def put(self, relpath, content: bytes, mtime: float):
+    def put(self, relpath, content: bytes, mtime: float, etag: str = ""):
         self.files[relpath] = {
             "kind": "file",
             "content": content,
             "mtime": mtime,
             "size": len(content),
+            "etag": etag,
         }
 
 

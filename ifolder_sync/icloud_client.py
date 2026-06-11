@@ -14,6 +14,7 @@ import getpass
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -36,7 +37,62 @@ from pyicloud.utils import (
 from .config import Config, session_paths, sessions_dir
 from .retry import with_retry
 
+try:
+    from pyicloud.session import NON_PERSISTED_SESSION_KEYS
+except ImportError:  # pragma: no cover - upstream renamed/removed the symbol
+    NON_PERSISTED_SESSION_KEYS = frozenset()
+
 log = logging.getLogger("ifolder-sync.icloud")
+
+
+def _replace_atomic(dest: str, write) -> None:
+    """Run `write(tmp)` then atomically `os.replace(tmp, dest)`. The tmp name carries
+    the pid so two daemon processes sharing one Apple ID's files never collide on it
+    (cross-process safety without a lock — os.replace is atomic, so last-writer-wins
+    installs a complete file either way). A failed write leaves `dest` untouched."""
+    tmp = f"{dest}.{os.getpid()}.tmp"
+    try:
+        write(tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_session_atomic(session) -> None:
+    """Write pyicloud's session JSON and cookiejar atomically, each born 0600 (no
+    world-readable window for the cookie tokens). Replaces pyicloud's in-place
+    truncate-write so a concurrent reader/writer never sees a torn file (which would drop
+    the trust token -> a silent re-2FA). Modes are set explicitly per file (not via a
+    process-global umask), so this stays safe even if the caller is ever multi-threaded."""
+    data = {k: v for k, v in dict(session.data).items() if k not in NON_PERSISTED_SESSION_KEYS}
+
+    def _dump(path: str) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    _replace_atomic(session.session_path, _dump)
+
+    cookies = session.cookies
+    if getattr(cookies, "filename", None):
+
+        def _save(path: str) -> None:
+            # Pre-create the tmp at 0600; LWPCookieJar.save open()s it "w", which
+            # truncates but preserves an existing file's mode, so the tokens never pass
+            # through a world-readable inode.
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            cookies.save(filename=path)
+            # PyiCloudCookieJar.save swallows RuntimeError and can write nothing; never
+            # replace a good cookiejar with a missing/empty snapshot.
+            if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                raise OSError("cookiejar save produced no/empty file")
+
+        _replace_atomic(session.cookiejar_path, _save)
+
 
 # Apple's error code for "wrong verification code" (covers device AND SMS).
 APPLE_WRONG_CODE = -21669
@@ -56,6 +112,7 @@ class RemoteEntry:
     kind: str  # "file" | "dir"
     size: int
     mtime: float  # epoch UTC
+    etag: str = ""  # iCloud entity tag (content fingerprint); "" if unavailable
 
 
 class _WalkCacheMiss(Exception):
@@ -84,6 +141,7 @@ class ICloudClient:
         walk_workers: int = 4,
         full_walk_interval: int = 600,
         request_timeout: int = 60,
+        strict_child_count: bool = False,
     ):
         self.apple_id = apple_id
         self.remote_root = remote_folder.strip("/")
@@ -93,6 +151,7 @@ class ICloudClient:
         self.walk_workers = max(1, int(walk_workers))
         self.full_walk_interval = max(0, int(full_walk_interval))
         self.request_timeout = int(request_timeout)
+        self.strict_child_count = bool(strict_child_count)
         self.api: Optional[PyiCloudService] = None
         # Etag-keyed walk cache: folder relpath -> subtree fingerprint, and
         # folder relpath -> its (already ignore-pruned) children entries.
@@ -113,6 +172,7 @@ class ICloudClient:
             walk_workers=cfg.walk_workers,
             full_walk_interval=cfg.full_walk_interval_seconds,
             request_timeout=cfg.request_timeout_seconds,
+            strict_child_count=cfg.strict_child_count,
         )
 
     def _retry(self, fn: Callable[[], T]) -> T:
@@ -176,6 +236,7 @@ class ICloudClient:
         self._handle_2fa(interactive=interactive)
         self._secure_session_files()
         self._install_request_timeout()
+        self._install_atomic_session_save()
 
     def _install_request_timeout(self) -> None:
         """Wrap session.request so any call without an explicit timeout gets a
@@ -198,6 +259,32 @@ class ICloudClient:
 
         session.request = _with_timeout
         session._ifolder_timeout_wrapped = True
+
+    def _install_atomic_session_save(self) -> None:
+        """Replace pyicloud's `_save_session_data` (it runs after EVERY request) with an
+        atomic version. pyicloud truncate-writes the session JSON and the cookiejar in
+        place; the parallel walk's threads (in-process) and other daemons on the same
+        Apple ID (cross-process) can interleave those writes and tear the file -> a
+        dropped trust token -> a silent re-2FA. A per-process tmp + os.replace makes each
+        write all-or-nothing and collision-free across processes; a threading.Lock
+        serializes the in-process walk threads. Best-effort: a save failure never breaks
+        the triggering request (the prior atomic file stays valid)."""
+        if self.api is None:
+            return
+        session = self.api.session
+        if getattr(session, "_ifolder_atomic_save", False):
+            return
+        lock = threading.Lock()
+
+        def _atomic_save() -> None:
+            try:
+                with lock:
+                    _write_session_atomic(session)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not persist session this request (will retry): %s", exc)
+
+        session._save_session_data = _atomic_save
+        session._ifolder_atomic_save = True
 
     # --- on-disk session management ------------------------------------------
     def _clear_session(self) -> None:
@@ -598,23 +685,25 @@ class ICloudClient:
                     else:
                         to_list.append((rel, node, etag))
                 futures = [
-                    (rel, etag, ex.submit(self._retry, node.get_children))
+                    (rel, node, etag, ex.submit(self._retry, node.get_children))
                     for rel, node, etag in to_list
                 ]
                 frontier = []
-                for rel, etag, fut in futures:
+                for rel, node, etag, fut in futures:
                     # fut.result() re-raises listing errors here, keeping the
                     # abort-on-failure guard visible at the walk level.
-                    frontier += self._ingest_children(rel, fut.result(), is_ignored, out)
+                    frontier += self._ingest_children(rel, node, fut.result(), is_ignored, out)
                     if etag:
                         self._etag_cache[rel] = etag
         if not allow_cache:
             self._last_full_walk = time.time()
         return out
 
-    def _ingest_children(self, rel, children, is_ignored, out) -> list[tuple]:
+    def _ingest_children(self, rel, node, children, is_ignored, out) -> list[tuple]:
         """Record one fresh listing into `out` and the cache; return the subfolder
         (relpath, node, etag) tuples that form the next BFS level."""
+        children = list(children)
+        self._check_child_count(rel, node, len(children))
         entries: list[_CachedChild] = []
         frontier: list[tuple] = []
         for child in children:
@@ -622,17 +711,42 @@ class ICloudClient:
             if is_ignored is not None and is_ignored(crel):
                 continue  # prune: never listed, never cached
             mtime = self._node_mtime(child)
+            child_etag = self._child_etag(child)
             if child.type == "folder":
-                child_etag = child.data.get("etag")
-                out[crel] = RemoteEntry(crel, "dir", 0, mtime)
+                out[crel] = RemoteEntry(crel, "dir", 0, mtime, child_etag or "")
                 entries.append(_CachedChild(child.name, "dir", 0, mtime, child_etag))
                 frontier.append((crel, child, child_etag))
             else:
                 size = int(child.size or 0)
-                out[crel] = RemoteEntry(crel, "file", size, mtime)
-                entries.append(_CachedChild(child.name, "file", size, mtime, None))
+                out[crel] = RemoteEntry(crel, "file", size, mtime, child_etag or "")
+                entries.append(_CachedChild(child.name, "file", size, mtime, child_etag))
         self._children_cache[rel] = entries
         return frontier
+
+    @staticmethod
+    def _child_etag(child) -> Optional[str]:
+        data = getattr(child, "data", None)
+        return data.get("etag") if isinstance(data, dict) else None
+
+    def _check_child_count(self, rel: str, node, got: int) -> None:
+        """Guard against a silently-truncated listing: drivews returns each folder's
+        directChildrenCount alongside its items, so fewer items than that count signals
+        truncation (which would read as deletions). The items and the count come from the
+        same response, so they should agree. strict_child_count escalates to an abort."""
+        expected = getattr(node, "data", {}).get("directChildrenCount")
+        if not isinstance(expected, int) or expected <= 0 or got >= expected:
+            return
+        msg = (
+            f"remote folder '{rel or '(root)'}' listed {got} of {expected} items "
+            "(directChildrenCount) — the listing may be truncated"
+        )
+        if self.strict_child_count:
+            raise RuntimeError(msg)  # walk guard -> pass aborts, zero deletions
+        log.warning(
+            "%s; treating the listed items as authoritative (set strict_child_count "
+            "to abort the pass instead)",
+            msg,
+        )
 
     def _emit_cached(self, rel: str, out: dict[str, RemoteEntry]) -> None:
         """Emit a folder's whole subtree from cache, zero network calls: its etag
@@ -642,7 +756,7 @@ class ICloudClient:
             raise _WalkCacheMiss(rel)
         for child in cached:
             crel = f"{rel}/{child.name}" if rel else child.name
-            out[crel] = RemoteEntry(crel, child.kind, child.size, child.mtime)
+            out[crel] = RemoteEntry(crel, child.kind, child.size, child.mtime, child.etag or "")
             if child.kind == "dir":
                 self._emit_cached(crel, out)
 
@@ -666,13 +780,32 @@ class ICloudClient:
         parent, name = self._navigate(relpath)
         node = parent[name]
         tmp = str(dest) + PART_SUFFIX
+        # The listing size for a real file equals its byte count; 0/unknown skips the
+        # check by design (0-byte notes stream empty; folders are never downloaded).
+        expected = int(getattr(node, "size", None) or 0)
 
         def _fetch():
             with node.open(stream=True) as resp:
                 with open(tmp, "wb") as fh:
                     copyfileobj(resp.raw, fh)
+            # Never install a truncated download: a dropped connection mid-stream leaves
+            # a short .part. Compare bytes written to the listing size before os.replace;
+            # a mismatch is retried (transient), and on final failure the .part is removed
+            # so the old local file is kept (no half-file ever lands in the vault).
+            got = os.path.getsize(tmp)
+            if expected and got != expected:
+                raise OSError(
+                    f"download size mismatch for {relpath}: got {got} bytes, expected {expected}"
+                )
 
-        self._retry(_fetch)
+        try:
+            self._retry(_fetch)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         os.replace(tmp, dest)
 
     def upload(self, relpath: str, src: "os.PathLike", mtime: float) -> None:
