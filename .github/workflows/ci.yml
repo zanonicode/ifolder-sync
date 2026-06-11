@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 9 * * 1" # weekly canary against the latest in-range pyicloud
+  workflow_dispatch:
 
 jobs:
   build:
@@ -38,3 +41,16 @@ jobs:
       - run: ruff format --check ifolder_sync tests
       - run: mypy ifolder_sync
       - run: pytest --cov=ifolder_sync --cov-report=term --cov-fail-under=65
+
+  canary:
+    name: pyicloud canary (latest in-range)
+    runs-on: macos-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade -e ".[dev]"
+      - run: python scripts/pyicloud_canary.py
+      - run: pytest -q

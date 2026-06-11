@@ -253,12 +253,11 @@ class ICloudClient:
         return api._get_auth_headers({"Accept": "application/json"})
 
     def _trigger_device_push(self, api) -> bool:
-        """Ask Apple to PUSH a 6-digit code to trusted devices. This is the central
-        fix: since ~iOS 26/2026 Apple no longer sends the code automatically on API
-        logins -- you must request it. PUT /verify/trusteddevice/securitycode with no
-        body (new flow); fallback GET /verify/trusteddevice (legacy). Returns True if
-        either responded OK. (Same path as validate; verb differs: PUT asks, POST
-        validates.)"""
+        """Raw fallback: ask Apple to PUSH a 6-digit code to trusted devices.
+        Since ~iOS 26/2026 Apple no longer sends the code automatically on API
+        logins. pyicloud >=2.5 owns this push (sent inside authenticate(), and
+        re-requestable via the public request_2fa_code()); this raw PUT stays only
+        as a fallback for upstreams that lack it. PUT asks, POST validates."""
         headers = self._auth_headers(api)
         try:
             api.session.put(
@@ -274,21 +273,28 @@ class ICloudClient:
                 print(f"(Warning: could not trigger the 2FA push: {exc_put})")
                 return False
 
+    def _resend_push(self, api) -> bool:
+        """Re-request the 2FA push. Prefer upstream's request_2fa_code() (it knows
+        the active challenge type: trusted-device bridge, sms, security key);
+        fall back to the raw PUT for upstreams that lack it."""
+        try:
+            return bool(api.request_2fa_code())
+        except AttributeError:
+            return self._trigger_device_push(api)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(Warning: could not re-request the 2FA push: {exc})")
+            return False
+
     def _prompt_2fa(self, api) -> None:
-        pushed = self._trigger_device_push(api)
+        # pyicloud >=2.5 already pushed the code inside authenticate(); pushing
+        # again here would land a second, confusing prompt on the user's devices.
         print("\n== Apple two-factor verification (2FA) ==")
-        if pushed:
-            print(
-                "Requested a 6-digit code: it appears NOW as a pop-up\n"
-                "('Sign-In Request') on your Apple devices signed into THIS account --\n"
-                "tap 'Allow' to see the 6 digits (check Notification Center if it does\n"
-                "not pop). It expires in ~1 minute. If nothing arrives, use [r]esend or [s]ms."
-            )
-        else:
-            print(
-                "Could not trigger the push automatically. Use [r]esend to try again,\n"
-                "or [s]ms to receive the code by text message."
-            )
+        print(
+            "A 6-digit code request should appear NOW as a pop-up ('Sign-In Request')\n"
+            "on your Apple devices signed into THIS account -- tap 'Allow' to see the\n"
+            "6 digits (check Notification Center if it does not pop). It expires in\n"
+            "~1 minute. If nothing arrived, use [r]esend or [s]ms."
+        )
         self._code_loop(api)
 
     def _code_loop(self, api) -> None:
@@ -303,8 +309,10 @@ class ICloudClient:
                 raise RuntimeError("2FA cancelled by the user.")
             low = choice.lower()
             if low == "r":
-                if self._trigger_device_push(api):
+                if self._resend_push(api):
                     print("Push resent to trusted devices.")
+                else:
+                    print("Could not resend the push; try [s]ms.")
                 channel = "device"
                 continue
             if low == "s":

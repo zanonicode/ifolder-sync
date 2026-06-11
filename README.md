@@ -34,7 +34,8 @@ FSEvents watcher). Built for an **Obsidian vault**, with safe handling of the
 ## Requirements
 
 - **macOS** (developed and tested on macOS 26 only; earlier versions untested).
-- **Python ≥ 3.9** (the system Python works).
+- **Python ≥ 3.10** — the macOS system Python (3.9) is too old; install one with
+  [Homebrew](https://brew.sh) (`brew install python`) or pyenv.
 - An **Apple ID you control**, with two-factor authentication and its **primary
   password** (app-specific passwords do not work — see [Password](#password)).
 
@@ -45,15 +46,12 @@ Not yet published on PyPI — install from source:
 ```bash
 git clone https://github.com/zanonicode/ifolder-sync.git
 cd ifolder-sync
-python3 -m venv .venv
+python3.13 -m venv .venv          # any Python >= 3.10
 source .venv/bin/activate
 pip install -e .
 # for development (tests, lint, format, types):
 pip install -e ".[dev]"
 ```
-
-> The system Python (3.9, LibreSSL) emits a harmless `NotOpenSSLWarning`. To silence
-> it, use a Homebrew/pyenv Python built against OpenSSL.
 
 ## Quick start
 
