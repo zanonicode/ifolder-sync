@@ -775,6 +775,175 @@ def test_run_sync_stops_clean_on_service_not_activated(tmp_path, monkeypatch):
     d.store.close()
 
 
+def test_is_session_relapse_classifier_distinguishes_recoverable_from_terminal():
+    """The classifier must say YES to the recoverable 421 LOGIN_TOKEN_EXPIRED (and its
+    code=None 'Missing X-APPLE-WEBAUTH-TOKEN cookie' variant) but NO to a transient 503 and
+    to 409/450/500 (which share the rewritten 'Authentication required for Account.' reason
+    yet genuinely need 2FA, so must keep clean-stopping — not reconnect)."""
+    from pyicloud.const import AppleAuthError
+    from pyicloud.exceptions import PyiCloudAPIResponseException
+
+    from ifolder_sync.icloud_client import is_session_relapse
+
+    # observed live failure (mid-session drive call): 421, generic API exception
+    assert is_session_relapse(
+        PyiCloudAPIResponseException(
+            "Authentication required for Account.", AppleAuthError.LOGIN_TOKEN_EXPIRED
+        )
+    )
+    # re-validation variant: code=None, reason carries the webauth-cookie string
+    assert is_session_relapse(
+        PyiCloudAPIResponseException("Missing X-APPLE-WEBAUTH-TOKEN cookie", None)
+    )
+    # genuine transient: must NOT trigger a reconnect-storm
+    assert not is_session_relapse(PyiCloudAPIResponseException("Service Unavailable", 503))
+    # 2FA-required (409) shares the rewritten reason but is NOT reconnectable
+    assert not is_session_relapse(
+        PyiCloudAPIResponseException(
+            "Authentication required for Account.", AppleAuthError.TWO_FACTOR_REQUIRED
+        )
+    )
+    assert not is_session_relapse(RuntimeError("boom"))
+
+
+def _relapse_boom(*_a, **_k):
+    from pyicloud.const import AppleAuthError
+    from pyicloud.exceptions import PyiCloudAPIResponseException
+
+    raise PyiCloudAPIResponseException(
+        "Authentication required for Account.", AppleAuthError.LOGIN_TOKEN_EXPIRED
+    )
+
+
+def test_run_sync_reconnects_on_session_relapse(tmp_path, monkeypatch):
+    """A lapsed login token (421) must self-heal: the daemon reconnects in place and keeps
+    running, instead of looping forever in the broad exception handler."""
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+    reconnects = []
+    monkeypatch.setattr(d.client, "connect", lambda *a, **k: reconnects.append(1))
+    monkeypatch.setattr(d.syncer, "sync_once", _relapse_boom)
+
+    d._run_sync("poll")
+
+    assert not d._stop.is_set()
+    assert len(reconnects) == 1  # reconnected once
+    assert d._relapse_count == 1
+    d.store.close()
+
+
+def test_run_sync_stops_when_reconnect_needs_reauth(tmp_path, monkeypatch):
+    """If the in-place reconnect itself needs interactive 2FA, the daemon clean-stops with a
+    'run auth' hint rather than spinning (the trust token is gone, not just the web cookie)."""
+    from pyicloud.exceptions import PyiCloudFailedLoginException
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+    monkeypatch.setattr(d.syncer, "sync_once", _relapse_boom)
+
+    def reconnect_fails(*_a, **_k):
+        raise PyiCloudFailedLoginException("trust token expired")
+
+    monkeypatch.setattr(d.client, "connect", reconnect_fails)
+
+    d._run_sync("poll")
+
+    assert d._stop.is_set()
+    assert "auth" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_run_sync_throttles_reconnect_storm(tmp_path, monkeypatch):
+    """A tight relapse storm must NOT replay SRP every poll (Apple lockout): inside
+    min_reconnect_interval the daemon retries WITHOUT reconnecting."""
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+    d._min_reconnect_interval = 9999
+    reconnects = []
+    monkeypatch.setattr(d.client, "connect", lambda *a, **k: reconnects.append(1))
+    monkeypatch.setattr(d.syncer, "sync_once", _relapse_boom)
+
+    d._run_sync("poll")  # first relapse -> reconnect
+    d._run_sync("poll")  # immediate second -> throttled, no SRP replay
+
+    assert len(reconnects) == 1
+    assert d._relapse_count == 1
+    assert not d._stop.is_set()
+    d.store.close()
+
+
+def test_run_sync_stops_after_max_session_reconnects(tmp_path, monkeypatch):
+    """If the session keeps lapsing with no clean pass between, the bounded budget must
+    clean-stop instead of reconnecting forever."""
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+    d._max_session_reconnects = 2
+    d._min_reconnect_interval = 0  # don't throttle so each relapse reconnects
+    monkeypatch.setattr(d.client, "connect", lambda *a, **k: None)  # reconnect "succeeds"
+    monkeypatch.setattr(d.syncer, "sync_once", _relapse_boom)
+
+    d._run_sync("poll")  # count=1, reconnect
+    d._run_sync("poll")  # count=2, reconnect
+    assert not d._stop.is_set()
+    d._run_sync("poll")  # count=3 > 2 -> stop
+    assert d._stop.is_set()
+    assert "auth" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_completed_pass_resets_relapse_count_and_clears_last_error(tmp_path, monkeypatch):
+    """A pass that completes proves the session is healthy: it must zero the reconnect budget
+    and clear a stale last_error so `status` reflects the recovery (P4-3 / status truthful)."""
+    from ifolder_sync.syncer import SyncStats
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+    d._relapse_count = 3
+    d._set_last_error("auth: session expired earlier")
+    monkeypatch.setattr(d.syncer, "sync_once", lambda *a, **k: SyncStats())
+
+    d._run_sync("poll")
+
+    assert d._relapse_count == 0
+    assert (d.store.get_meta("last_error") or "") == ""
+    d.store.close()
+
+
+def test_session_relapse_classifier_ignores_cookie_string_in_server_body():
+    """Hardening (adversarial review): the WEBAUTH branch anchors on exc.reason, not str(exc),
+    so a terminal 409 whose raw response body merely CONTAINS the cookie string is NOT mistaken
+    for a recoverable relapse (which would trigger a wrong reconnect)."""
+    from types import SimpleNamespace
+
+    from pyicloud.const import AppleAuthError
+    from pyicloud.exceptions import PyiCloudAPIResponseException
+
+    from ifolder_sync.icloud_client import is_session_relapse
+
+    resp = SimpleNamespace(text="server said: ...Missing X-APPLE-WEBAUTH-TOKEN cookie...")
+    exc = PyiCloudAPIResponseException(
+        "Authentication required for Account.", AppleAuthError.TWO_FACTOR_REQUIRED, resp
+    )
+    assert "Missing X-APPLE-WEBAUTH-TOKEN cookie" in str(exc)  # the trap the str() check fell into
+    assert not is_session_relapse(exc)  # reason-anchored -> correctly terminal, no reconnect
+
+
+def test_run_sync_retries_on_transient_during_reconnect(tmp_path, monkeypatch):
+    """Hardening (adversarial review): a transient API error (e.g. 503) raised DURING the
+    reconnect login must not crash or clean-stop the daemon — it retries next poll within the
+    bounded budget, rather than escaping _run_sync and crashing the process."""
+    from pyicloud.exceptions import PyiCloudAPIResponseException
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+
+    def reconnect_blips(*_a, **_k):
+        raise PyiCloudAPIResponseException("Service Unavailable", 503)
+
+    monkeypatch.setattr(d.client, "connect", reconnect_blips)
+    monkeypatch.setattr(d.syncer, "sync_once", _relapse_boom)
+
+    d._run_sync("poll")
+
+    assert not d._stop.is_set()
+    assert "reconnect transient" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
 def test_dangling_and_circular_symlinks_do_not_abort_the_pass(make_syncer, fake, local_dir):
     """P1-12 (adversarial follow-up): a broken/circular symlink must be skipped, never
     reaching p.stat() in a way that raises LocalScanError (invariant 2 false-positive).

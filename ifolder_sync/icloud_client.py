@@ -25,6 +25,7 @@ from shutil import copyfileobj
 from typing import Callable, NamedTuple, Optional, TypeVar
 
 from pyicloud import PyiCloudService
+from pyicloud.const import AppleAuthError
 from pyicloud.exceptions import (
     PyiCloudAPIResponseException,
     PyiCloudFailedLoginException,
@@ -43,7 +44,40 @@ try:
 except ImportError:  # pragma: no cover - upstream renamed/removed the symbol
     NON_PERSISTED_SESSION_KEYS = frozenset()
 
+try:
+    from pyicloud.exceptions import PyiCloud2SARequiredException
+except ImportError:  # pragma: no cover - upstream renamed/removed the symbol
+    PyiCloud2SARequiredException = ()  # isinstance(..., ()) is always False
+
 log = logging.getLogger("ifolder-sync.icloud")
+
+
+def is_session_relapse(exc: BaseException) -> bool:
+    """True for a RECOVERABLE expired-session signal — the iCloud login token lapsed
+    mid-run (HTTP 421 ``AppleAuthError.LOGIN_TOKEN_EXPIRED``, which pyicloud surfaces as a
+    GENERIC ``PyiCloudAPIResponseException``, or the ``code=None`` variant whose reason is
+    exactly "Missing X-APPLE-WEBAUTH-TOKEN cookie"). A fresh ``connect()`` re-establishes
+    the session WITHOUT 2FA while the trust token is still valid, so the daemon reconnects
+    in place rather than looping (transient retry) or clean-stopping (real re-auth).
+
+    Anchored to the 421 code and the WEBAUTH-cookie string — NOT to the shared
+    "Authentication required for Account." reason, which pyicloud ALSO emits for 409/450/500
+    (those genuinely need 2FA and must keep clean-stopping). Total and never raises, so it is
+    safe to call from inside a broad ``except``."""
+    try:
+        if PyiCloud2SARequiredException and isinstance(exc, PyiCloud2SARequiredException):
+            return True
+        if isinstance(exc, PyiCloudAPIResponseException):
+            code = getattr(exc, "code", None)
+            if code == AppleAuthError.LOGIN_TOKEN_EXPIRED or str(code) == "421":
+                return True
+            # Anchor to the exception's REASON (mirroring pyicloud's own _raise_error), NOT
+            # str(exc): str folds in the raw server body, so a terminal 409/450/500 whose
+            # response text happened to contain this string would misclassify as recoverable.
+            return getattr(exc, "reason", "") == "Missing X-APPLE-WEBAUTH-TOKEN cookie"
+    except Exception:  # noqa: BLE001 - a classifier must never throw into the caller's except
+        return False
+    return False
 
 
 def _replace_atomic(dest: str, write) -> None:

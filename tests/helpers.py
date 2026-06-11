@@ -29,8 +29,12 @@ class FakeICloud:
         self.files: dict[str, dict] = {}
         self.fail_walk = False
         self.calls = {
-            k: 0 for k in ("refresh", "walk", "upload", "download", "delete", "stat", "mkdir")
+            k: 0
+            for k in ("refresh", "walk", "upload", "download", "delete", "stat", "mkdir", "connect")
         }
+
+    def connect(self, interactive: bool = True, fresh: bool = False):
+        self.calls["connect"] += 1
 
     def refresh(self):
         self.calls["refresh"] += 1

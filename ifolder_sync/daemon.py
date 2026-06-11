@@ -19,6 +19,7 @@ from typing import Optional
 
 from pyicloud.exceptions import (
     PyiCloud2FARequiredException,
+    PyiCloudAPIResponseException,
     PyiCloudAuthRequiredException,
     PyiCloudFailedLoginException,
     PyiCloudServiceNotActivatedException,
@@ -32,7 +33,7 @@ from .config import (
     tcc_protected,
     trash_dir,
 )
-from .icloud_client import PART_SUFFIX, ICloudClient
+from .icloud_client import PART_SUFFIX, ICloudClient, is_session_relapse
 from .locking import SingleInstanceLock
 from .state import CorruptBaselineError, StateStore
 from .syncer import LocalScanError, Syncer, VaultIdentityError
@@ -65,6 +66,13 @@ class Daemon:
         self._trips = 0
         self._backoff: Optional[int] = None
         self._last_activity = 0.0
+        # Session-relapse self-heal (a lapsed login token, HTTP 421): bounded reconnects.
+        self._relapse_count = 0
+        self._last_reconnect_at = 0.0
+        self._max_session_reconnects = max(0, int(getattr(config, "max_session_reconnects", 5)))
+        self._min_reconnect_interval = max(
+            0, int(getattr(config, "min_reconnect_interval_seconds", 120))
+        )
 
     # ----------------------------------------------------------- preflight ---
     def _preflight(self) -> bool:
@@ -120,6 +128,10 @@ class Daemon:
             if not defer_deletes:
                 self._apply_passes += 1
             stats = self.syncer.sync_once(defer_deletes=defer_deletes)
+            # A pass that completed proves the session is healthy: reset the reconnect
+            # budget and clear any stale error so `status` reflects the recovery, not a ghost.
+            self._relapse_count = 0
+            self._clear_last_error()
             log.info("sync done (%s): %s", reason, stats.summary())
             changed = bool(
                 stats.uploaded or stats.downloaded or stats.deleted_local or stats.deleted_remote
@@ -186,8 +198,14 @@ class Daemon:
             self._stop.set()
             self._wake.set()
         except Exception as exc:  # noqa: BLE001
-            log.exception("sync failed (%s): %s", reason, exc)
-            self._set_last_error(str(exc))
+            # A lapsed login token (HTTP 421) surfaces here as a generic
+            # PyiCloudAPIResponseException; reconnect in place instead of looping. Genuine
+            # transient errors (e.g. 503) keep the plain log + retry-next-poll posture.
+            if is_session_relapse(exc):
+                self._handle_session_relapse(exc)
+            else:
+                log.exception("sync failed (%s): %s", reason, exc)
+                self._set_last_error(str(exc))
         finally:
             self._sync_lock.release()
 
@@ -263,6 +281,84 @@ class Daemon:
             self.store.set_meta("last_error", f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}")
         except Exception:  # noqa: BLE001
             pass
+
+    def _clear_last_error(self):
+        """Reset last_error to empty so `status` stops showing a resolved error. Stored as
+        "" (not via _set_last_error, which prepends a timestamp) so the status renderer's
+        truthy check treats it as 'no error'."""
+        try:
+            self.store.set_meta("last_error", "")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_session_relapse(self, exc) -> None:
+        """The iCloud login token lapsed mid-run (HTTP 421): the in-memory session is stale
+        but the trust token is still valid, so a fresh connect() heals it WITHOUT 2FA.
+        Reconnect in place and let the next pass resume. Two guards against an Apple lockout:
+        never replay SRP more than once per `min_reconnect_interval_seconds`, and clean-stop
+        after `max_session_reconnects` reconnects with no clean pass between (a completed pass
+        resets the counter). If the reconnect itself needs interactive re-auth, clean-stop
+        with a `run auth` hint (exit 0 -> launchd SuccessfulExit=false does not restart)."""
+        now = time.time()
+        if (
+            self._min_reconnect_interval
+            and self._last_reconnect_at
+            and (now - self._last_reconnect_at) < self._min_reconnect_interval
+        ):
+            log.warning(
+                "iCloud session still lapsing (%s); throttling reconnects, retrying next poll",
+                exc,
+            )
+            self._set_last_error(f"session expired (reconnect throttled): {exc}")
+            return
+        self._relapse_count += 1
+        if self._relapse_count > self._max_session_reconnects:
+            log.critical(
+                "iCloud session kept lapsing across %d reconnects — run "
+                "`ifolder-sync auth --profile %s`; stopping daemon",
+                self._max_session_reconnects,
+                self.profile,
+            )
+            self._set_last_error(f"auth: session expired repeatedly: {exc}")
+            self._stop.set()
+            self._wake.set()
+            return
+        log.warning(
+            "iCloud session expired mid-run (%s); reconnecting (%d/%d)",
+            exc,
+            self._relapse_count,
+            self._max_session_reconnects,
+        )
+        self._last_reconnect_at = now
+        try:
+            self.client.connect(interactive=False)
+        except (
+            PyiCloud2FARequiredException,
+            PyiCloudFailedLoginException,
+            PyiCloudAuthRequiredException,
+            PyiCloudServiceNotActivatedException,
+            RuntimeError,
+        ) as rexc:
+            log.critical(
+                "reconnect needs interactive re-auth (%s) — run "
+                "`ifolder-sync auth --profile %s`; stopping daemon",
+                rexc,
+                self.profile,
+            )
+            self._set_last_error(f"auth: reconnect failed: {rexc}")
+            self._stop.set()
+            self._wake.set()
+            return
+        except PyiCloudAPIResponseException as rexc:
+            # A transient blip during the reconnect login (e.g. 503) — do NOT crash the
+            # daemon or clean-stop; the next poll re-attempts the pass (and reconnect) within
+            # the same bounded budget. (PyiCloudServiceNotActivatedException is a subclass but
+            # is caught by the clause above, so it still clean-stops.)
+            log.warning("transient error during reconnect (%s); retrying next poll", rexc)
+            self._set_last_error(f"reconnect transient: {rexc}")
+            return
+        log.info("iCloud session re-established; resuming sync next pass")
+        self._set_last_error(f"session re-established after token expiry ({self._relapse_count})")
 
     def _on_local_change(self):
         self._wake.set()

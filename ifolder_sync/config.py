@@ -188,6 +188,16 @@ class Config:
     # timeout=None by default, so one hung socket would wedge the daemon forever; a
     # timeout turns the hang into a retryable error. <=0 disables (no timeout).
     request_timeout_seconds: int = 60
+    # The iCloud login token (web-auth cookie) lapses after some hours of uptime; a drive
+    # call then raises HTTP 421 LOGIN_TOKEN_EXPIRED. The daemon reconnects in place (no 2FA
+    # while the trust token is still valid) instead of looping every poll. This caps the
+    # consecutive reconnects (with no clean pass between) before it clean-stops with a "run
+    # auth" hint; 0 disables auto-reconnect (clean-stop on the first relapse).
+    max_session_reconnects: int = 5
+    # Minimum seconds between two SRP reconnects, so a pathological relapse storm cannot
+    # replay logins every poll (Apple lockout risk); within the window the daemon retries
+    # without reconnecting.
+    min_reconnect_interval_seconds: int = 120
     # After each successful pass that changed something, the daemon snapshots the
     # baseline DB into a ring of this many rotated copies (recovery net for corruption;
     # never auto-recreated). 0 disables.
