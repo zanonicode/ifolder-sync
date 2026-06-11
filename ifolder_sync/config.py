@@ -234,6 +234,12 @@ class Config:
     # delete threshold still backstops mass deletion); True = abort the pass (zero
     # deletions) like the rest of the walk guard.
     strict_child_count: bool = False
+    # Skip uploading a local file larger than this many MB. pyicloud buffers the whole
+    # file in memory to build the multipart body, so a multi-GB file would spike the
+    # daemon's RSS (OOM risk under launchd). 0 = no limit (default; unchanged behavior).
+    # Note: an over-limit file that is also in a both-sides conflict cannot be pushed, so
+    # the conflict stays unresolved until the limit is raised or the file shrinks.
+    max_file_size_mb: int = 0
     delete_threshold_pct: int = 50
     delete_threshold_count: int = 100
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
@@ -275,6 +281,7 @@ class Config:
             "request_timeout_seconds",
             "baseline_backups",
             "settle_max_passes",
+            "max_file_size_mb",
         ):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f"`{name}` must be an integer.")

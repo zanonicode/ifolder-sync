@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unicodedata
@@ -212,6 +213,7 @@ class Syncer:
         self.trash_dir = trash_dir or default_trash_dir()
         self.ignore_patterns = config.effective_ignore
         self._symlink_warned: set[str] = set()
+        self._oversize_warned: set[str] = set()  # max_file_size_mb: warn once per path
         self._nfc_active: Optional[bool] = None  # probed once (volume normalization)
         self._resolved_root: Optional[Path] = None  # local_root.resolve() memoized once
         # relpath -> (remote_size, remote_mtime, consecutive_failures): backs off a
@@ -1199,12 +1201,59 @@ class Syncer:
         action()
 
     # -------------------------------------------------------------- actions ---
+    def _too_large_to_upload(self, relpath: str, src: Path, stats: SyncStats) -> bool:
+        """True when max_file_size_mb is set and src exceeds it. pyicloud buffers the
+        whole file in memory, so an over-limit upload would spike the daemon's RSS; skip
+        it (counted once, warned once per path). 0 = no limit -> no stat, no behavior
+        change for the default config."""
+        limit_mb = self.cfg.max_file_size_mb
+        if limit_mb <= 0:
+            return False
+        try:
+            size = src.stat().st_size
+        except OSError:
+            return False  # let the real upload path handle a vanished/unreadable file
+        if size <= limit_mb * 1024 * 1024:
+            return False
+        if relpath not in self._oversize_warned:
+            self._oversize_warned.add(relpath)
+            log.warning(
+                "skipping %s: %d bytes exceeds max_file_size_mb=%d (pyicloud buffers the "
+                "whole file in memory; raise the limit to sync it)",
+                relpath,
+                size,
+                limit_mb,
+            )
+        stats.errors += 1
+        return True
+
+    def _snapshot_for_upload(self, src: Path, snap: Path) -> None:
+        """Freeze src to snap for upload. Prefer an APFS clonefile (`cp -c`): a
+        copy-on-write clone is O(1) and does not physically duplicate a large file, and it
+        preserves the source mtime so invariant 6 (snapshot mtime == source mtime ==
+        recorded remote mtime, no upload->download ping-pong) still holds. Falls back to
+        shutil.copy2 on a non-APFS volume (cp's own fallback), a non-zero cp exit, or a
+        missing cp; a vanished source then surfaces as copy2's FileNotFoundError (which the
+        caller handles)."""
+        try:
+            subprocess.run(
+                ["/bin/cp", "-c", str(src), str(snap)],
+                check=True,
+                capture_output=True,
+            )
+            return
+        except (subprocess.CalledProcessError, OSError):
+            pass  # cp missing / unsupported / src gone -> let copy2 decide (it may raise)
+        shutil.copy2(src, snap)
+
     def _do_upload(self, relpath: str, stats: SyncStats, dry_run: bool) -> None:
+        src = self.local_root / relpath
+        if self._too_large_to_upload(relpath, src, stats):
+            return
         stats.uploaded += 1
         log.info("UP   %s", relpath)
         if dry_run:
             return
-        src = self.local_root / relpath
         # Upload a frozen snapshot, not the live file: under continuous editing
         # (editor autosave) the file changes between the scan and the send, so the
         # scan-time signature would describe bytes other than the ones uploaded —
@@ -1215,7 +1264,7 @@ class Syncer:
         with tempfile.TemporaryDirectory(prefix="ifolder-sync-up-") as td:
             snap = Path(td) / src.name
             try:
-                shutil.copy2(src, snap)
+                self._snapshot_for_upload(src, snap)
             except FileNotFoundError:
                 log.warning("vanished before upload, skipping: %s", relpath)
                 stats.errors += 1
