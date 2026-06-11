@@ -1,5 +1,8 @@
 # ifolder-sync
 
+[![CI](https://github.com/zanonicode/ifolder-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/zanonicode/ifolder-sync/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A **macOS** CLI daemon that **bidirectionally** syncs one folder of a **specific
 iCloud Drive account** (not necessarily the one signed into the Mac) with a local
 folder — **every X seconds** (remote polling) **and on every local change** (real-time

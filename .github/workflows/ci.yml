@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build & install gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build
+      - run: python -m build
+      - name: install wheel and smoke-test the CLI
+        run: |
+          python -m pip install dist/*.whl
+          ifolder-sync --help
+          python -m pip show ifolder-sync
+
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check ifolder_sync tests
+      - run: black --check ifolder_sync tests
+      - run: mypy ifolder_sync
+      - run: pytest --cov=ifolder_sync --cov-report=term --cov-fail-under=65
