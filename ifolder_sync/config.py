@@ -24,9 +24,15 @@ APP_NAME = "ifolder-sync"
 # OS/iCloud noise applied to every vault. The Obsidian per-device config
 # (OBSIDIAN_VOLATILE) is applied on top only when Config.obsidian is true --
 # see Config.effective_ignore. (*.part and the vault marker are additionally
-# hard-ignored by the engine itself, independent of this list, because configs
-# saved by older versions never pick up new defaults.)
+# hard-ignored by the engine itself, independent of this list.)
 DEFAULT_IGNORE = [".DS_Store", ".Trash", "*.icloud", "*.conflict-*", "*.part"]
+
+# Engine-critical patterns whose absence is a data-safety problem, merged into
+# effective_ignore at load time so a config saved before a pattern entered
+# DEFAULT_IGNORE still gains it without rewriting the saved file (the saved
+# `ignore` list is frozen at init; only DEFAULT_IGNORE moves forward). Keep this
+# minimal -- only patterns that are genuinely unsafe to sync, not user taste.
+ENGINE_IGNORE = ("*.conflict-*",)
 
 # Identity marker written at the vault root. Local-only: if it ever synced, a
 # vault re-downloaded from iCloud would carry the same UUID and "recreated
@@ -178,6 +184,10 @@ class Config:
     obsidian: bool = False
     max_retries: int = 3
     retry_base_delay: float = 1.0
+    # (connect, read) timeout in seconds for every iCloud request. pyicloud passes
+    # timeout=None by default, so one hung socket would wedge the daemon forever; a
+    # timeout turns the hang into a retryable error. <=0 disables (no timeout).
+    request_timeout_seconds: int = 60
     # Remote walk = one listing call per folder; folders on the same depth level are
     # listed concurrently with this many workers (1 = serial).
     walk_workers: int = 4
@@ -229,6 +239,7 @@ class Config:
             "interval_active_seconds",
             "active_window_seconds",
             "full_walk_interval_seconds",
+            "request_timeout_seconds",
         ):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f"`{name}` must be an integer.")
@@ -239,6 +250,15 @@ class Config:
 
     @property
     def effective_ignore(self) -> list[str]:
-        """Patterns actually applied: base `ignore` plus the Obsidian set when enabled."""
+        """Patterns actually applied: base `ignore`, the engine-critical set merged in
+        (old configs predate newer DEFAULT_IGNORE entries), plus the Obsidian set when
+        enabled. Deduplicated, order-stable."""
         extra = list(OBSIDIAN_VOLATILE) if self.obsidian else []
-        return list(self.ignore) + extra
+        merged = list(self.ignore) + list(ENGINE_IGNORE) + extra
+        seen: set[str] = set()
+        out: list[str] = []
+        for pat in merged:
+            if pat not in seen:
+                seen.add(pat)
+                out.append(pat)
+        return out

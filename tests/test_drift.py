@@ -516,3 +516,266 @@ def test_plist_has_no_crash_loop_keys(tmp_path, monkeypatch):
     body = cli._write_agent_plist("work").read_text()
     assert "<key>SuccessfulExit</key>" in body
     assert "<key>ThrottleInterval</key>" in body
+
+
+# --- Phase C Batch 1: independent engine/daemon/client safety guards -----------
+
+
+def test_conflict_aborts_when_remote_backup_download_fails(make_syncer, fake, local_dir):
+    """P1-4: if the remote loser cannot be backed up, conflict resolution must abort so
+    a transient error never hard-deletes the only copy of the losing version."""
+    syncer, store = make_syncer(policy="newer")
+    write_file(local_dir, "c.md", b"base", mtime=5000)
+    syncer.sync_once()
+
+    write_file(local_dir, "c.md", b"local-wins", mtime=5000 + 2 * FAR)
+    fake.put("c.md", b"remote-loses", mtime=5000 + FAR)
+
+    orig_download = fake.download
+
+    def boom_download(relpath, dest):
+        raise RuntimeError("transient backup download failure")
+
+    fake.download = boom_download
+    s = syncer.sync_once()
+    fake.download = orig_download
+
+    assert fake.files["c.md"]["content"] == b"remote-loses", s.summary()
+    assert not list(local_dir.glob("c.conflict-*.md"))
+
+    s2 = syncer.sync_once()
+    assert fake.files["c.md"]["content"] == b"local-wins", s2.summary()
+    backups = list(local_dir.glob("c.conflict-*.md"))
+    assert backups and backups[0].read_bytes() == b"remote-loses"
+    store.close()
+
+
+def test_symlinked_file_skipped_not_synced(make_syncer, fake, local_dir):
+    """P1-12: a symlinked file is never uploaded and the link is left intact."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "real.md", b"real-content", mtime=1000)
+    os.symlink(local_dir / "real.md", local_dir / "link.md")
+    syncer.sync_once()
+    assert "real.md" in fake.files
+    assert "link.md" not in fake.files
+    assert "link.md" not in store.all()
+    assert (local_dir / "link.md").is_symlink()
+    store.close()
+
+
+def test_symlinked_dir_skipped_and_not_descended(make_syncer, fake, local_dir):
+    """P1-12: a symlinked directory is neither recorded nor descended."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "target/inside.md", b"x", mtime=1000)
+    os.symlink(local_dir / "target", local_dir / "alias")
+    syncer.sync_once()
+    assert "target" in store.all() and "target/inside.md" in fake.files
+    assert "alias" not in store.all()
+    assert "alias" not in fake.files
+    assert "alias/inside.md" not in fake.files
+    assert (local_dir / "alias").is_symlink()
+    store.close()
+
+
+def test_request_timeout_installed_and_applied():
+    """P1-5: connect() wraps session.request so calls with no explicit timeout get the
+    configured (connect,read) tuple; an explicit timeout is left untouched; idempotent."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    captured = []
+
+    class _FakeSession:
+        def request(self, method, url, **kwargs):
+            captured.append(kwargs.get("timeout"))
+            return "ok"
+
+    class _FakeApi:
+        def __init__(self):
+            self.session = _FakeSession()
+
+    c = ICloudClient("x@y.com", request_timeout=42)
+    c.api = _FakeApi()
+    c._install_request_timeout()
+
+    assert c.api.session.request("GET", "https://example") == "ok"
+    assert captured[-1] == (42.0, 42.0)
+    c.api.session.request("GET", "https://example", timeout=5)
+    assert captured[-1] == 5
+    c._install_request_timeout()
+    c.api.session.request("GET", "https://example")
+    assert captured[-1] == (42.0, 42.0)
+
+
+def test_request_timeout_zero_disables():
+    """P1-5: request_timeout <= 0 disables wrapping (timeout stays None)."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    captured = []
+
+    class _FakeSession:
+        def request(self, method, url, **kwargs):
+            captured.append(kwargs.get("timeout"))
+            return "ok"
+
+    class _FakeApi:
+        session = _FakeSession()
+
+    c = ICloudClient("x@y.com", request_timeout=0)
+    c.api = _FakeApi()
+    c._install_request_timeout()
+    c.api.session.request("GET", "https://example")
+    assert captured[-1] is None
+
+
+def test_timeout_error_is_retried_then_raised():
+    """P1-5: a requests Timeout is transient: retried up to attempts then propagated so
+    the walk guard aborts the pass (zero deletions)."""
+    import requests
+
+    from ifolder_sync.retry import with_retry
+
+    calls = {"n": 0}
+
+    def hangs():
+        calls["n"] += 1
+        raise requests.exceptions.ReadTimeout("read timed out")
+
+    with pytest.raises(requests.exceptions.RequestException):
+        with_retry(hangs, attempts=3, base=0)
+    assert calls["n"] == 3
+
+
+def test_run_sync_stops_clean_on_auth_failure(tmp_path, monkeypatch):
+    """P1-13: a mid-run pyicloud login failure stops the daemon cleanly (sets _stop so
+    run() exits 0 and launchd does not restart), not the generic retry path."""
+    from pyicloud.exceptions import PyiCloudFailedLoginException
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+
+    def boom(*_a, **_k):
+        raise PyiCloudFailedLoginException("trust token expired")
+
+    monkeypatch.setattr(d.syncer, "sync_once", boom)
+    d._run_sync("poll")
+
+    assert d._stop.is_set()
+    assert d._wake.is_set()
+    assert "auth" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_run_sync_stops_clean_on_runtime_auth_error(tmp_path, monkeypatch):
+    """P1-13: a RuntimeError from the connect/2FA helpers mid-run also clean-stops."""
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("iCloud requires 2FA verification")
+
+    monkeypatch.setattr(d.syncer, "sync_once", boom)
+    d._run_sync("poll")
+
+    assert d._stop.is_set()
+    assert "auth" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_run_sync_local_scan_error_keeps_retrying(tmp_path, monkeypatch):
+    """P1-13: a transient LocalScanError must NOT stop the daemon (retry next poll)."""
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+
+    def boom(*_a, **_k):
+        raise LocalScanError("local scan failed: transient")
+
+    monkeypatch.setattr(d.syncer, "sync_once", boom)
+    d._run_sync("poll")
+
+    assert not d._stop.is_set()
+    assert "local scan failed" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_engine_ignore_merged_for_legacy_config_missing_conflict_pattern(
+    make_syncer, fake, local_dir
+):
+    """P1-18: a legacy config whose `ignore` predates *.conflict-* still excludes
+    conflict backups (merged from ENGINE_IGNORE at load time)."""
+    syncer, store = make_syncer(ignore=[".DS_Store"])
+    write_file(local_dir, "note.md", b"x", mtime=1000)
+    write_file(local_dir, "note.conflict-20260101-000000.md", b"backup", mtime=1000)
+    syncer.sync_once()
+    assert "note.md" in fake.files
+    assert "note.conflict-20260101-000000.md" not in fake.files
+    assert "note.conflict-20260101-000000.md" not in store.all()
+    store.close()
+
+
+def test_effective_ignore_merges_engine_set_without_duplicates():
+    """P1-18: ENGINE_IGNORE is merged into effective_ignore, deduplicated."""
+    from ifolder_sync.config import ENGINE_IGNORE, Config
+
+    cfg = Config(apple_id="x@y.com", local_folder="/tmp/x", ignore=[".DS_Store"])
+    eff = cfg.effective_ignore
+    for pat in ENGINE_IGNORE:
+        assert pat in eff
+    cfg2 = Config(apple_id="x@y.com", local_folder="/tmp/x", ignore=list(ENGINE_IGNORE))
+    assert cfg2.effective_ignore.count(ENGINE_IGNORE[0]) == 1
+
+
+def test_run_sync_stops_clean_on_reauth_required(tmp_path, monkeypatch):
+    """P1-13 (adversarial follow-up): a mid-run PyiCloudAuthRequiredException (HTTP 450
+    FIND_MY_REAUTH_REQUIRED) must also clean-stop — it does not subclass RuntimeError and
+    would otherwise be retried every poll (lockout risk)."""
+    from unittest.mock import MagicMock
+
+    from pyicloud.exceptions import PyiCloudAuthRequiredException
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+
+    def boom(*_a, **_k):
+        raise PyiCloudAuthRequiredException("x@y.com", MagicMock())
+
+    monkeypatch.setattr(d.syncer, "sync_once", boom)
+    d._run_sync("poll")
+
+    assert d._stop.is_set()
+    assert "auth" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_run_sync_stops_clean_on_service_not_activated(tmp_path, monkeypatch):
+    """P1-13 (adversarial follow-up): PyiCloudServiceNotActivatedException (auth-failed)
+    subclasses PyiCloudAPIResponseException and is classed non-transient; it must
+    clean-stop, not retry."""
+    from pyicloud.exceptions import PyiCloudServiceNotActivatedException
+
+    d = _daemon(tmp_path, monkeypatch, tmp_path / "vault")
+
+    def boom(*_a, **_k):
+        raise PyiCloudServiceNotActivatedException("authentication failed", "ERROR")
+
+    monkeypatch.setattr(d.syncer, "sync_once", boom)
+    d._run_sync("poll")
+
+    assert d._stop.is_set()
+    assert "auth" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_dangling_and_circular_symlinks_do_not_abort_the_pass(make_syncer, fake, local_dir):
+    """P1-12 (adversarial follow-up): a broken/circular symlink must be skipped, never
+    reaching p.stat() in a way that raises LocalScanError (invariant 2 false-positive).
+    os.path.islink is True for both, so the guard skips them before stat."""
+    write_file(local_dir, "real.md", b"x", mtime=1000)
+    os.symlink(local_dir / "nonexistent-target", local_dir / "dead.md")  # dangling
+    os.symlink(local_dir / "loopb", local_dir / "loopa")  # circular pair
+    os.symlink(local_dir / "loopa", local_dir / "loopb")
+
+    syncer, store = make_syncer()
+    s = syncer.sync_once()  # must NOT raise LocalScanError
+
+    assert "real.md" in fake.files
+    for link in ("dead.md", "loopa", "loopb"):
+        assert link not in fake.files
+        assert link not in store.all()
+    assert s.errors == 0, s.summary()
+    store.close()

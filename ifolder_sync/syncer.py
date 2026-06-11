@@ -130,6 +130,7 @@ class Syncer:
         self.local_root = config.local_path
         self.trash_dir = trash_dir or default_trash_dir()
         self.ignore_patterns = config.effective_ignore
+        self._symlink_warned: set[str] = set()
 
     # ----------------------------------------------------------- snapshots ---
     def _ignored(self, relpath: str) -> bool:
@@ -140,6 +141,18 @@ class Syncer:
         if name == VAULT_MARKER_NAME or name.endswith(PART_SUFFIX):
             return True
         return any(path_is_ignored(pat, segs) for pat in self.ignore_patterns)
+
+    def _skip_symlink(self, rel: str, p: Path) -> bool:
+        """Symlinks are not synced: a symlinked file would be replaced by a regular
+        file on the next remote download (destroying the link), and a symlinked dir
+        would sync as a forever-empty folder (os.walk does not descend it). Skip with
+        a once-per-path warning."""
+        if not os.path.islink(p):
+            return False
+        if rel not in self._symlink_warned:
+            self._symlink_warned.add(rel)
+            log.warning("skipping symlink (symlinks are not synced): %s", rel)
+        return True
 
     def _is_safe_rel(self, relpath: str) -> bool:
         """True if local_root/relpath stays inside local_root (no traversal)."""
@@ -207,6 +220,9 @@ class Syncer:
                     dirnames.remove(d)
                     continue
                 p = Path(dirpath) / d
+                if self._skip_symlink(rel, p):
+                    dirnames.remove(d)  # do not descend a symlinked directory
+                    continue
                 try:
                     st = p.stat()
                 except FileNotFoundError:
@@ -220,6 +236,8 @@ class Syncer:
                 if self._ignored(rel):
                     continue
                 p = Path(dirpath) / f
+                if self._skip_symlink(rel, p):
+                    continue
                 try:
                     st = p.stat()
                 except FileNotFoundError:
@@ -618,7 +636,16 @@ class Syncer:
         try:
             self.client.download(relpath, bkp)
         except Exception as exc:  # noqa: BLE001
-            log.error("could not save remote backup of %s: %s", relpath, exc)
+            # Never run action() (which removes the remote loser) without a saved
+            # backup: a transient download error would otherwise hard-delete the only
+            # copy of the losing version. Abort; the conflict re-derives next pass.
+            log.error(
+                "could not save remote backup of %s; aborting conflict resolution this "
+                "pass (will retry): %s",
+                relpath,
+                exc,
+            )
+            return
         action()
 
     # -------------------------------------------------------------- actions ---

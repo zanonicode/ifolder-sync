@@ -348,6 +348,8 @@ def test_init_obsidian_flag_is_authoritative(tmp_path, monkeypatch):
         prompts.append(prompt)
         if "Apple ID" in prompt:
             return "x@y.com"
+        if "Folder inside iCloud" in prompt:
+            return "Notes"
         if "Local folder" in prompt:
             return str(tmp_path / "vault")
         return ""
@@ -358,3 +360,129 @@ def test_init_obsidian_flag_is_authoritative(tmp_path, monkeypatch):
     assert not any("Obsidian" in p for p in prompts)
     cfg = Config.load(config_path("work"))
     assert cfg.obsidian is True
+
+
+# --- Phase C Batch 1: CLI guards (plist grace, sync lock, root-scope opt-in) ----
+
+
+def test_plist_sets_exit_timeout(tmp_path, monkeypatch):
+    """P1-7f: the generated plist sets ExitTimeOut (graceful-shutdown window) while
+    keeping the invariant-9 crash-loop keys."""
+    _sandbox(tmp_path, monkeypatch)
+    body = cli._write_agent_plist("work").read_text()
+    assert "<key>ExitTimeOut</key>" in body
+    assert "<integer>30</integer>" in body
+    assert "<key>SuccessfulExit</key>" in body
+    assert "<key>ThrottleInterval</key>" in body
+
+
+def test_manual_sync_refused_while_lock_held(tmp_path, monkeypatch, capsys):
+    """P1-8: a non-dry-run sync must not run while the single-instance lock is held."""
+    from ifolder_sync.locking import SingleInstanceLock
+
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+
+    other = SingleInstanceLock(lock_path("work"))
+    other.acquire()
+    try:
+        with pytest.raises(SystemExit):
+            main(["sync", "--profile", "work"])
+    finally:
+        other.release()
+    err = capsys.readouterr().err
+    assert "baseline" in err and ("running" in err or "already running" in err)
+
+
+def test_dry_run_sync_allowed_while_lock_held(tmp_path, monkeypatch):
+    """P1-8: --dry-run never acquires the lock, so a preview runs even while held."""
+    from ifolder_sync.locking import SingleInstanceLock
+
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+
+    held = SingleInstanceLock(lock_path("work"))
+    held.acquire()
+    try:
+        connected = {"n": 0}
+
+        class _StubClient:
+            @classmethod
+            def from_config(cls, _cfg):
+                return cls()
+
+            def connect(self, *a, **k):
+                connected["n"] += 1
+
+        import ifolder_sync.icloud_client as ic
+
+        monkeypatch.setattr(ic, "ICloudClient", _StubClient)
+
+        class _StubStats:
+            def summary(self):
+                return "up=0 down=0"
+
+        import ifolder_sync.syncer as sy
+
+        def _stub_sync_once(self, *a, **k):
+            return _StubStats()
+
+        monkeypatch.setattr(sy.Syncer, "sync_once", _stub_sync_once)
+
+        main(["sync", "--dry-run", "--profile", "work"])
+        assert connected["n"] == 1
+    finally:
+        held.release()
+
+
+def _init_answers(monkeypatch, *answers):
+    it = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(it))
+
+
+def test_init_root_requires_confirmation(tmp_path, monkeypatch):
+    """P1-16: an empty remote_folder without --allow-root or the token errors out and
+    writes no config."""
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    _init_answers(monkeypatch, "x@y.com", "", str(vault), "60", "newer", "n", "n", "no thanks")
+    with pytest.raises(SystemExit):
+        main(["init", "--profile", "work"])
+    assert not config_path("work").exists()
+
+
+def test_init_root_allowed_with_flag(tmp_path, monkeypatch):
+    """P1-16: --allow-root accepts an empty remote_folder without a typed token."""
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    _init_answers(monkeypatch, "x@y.com", "", str(vault), "60", "newer", "n", "n")
+    main(["init", "--allow-root", "--profile", "work"])
+    assert Config.load(config_path("work")).remote_folder == ""
+
+
+def test_init_root_confirmed_by_typed_token(tmp_path, monkeypatch):
+    """P1-16: typing the exact token accepts root scope (no flag needed)."""
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    _init_answers(
+        monkeypatch, "x@y.com", "", str(vault), "60", "newer", "n", "n", "SYNC ENTIRE ICLOUD"
+    )
+    main(["init", "--profile", "work"])
+    assert Config.load(config_path("work")).remote_folder == ""
+
+
+def test_init_nonempty_remote_folder_unaffected(tmp_path, monkeypatch):
+    """P1-16: a normal subfolder needs no flag and no extra prompt."""
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    _init_answers(monkeypatch, "x@y.com", "Notes", str(vault), "60", "newer", "n", "n")
+    main(["init", "--profile", "work"])
+    assert Config.load(config_path("work")).remote_folder == "Notes"

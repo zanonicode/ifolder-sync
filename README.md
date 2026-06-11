@@ -216,6 +216,15 @@ Patterns apply on **both sides** and match at **any depth** (root *and* subfolde
 **Default patterns:** `.DS_Store`, `.Trash`, `*.icloud`, `*.conflict-*`, `*.part`,
 plus the Obsidian config-local set listed above when `obsidian: true`.
 
+`*.conflict-*` (the conflict-backup names) and `*.part` (in-flight downloads) are
+**always** ignored by the engine even if absent from a saved `ignore` list, and the
+vault marker `.ifolder-sync-vault` never syncs.
+
+**Symlinks inside the vault are not synced.** A symlinked file would be replaced by a
+regular file on the next remote download (destroying the link), and a symlinked folder
+would sync as empty (the scan does not descend it). Symlinks are skipped with a
+one-time warning.
+
 ## Conflict policy
 
 When **both sides change** the same file between two syncs:

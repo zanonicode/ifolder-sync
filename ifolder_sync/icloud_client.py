@@ -83,6 +83,7 @@ class ICloudClient:
         retry_base: float = 1.0,
         walk_workers: int = 4,
         full_walk_interval: int = 600,
+        request_timeout: int = 60,
     ):
         self.apple_id = apple_id
         self.remote_root = remote_folder.strip("/")
@@ -91,6 +92,7 @@ class ICloudClient:
         self.retry_base = retry_base
         self.walk_workers = max(1, int(walk_workers))
         self.full_walk_interval = max(0, int(full_walk_interval))
+        self.request_timeout = int(request_timeout)
         self.api: Optional[PyiCloudService] = None
         # Etag-keyed walk cache: folder relpath -> subtree fingerprint, and
         # folder relpath -> its (already ignore-pruned) children entries.
@@ -110,6 +112,7 @@ class ICloudClient:
             retry_base=cfg.retry_base_delay,
             walk_workers=cfg.walk_workers,
             full_walk_interval=cfg.full_walk_interval_seconds,
+            request_timeout=cfg.request_timeout_seconds,
         )
 
     def _retry(self, fn: Callable[[], T]) -> T:
@@ -172,6 +175,29 @@ class ICloudClient:
 
         self._handle_2fa(interactive=interactive)
         self._secure_session_files()
+        self._install_request_timeout()
+
+    def _install_request_timeout(self) -> None:
+        """Wrap session.request so any call without an explicit timeout gets a
+        (connect, read) timeout. pyicloud passes timeout=None everywhere, so one hung
+        socket would block the poll loop forever; with a timeout the hang becomes a
+        requests.Timeout that the retry + walk guard handle (pass aborts, zero
+        deletions). Idempotent; <=0 disables."""
+        if self.api is None or self.request_timeout <= 0:
+            return
+        session = self.api.session
+        if getattr(session, "_ifolder_timeout_wrapped", False):
+            return
+        original = session.request
+        t = (float(self.request_timeout), float(self.request_timeout))
+
+        def _with_timeout(method, url, **kwargs):
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = t
+            return original(method, url, **kwargs)
+
+        session.request = _with_timeout
+        session._ifolder_timeout_wrapped = True
 
     # --- on-disk session management ------------------------------------------
     def _clear_session(self) -> None:

@@ -155,6 +155,28 @@ def _load_profile(args) -> tuple[str, Config]:
 
 
 # ----------------------------------------------------------------- commands ---
+_ROOT_CONFIRM_TOKEN = "SYNC ENTIRE ICLOUD"
+
+
+def _confirm_root_scope(args) -> None:
+    """An empty remote_folder means the WHOLE iCloud Drive root: every app container
+    is mirrored into the vault and a local deletion propagates to iCloud. Require an
+    explicit opt-in (--allow-root or a typed confirmation) so root scope is never
+    accidental."""
+    if getattr(args, "allow_root", False):
+        return
+    print(
+        "WARNING: an empty folder means the ENTIRE iCloud Drive root. Every app's\n"
+        "iCloud container (Pages, Numbers, Shortcuts, ...) would be mirrored into the\n"
+        "local vault, AND a local deletion would propagate to iCloud. This is almost\n"
+        "never what you want -- pick a dedicated subfolder instead.",
+        file=sys.stderr,
+    )
+    typed = input(f'Type "{_ROOT_CONFIRM_TOKEN}" to sync the whole Drive root: ').strip()
+    if typed != _ROOT_CONFIRM_TOKEN:
+        raise ValueError("root sync not confirmed; set a remote folder or pass --allow-root.")
+
+
 def cmd_init(args):
     profile = _profile(args)
     path = config_path(profile)
@@ -180,6 +202,9 @@ def cmd_init(args):
     else:
         obs_default = "y" if cfg.obsidian else "n"
         cfg.obsidian = ask("Is this an Obsidian vault? (y/n)", obs_default).lower().startswith("y")
+
+    if not cfg.remote_folder.strip():
+        _confirm_root_scope(args)
 
     cfg.validate()
     saved = cfg.save(path)
@@ -209,11 +234,16 @@ def cmd_auth(args):
 
 def cmd_sync(args):
     from .icloud_client import ICloudClient
+    from .locking import AlreadyRunning, SingleInstanceLock
     from .state import StateStore
     from .syncer import Syncer
 
     profile, cfg = _load_profile(args)
+    lock = None
     if not args.dry_run:
+        # A non-dry-run sync mutates the baseline; it must hold the same single-instance
+        # lock the daemon uses, or a daemon start (or a second manual sync) racing in
+        # right after a plain holder_pid check would corrupt the baseline (TOCTOU).
         pid = holder_pid(lock_path(profile))
         if pid:
             print(
@@ -223,13 +253,27 @@ def cmd_sync(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-    client = ICloudClient.from_config(cfg)
-    client.connect(interactive=not args.non_interactive)
-    with StateStore(baseline_path(profile)) as store:
-        syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
-        stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
-    prefix = "Dry-run (no changes written)" if args.dry_run else "Sync done"
-    print(f"{prefix}: {stats.summary()}")
+        lock = SingleInstanceLock(lock_path(profile))
+        try:
+            lock.acquire()
+        except AlreadyRunning as exc:
+            print(
+                f"Error: {exc} — a manual sync would race the baseline. Stop it first "
+                f"(`ifolder-sync stop --profile {profile}`) or preview with --dry-run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    try:
+        client = ICloudClient.from_config(cfg)
+        client.connect(interactive=not args.non_interactive)
+        with StateStore(baseline_path(profile)) as store:
+            syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
+            stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
+        prefix = "Dry-run (no changes written)" if args.dry_run else "Sync done"
+        print(f"{prefix}: {stats.summary()}")
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def cmd_start(args):
@@ -454,6 +498,9 @@ def _write_agent_plist(profile: str) -> Path:
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": 60,
+        # Grace period for SIGTERM (stop/logout) to finish the current apply action
+        # and commit before launchd SIGKILLs. Does not delay a clean exit.
+        "ExitTimeOut": 30,
         "StandardOutPath": str(log_dir / "daemon.out.log"),
         "StandardErrorPath": str(log_dir / "daemon.err.log"),
         "ProcessType": "Background",
@@ -531,6 +578,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="mark this vault as Obsidian and skip that prompt "
         "(excludes the .obsidian per-device config from sync)",
+    )
+    pi.add_argument(
+        "--allow-root",
+        action="store_true",
+        help="allow an empty remote folder = sync the entire iCloud Drive root "
+        "(dangerous: mirrors every app container and propagates local deletes)",
     )
     _add_profile(pi)
     pi.set_defaults(func=cmd_init)

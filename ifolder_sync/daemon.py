@@ -17,6 +17,13 @@ import threading
 import time
 from typing import Optional
 
+from pyicloud.exceptions import (
+    PyiCloud2FARequiredException,
+    PyiCloudAuthRequiredException,
+    PyiCloudFailedLoginException,
+    PyiCloudServiceNotActivatedException,
+)
+
 from .config import (
     DEFAULT_PROFILE,
     Config,
@@ -28,7 +35,7 @@ from .config import (
 from .icloud_client import PART_SUFFIX, ICloudClient
 from .locking import SingleInstanceLock
 from .state import StateStore
-from .syncer import Syncer, VaultIdentityError
+from .syncer import LocalScanError, Syncer, VaultIdentityError
 from .watcher import LocalWatcher
 
 log = logging.getLogger("ifolder-sync.daemon")
@@ -121,6 +128,45 @@ class Daemon:
             # interval would only spam. Clean stop -> no launchd restart loop.
             log.critical("%s — stopping daemon", exc)
             self._set_last_error(str(exc))
+            self._stop.set()
+            self._wake.set()
+        except (
+            PyiCloud2FARequiredException,
+            PyiCloudFailedLoginException,
+            PyiCloudAuthRequiredException,
+            PyiCloudServiceNotActivatedException,
+        ) as exc:
+            # Trust expiry / invalidated session mid-run surfaces from the data path as
+            # one of these: 2FA-required (409), failed-login, auth-required (450
+            # FIND_MY_REAUTH_REQUIRED), or service-not-activated (auth-failed). Replaying
+            # SRP logins every poll risks an Apple lockout (the scenario the startup path
+            # also avoids). Clean stop -> exit(0) -> launchd SuccessfulExit=false does not
+            # restart. A plain transient PyiCloudAPIResponseException (503) is NOT here, so
+            # it still falls through to the generic handler and retries.
+            log.critical(
+                "iCloud authentication failed mid-run: %s — run "
+                "`ifolder-sync auth --profile %s`; stopping daemon",
+                exc,
+                self.profile,
+            )
+            self._set_last_error(f"auth: {exc}")
+            self._stop.set()
+            self._wake.set()
+        except LocalScanError as exc:
+            # Transient (a brief permission blip); the next poll retries. Must be
+            # caught before the broad RuntimeError below so it never stops the daemon.
+            log.exception("sync failed (%s): %s", reason, exc)
+            self._set_last_error(str(exc))
+        except RuntimeError as exc:
+            # The connect/2FA helpers raise RuntimeError on auth-shaped failures; the
+            # data path raises typed pyicloud/OS errors instead, so a RuntimeError here
+            # is unrecoverable auth. Clean stop, same posture as a login failure.
+            log.critical(
+                "cannot reach iCloud: %s — run `ifolder-sync auth --profile %s`; stopping daemon",
+                exc,
+                self.profile,
+            )
+            self._set_last_error(f"auth: {exc}")
             self._stop.set()
             self._wake.set()
         except Exception as exc:  # noqa: BLE001

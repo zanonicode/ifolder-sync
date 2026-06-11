@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Callable, TypeVar
 
+import requests
 from pyicloud.exceptions import PyiCloudAPIResponseException
 
 log = logging.getLogger("ifolder-sync.retry")
@@ -28,7 +29,7 @@ def _is_transient(exc: Exception) -> bool:
             return False
     if isinstance(exc, OSError) and exc.errno in _NON_TRANSIENT_ERRNO:
         return False
-    return True  # connection-level errors (requests/socket) are transient
+    return True  # connection-level errors (requests/socket/timeout) are transient
 
 
 def with_retry(
@@ -36,7 +37,11 @@ def with_retry(
     *,
     attempts: int = 3,
     base: float = 1.0,
-    retry_on: tuple[type[Exception], ...] = (PyiCloudAPIResponseException, OSError),
+    retry_on: tuple[type[Exception], ...] = (
+        PyiCloudAPIResponseException,
+        OSError,
+        requests.exceptions.RequestException,
+    ),
 ) -> T:
     """Call ``fn``; retry on transient errors with delays base*2**i (1s, 2s, 4s...)."""
     for i in range(attempts):
