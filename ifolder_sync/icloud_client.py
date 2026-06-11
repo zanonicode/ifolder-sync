@@ -14,6 +14,7 @@ import getpass
 import json
 import logging
 import os
+import random
 import threading
 import time
 import unicodedata
@@ -191,6 +192,10 @@ class ICloudClient:
         self._etag_cache: dict[str, str] = {}
         self._children_cache: dict[str, list[_CachedChild]] = {}
         self._last_full_walk = 0.0
+        # Per-instance jitter (up to ~10%, capped at 5 min) added to the full-walk cadence
+        # so several profiles or a fleet that restart together do not all do their uncached
+        # full walk at the same wall-clock moment.
+        self._full_walk_jitter = random.uniform(0, min(300.0, 0.1 * self.full_walk_interval))
 
     @classmethod
     def from_config(cls, cfg: Config) -> "ICloudClient":
@@ -448,10 +453,11 @@ class ICloudClient:
         concurrently (walk_workers). Ignored subtrees are pruned (never listed).
         Raises on a network error rather than returning an empty tree, so a failed
         scan never looks like 'all deleted'."""
+        cadence = self.full_walk_interval + self._full_walk_jitter
         allow_cache = (
             self.full_walk_interval > 0
             and bool(self._etag_cache)
-            and (time.time() - self._last_full_walk) < self.full_walk_interval
+            and (time.time() - self._last_full_walk) < cadence
         )
         try:
             return self._walk_impl(is_ignored, allow_cache)
@@ -461,6 +467,45 @@ class ICloudClient:
             self._etag_cache.clear()
             self._children_cache.clear()
             return self._walk_impl(is_ignored, allow_cache=False)
+
+    # --- cache persistence across restarts ------------------------------------
+    def export_walk_cache(self) -> Optional[str]:
+        """Serialize the etag-keyed walk cache (JSON) so a restart need not repay the
+        uncached full walk. Returns None when empty. Safe to persist: correctness rests on
+        the next walk re-fetching the root etag and comparing each folder's etag, so a stale
+        cache (the remote changed while the daemon was down) is detected and re-listed."""
+        if not self._etag_cache:
+            return None
+        return json.dumps(
+            {
+                "etags": self._etag_cache,
+                "children": {
+                    rel: [list(c) for c in kids] for rel, kids in self._children_cache.items()
+                },
+            }
+        )
+
+    def import_walk_cache(self, blob: Optional[str]) -> None:
+        """Restore a cache produced by export_walk_cache. Ignores absent/corrupt data (the
+        next walk just runs uncached). _last_full_walk is set to now so the restored cache is
+        eligible immediately; the per-folder etag comparison still guards every served entry."""
+        if not blob:
+            return
+        try:
+            data = json.loads(blob)
+            if not isinstance(data.get("etags"), dict) or not isinstance(
+                data.get("children"), dict
+            ):
+                return  # not a cache blob we wrote; ignore rather than crash startup
+            etags = data["etags"]
+            children = {
+                rel: [_CachedChild(*c) for c in kids] for rel, kids in data["children"].items()
+            }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+        self._etag_cache = etags
+        self._children_cache = children
+        self._last_full_walk = time.time()
 
     def _walk_impl(
         self, is_ignored: Optional[Callable[[str], bool]], allow_cache: bool

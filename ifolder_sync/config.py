@@ -8,6 +8,7 @@ environment variable as a fallback.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Optional
 
 from .obsidian import OBSIDIAN_VOLATILE
+
+log = logging.getLogger("ifolder-sync.config")
 
 APP_NAME = "ifolder-sync"
 
@@ -228,8 +231,10 @@ class Config:
     # iCloud folder etags fingerprint the whole subtree (verified empirically:
     # a child edit propagates to every ancestor; untouched folders stay stable), so
     # unchanged folders can be served from cache. A full uncached walk still runs
-    # every this-many seconds as belt-and-suspenders (0 disables caching).
-    full_walk_interval_seconds: int = 600
+    # every this-many seconds (plus a small per-instance jitter) as belt-and-suspenders
+    # (0 disables caching). 3600 because the etag cache makes the periodic full walk
+    # rarely necessary; the cache is also persisted across restarts.
+    full_walk_interval_seconds: int = 3600
     # Adaptive polling: while changes flowed in the last active_window_seconds, poll
     # every interval_active_seconds instead of interval_seconds.
     interval_active_seconds: int = 20
@@ -271,6 +276,11 @@ class Config:
             raise FileNotFoundError(f"Config not found at {path}. Run `ifolder-sync init` first.")
         data = json.loads(path.read_text())
         known = set(Config().__dict__)
+        unknown = sorted(set(data) - known)
+        if unknown:
+            # A typo'd key (e.g. "intervall_seconds") used to be dropped silently, so the
+            # setting had no effect with no signal. Warn but still load the known keys.
+            log.warning("ignoring unknown config key(s) in %s: %s", path, ", ".join(unknown))
         clean = {k: v for k, v in data.items() if k in known}
         return Config(**clean)
 
@@ -303,8 +313,15 @@ class Config:
             "settle_max_passes",
             "max_file_size_mb",
         ):
-            if not isinstance(getattr(self, name), int):
+            value = getattr(self, name)
+            # bool is a subclass of int, so plain isinstance(..., int) would accept
+            # `"walk_workers": true` from JSON; reject it explicitly.
+            if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(f"`{name}` must be an integer.")
+        for name in ("retry_base_delay", "debounce_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"`{name}` must be a number.")
 
     @property
     def local_path(self) -> Path:

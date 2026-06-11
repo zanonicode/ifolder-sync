@@ -6,16 +6,19 @@ D3: max_file_size_mb upload guard + snapshot mtime preservation (P2-4), and the
 extracted twofa helpers (P3-4).
 D4: shared vault-access TCC hint (P3-5), watcher ignore-filtering (P2-1), and the
 ~/Library/Logs log location (P2-5).
+D5: config hygiene (P3-7) and the walk-cache persistence + 3600 cadence (P2-2). The
+lock PID-reuse hardening (P2-7) lives in tests/test_safety.py.
 """
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from ifolder_sync import twofa
-from ifolder_sync.config import log_file, vault_access_error
+from ifolder_sync.config import Config, log_file, vault_access_error
 from ifolder_sync.icloud_client import ICloudClient
 from ifolder_sync.syncer import SyncClient
 from ifolder_sync.watcher import _DebouncedHandler
@@ -224,6 +227,59 @@ def test_log_file_is_under_library_logs(tmp_path, monkeypatch):
     p = log_file("work")
     assert p == tmp_path / "Library" / "Logs" / "ifolder-sync" / "work.log"
     assert not p.parent.exists()  # read-only helper: no mkdir side effect
+
+
+# --------------------------------------------------------- P3-7 config hygiene ---
+def test_config_load_warns_on_unknown_keys(tmp_path, caplog):
+    """A typo'd key is dropped (as before) but now warned about instead of silently
+    swallowed; known keys still load."""
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"apple_id": "a@b.com", "local_folder": "/x", "intervall_seconds": 99}))
+    with caplog.at_level("WARNING"):
+        cfg = Config.load(p)
+    assert not hasattr(cfg, "intervall_seconds")
+    assert "intervall_seconds" in caplog.text
+    assert cfg.apple_id == "a@b.com" and cfg.local_folder == "/x"
+
+
+def test_config_validate_rejects_bool_and_non_numbers():
+    base = dict(apple_id="a@b.com", local_folder="/x")
+    with pytest.raises(ValueError):
+        Config(**base, walk_workers=True).validate()  # bool is not an int
+    with pytest.raises(ValueError):
+        Config(**base, retry_base_delay="fast").validate()  # not a number
+    with pytest.raises(ValueError):
+        Config(**base, debounce_seconds=True).validate()  # bool is not a number
+    Config(**base, retry_base_delay=2, debounce_seconds=1.5).validate()  # int/float OK
+
+
+# ------------------------------------------------------- P2-2 walk cache ---
+def test_full_walk_interval_default_raised_to_3600():
+    assert Config().full_walk_interval_seconds == 3600
+
+
+def test_walk_cache_export_import_roundtrip_and_tolerates_garbage():
+    c = ICloudClient("x@y.com")
+    assert c.export_walk_cache() is None  # empty cache -> nothing to persist
+    c._etag_cache = {"": "root-etag", "sub": "sub-etag"}
+    c._children_cache = {"": [], "sub": []}
+    blob = c.export_walk_cache()
+
+    c2 = ICloudClient("x@y.com")
+    c2.import_walk_cache(blob)
+    assert c2._etag_cache == {"": "root-etag", "sub": "sub-etag"}
+    assert c2._last_full_walk > 0  # restored cache is eligible immediately
+
+    c2.import_walk_cache("not json{")  # corrupt JSON -> ignored
+    c2.import_walk_cache(None)  # absent -> ignored
+    c2.import_walk_cache(json.dumps(["not", "a", "dict"]))  # wrong top-level shape
+    c2.import_walk_cache(
+        json.dumps({"etags": {"": "e"}, "children": [["x"]]})
+    )  # children not a dict
+    c2.import_walk_cache(
+        json.dumps({"etags": {"": "e"}, "children": {"": [["a", "b"]]}})
+    )  # bad arity
+    assert c2._etag_cache == {"": "root-etag", "sub": "sub-etag"}  # all ignored, cache intact
 
 
 # ----------------------------------------------------- P3-6 SyncClient proto ---

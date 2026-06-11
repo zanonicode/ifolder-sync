@@ -104,11 +104,28 @@ def test_single_instance_lock(tmp_path):
 
 def test_stale_lock_reclaimed(tmp_path):
     lock_path = tmp_path / "daemon.lock"
-    lock_path.write_text("2147483647")  # almost certainly not a live PID
+    lock_path.write_text("2147483647")  # almost certainly not a live PID (legacy 1-line lock)
     lock = SingleInstanceLock(lock_path)
     lock.acquire()
-    assert lock_path.read_text().strip() == str(os.getpid())
+    # P2-7: the lock now stores "pid\nboot_time"; the first line is the owning pid.
+    assert lock_path.read_text().splitlines()[0].strip() == str(os.getpid())
     lock.release()
+
+
+def test_lock_from_previous_boot_is_stale(tmp_path):
+    """P2-7: a lock whose recorded boot time differs from this boot is treated as stale
+    even if its PID is alive — after a reboot the PID may have been recycled."""
+    from ifolder_sync.locking import _boot_time, holder_pid
+
+    if _boot_time() is None:
+        pytest.skip("boot time unavailable (non-macOS); falls back to the liveness check")
+    lock_path = tmp_path / "daemon.lock"
+    other_boot = (_boot_time() or 0) - 100000  # a different (earlier) boot
+    lock_path.write_text(f"{os.getpid()}\n{other_boot}")  # OUR live pid, but a prior boot
+    assert holder_pid(lock_path) is None  # stale despite being alive
+    # a current-boot lock with our live pid IS held
+    lock_path.write_text(f"{os.getpid()}\n{_boot_time() or ''}")
+    assert holder_pid(lock_path) == os.getpid()
 
 
 def test_retry_recovers_from_transient():

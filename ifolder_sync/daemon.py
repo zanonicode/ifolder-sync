@@ -403,6 +403,13 @@ class Daemon:
                 self._set_last_error(f"auth: {exc}")
                 return
             log.info("connected to iCloud as %s", self.cfg.apple_id)
+            # Restore the etag walk cache from the last clean shutdown so the first pass can
+            # serve unchanged subtrees from cache instead of repaying the uncached full walk.
+            # Best-effort: a corrupt/foreign cache blob must never crash startup (invariant 9).
+            try:
+                self.client.import_walk_cache(self.store.get_meta("walk_cache"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not restore the walk cache (non-fatal): %s", exc)
 
             if self.cfg.watch_local:
                 self.watcher = LocalWatcher(
@@ -451,6 +458,13 @@ class Daemon:
     def _shutdown(self):
         if self.watcher:
             self.watcher.stop()
+        # Persist the etag walk cache on a clean shutdown so the next start skips the
+        # uncached full walk. Best-effort: a failure here must never block shutdown. (A
+        # SIGKILL crash skips this and the next start simply walks uncached, as before.)
+        try:
+            self.store.set_meta("walk_cache", self.client.export_walk_cache() or "")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not persist the walk cache (non-fatal): %s", exc)
         self.store.close()
         self.lock.release()
         log.info("daemon stopped.")
