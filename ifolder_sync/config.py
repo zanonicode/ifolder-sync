@@ -52,6 +52,19 @@ def tcc_protected(path: Path) -> bool:
     return bool(rel.parts) and rel.parts[0] in _TCC_PROTECTED
 
 
+def vault_access_error(root: Path, exc: OSError) -> str:
+    """Shared message for an unreachable/denied vault root, with the macOS TCC hint when a
+    PermissionError hits a protected folder. Used by BOTH the daemon preflight and the
+    syncer scan guard so the guidance no longer drifts (the TCC hint used to be daemon-only)."""
+    hint = ""
+    if isinstance(exc, PermissionError) and tcc_protected(root):
+        hint = (
+            " — macOS TCC blocks launchd daemons from Downloads/Desktop/Documents; "
+            "move the vault or grant Full Disk Access"
+        )
+    return f"vault not accessible: {exc}{hint}"
+
+
 def write_vault_marker(root: Path, profile: str = "") -> str:
     marker = root / VAULT_MARKER_NAME
     payload = {"uuid": str(uuid.uuid4()), "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -108,6 +121,13 @@ def baseline_path(profile: str = DEFAULT_PROFILE) -> Path:
 
 def lock_path(profile: str = DEFAULT_PROFILE) -> Path:
     return state_dir(profile) / "daemon.lock"
+
+
+def log_file(profile: str = DEFAULT_PROFILE) -> Path:
+    """The daemon's rotating log, under the macOS-convention ~/Library/Logs so it is
+    discoverable in Console.app. No mkdir side effect (read-only callers like `status`
+    must not create it); the daemon's logging setup creates the parent."""
+    return Path.home() / "Library" / "Logs" / "ifolder-sync" / f"{profile}.log"
 
 
 def sessions_dir() -> Path:

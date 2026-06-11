@@ -4,15 +4,21 @@ D2: download mtime restore (P2-6), the _is_safe_rel cached-root realpath + symli
 escape (P2-3), SyncClient Protocol conformance (P3-6).
 D3: max_file_size_mb upload guard + snapshot mtime preservation (P2-4), and the
 extracted twofa helpers (P3-4).
+D4: shared vault-access TCC hint (P3-5), watcher ignore-filtering (P2-1), and the
+~/Library/Logs log location (P2-5).
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from ifolder_sync import twofa
+from ifolder_sync.config import log_file, vault_access_error
 from ifolder_sync.icloud_client import ICloudClient
 from ifolder_sync.syncer import SyncClient
+from ifolder_sync.watcher import _DebouncedHandler
 
 from .helpers import write_file
 
@@ -167,6 +173,57 @@ def test_print_diagnostics_delegator_handles_no_connection(capsys):
     api-is-None guard still prints the no-connection notice (cli `status` relies on it)."""
     ICloudClient("x@y.com").print_diagnostics()
     assert "(no connection)" in capsys.readouterr().out
+
+
+# ------------------------------------------------- P3-5 shared access hint ---
+def test_vault_access_error_adds_tcc_hint_only_when_relevant(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    protected = tmp_path / "Downloads" / "vault"
+    safe = tmp_path / "vaults" / "obs"
+    perm = PermissionError(13, "Permission denied")
+
+    assert "TCC" in vault_access_error(protected, perm)  # protected + permission -> hint
+    assert "TCC" not in vault_access_error(safe, perm)  # outside protected -> no hint
+    assert "TCC" not in vault_access_error(protected, FileNotFoundError(2, "missing"))
+
+
+# --------------------------------------------------- P2-1 watcher filtering ---
+def _handler(root, is_ignored):
+    return _DebouncedHandler(lambda: None, 0.1, root, is_ignored)
+
+
+def test_watcher_suppresses_only_all_ignored_events(tmp_path):
+    ignored = lambda rel: rel.endswith(".part") or rel == ".obsidian/workspace.json"  # noqa: E731
+    h = _handler(tmp_path, ignored)
+
+    def ev(src, dest=None):
+        return SimpleNamespace(
+            src_path=str(tmp_path / src), **({"dest_path": str(tmp_path / dest)} if dest else {})
+        )
+
+    assert h._all_ignored(ev(".obsidian/workspace.json"))  # volatile -> suppress
+    assert h._all_ignored(ev("note.md.part"))  # download tempfile -> suppress
+    assert not h._all_ignored(ev("note.md"))  # real edit -> wake
+    # a move out of an ignored file INTO a watched one must still wake
+    assert not h._all_ignored(ev(".obsidian/workspace.json", dest="note.md"))
+
+
+def test_watcher_no_filter_when_predicate_absent(tmp_path):
+    h = _handler(tmp_path, None)
+    assert not h._all_ignored(SimpleNamespace(src_path=str(tmp_path / "anything.part")))
+
+
+def test_watcher_does_not_suppress_path_outside_root(tmp_path):
+    h = _handler(tmp_path, lambda rel: True)  # would suppress everything classifiable
+    assert not h._all_ignored(SimpleNamespace(src_path="/etc/passwd"))  # unclassifiable -> wake
+
+
+# ------------------------------------------------------- P2-5 log location ---
+def test_log_file_is_under_library_logs(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    p = log_file("work")
+    assert p == tmp_path / "Library" / "Logs" / "ifolder-sync" / "work.log"
+    assert not p.parent.exists()  # read-only helper: no mkdir side effect
 
 
 # ----------------------------------------------------- P3-6 SyncClient proto ---

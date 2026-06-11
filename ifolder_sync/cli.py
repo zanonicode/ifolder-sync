@@ -32,6 +32,7 @@ import time
 from collections import deque
 from datetime import datetime
 from http.cookiejar import LoadError, LWPCookieJar
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +44,7 @@ from .config import (
     config_path,
     list_profiles,
     lock_path,
+    log_file,
     migrate_legacy,
     read_vault_marker,
     session_paths,
@@ -118,11 +120,27 @@ def _warn_tcc(path: Path) -> None:
         )
 
 
-def _setup_logging(verbose: bool):
+def _setup_logging(verbose: bool, log_path: Optional[Path] = None):
+    """Configure logging. One-shot CLI commands stream to the console (log_path None).
+    The daemon passes log_path to add a RotatingFileHandler (bounded size, the log of
+    record under ~/Library/Logs). The console StreamHandler is added only on a TTY: under
+    launchd, stderr is redirected to a file, so streaming there would duplicate every line
+    into the launchd capture — the rotating file is authoritative. force=True because
+    main() already configured a stream-only logger before the command ran."""
+    handlers: list[logging.Handler] = []
+    if log_path is None or sys.stderr.isatty():
+        handlers.append(logging.StreamHandler())
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+        )
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S" if log_path is not None else "%H:%M:%S",
+        handlers=handlers,
+        force=True,
     )
     # pyicloud logs "Session file does not exist" at INFO on the first auth (benign:
     # there is no cached session yet). Without -v, raise it to WARNING.
@@ -286,6 +304,8 @@ def cmd_start(args):
     if getattr(args, "background", False):
         _start_background(profile)
         return
+    # The foreground daemon (also the process launchd runs) owns a rotating file log.
+    _setup_logging(getattr(args, "verbose", False), log_path=log_file(profile))
     try:
         Daemon(cfg, profile).run()
     except AlreadyRunning as exc:
@@ -314,7 +334,7 @@ def _start_background(profile: str) -> None:
     _launchctl("load", plist)
     print(f"Background daemon started via launchd ({_agent_label(profile)}).")
     print("It runs now, restarts on crash, and starts again at each login.")
-    print(f"Logs:    {state_dir(profile) / 'logs'}")
+    print(f"Logs:    {log_file(profile)}")
     print(f"Stop it: ifolder-sync stop --profile {profile}")
 
 
@@ -402,18 +422,20 @@ def cmd_purge_trash(args):
 
 def cmd_logs(args):
     profile = _profile(args)
-    log_file = state_dir(profile) / "logs" / "daemon.err.log"
-    if not log_file.exists():
+    primary = log_file(profile)
+    legacy = state_dir(profile) / "logs" / "daemon.err.log"  # pre-D4 launchd-redirected log
+    target = primary if primary.exists() else legacy
+    if not target.exists():
         print(
-            f"No log file at {log_file} — the background daemon writes it. "
+            f"No log file at {primary} — the background daemon writes it. "
             f"Start one with `ifolder-sync start --background --profile {profile}`."
         )
         return
-    with open(log_file, errors="replace") as fh:
+    with open(target, errors="replace") as fh:
         for line in deque(fh, maxlen=args.lines):
             print(line, end="")
     if args.follow:
-        _follow(log_file)
+        _follow(target)
 
 
 def _follow(path: Path) -> None:
@@ -569,7 +591,6 @@ def cmd_install_agent(args):
     cfg = Config.load(config_path(profile))
     _warn_tcc(cfg.local_path)
     plist_path = _write_agent_plist(profile)
-    log_dir = state_dir(profile) / "logs"
     print(f"LaunchAgent generated at {plist_path}")
     print("To enable (starts now and at each login):")
     print(f"  launchctl load -w {plist_path}")
@@ -577,7 +598,7 @@ def cmd_install_agent(args):
     print("To stop/remove:")
     print(f"  launchctl unload -w {plist_path}")
     print(f"  (or simply: ifolder-sync stop --profile {profile})")
-    print(f"Logs in {log_dir}")
+    print(f"Logs in {log_file(profile)}")
     print(f"\nIMPORTANT: run `ifolder-sync auth --profile {profile}` BEFORE loading the agent,")
     print("otherwise the daemon cannot pass 2FA (it runs non-interactively).")
 

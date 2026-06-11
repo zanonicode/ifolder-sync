@@ -36,6 +36,7 @@ from .config import (
     VAULT_MARKER_NAME,
     Config,
     read_vault_marker,
+    vault_access_error,
     write_vault_marker,
 )
 from .config import trash_dir as default_trash_dir
@@ -342,7 +343,7 @@ class Syncer:
                 self.store.set_meta("vault_uuid", write_vault_marker(root))
             return
         except PermissionError as exc:
-            raise LocalScanError(f"vault root not accessible: {exc}") from exc
+            raise LocalScanError(vault_access_error(root, exc)) from exc
 
         marker = read_vault_marker(root)
         expected = self.store.get_meta("vault_uuid")

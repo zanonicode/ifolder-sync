@@ -30,8 +30,8 @@ from .config import (
     Config,
     baseline_path,
     lock_path,
-    tcc_protected,
     trash_dir,
+    vault_access_error,
 )
 from .icloud_client import PART_SUFFIX, ICloudClient, is_session_relapse
 from .locking import SingleInstanceLock
@@ -40,6 +40,10 @@ from .syncer import LocalScanError, Syncer, VaultIdentityError
 from .watcher import LocalWatcher
 
 log = logging.getLogger("ifolder-sync.daemon")
+
+# An idle daemon still logs an INFO "sync done" at least this often, so the log shows the
+# daemon is alive even when no-op passes are demoted to DEBUG.
+_HEARTBEAT_SECONDS = 3600
 
 
 class Daemon:
@@ -66,6 +70,7 @@ class Daemon:
         self._trips = 0
         self._backoff: Optional[int] = None
         self._last_activity = 0.0
+        self._last_heartbeat = 0.0  # last INFO "sync done" timestamp (hourly heartbeat)
         # Session-relapse self-heal (a lapsed login token, HTTP 421): bounded reconnects.
         self._relapse_count = 0
         self._last_reconnect_at = 0.0
@@ -104,13 +109,7 @@ class Daemon:
         return True
 
     def _access_msg(self, root, exc: OSError) -> str:
-        hint = ""
-        if isinstance(exc, PermissionError) and tcc_protected(root):
-            hint = (
-                " — macOS TCC blocks launchd daemons from Downloads/Desktop/Documents; "
-                "move the vault or grant Full Disk Access"
-            )
-        return f"vault not accessible: {exc}{hint}"
+        return vault_access_error(root, exc)
 
     def _fail_preflight(self, msg: str) -> bool:
         log.critical("preflight failed: %s", msg)
@@ -124,7 +123,7 @@ class Daemon:
             self._wake.set()
             return
         try:
-            log.info("sync started (%s)", reason)
+            log.debug("sync started (%s)", reason)
             if not defer_deletes:
                 self._apply_passes += 1
             stats = self.syncer.sync_once(defer_deletes=defer_deletes)
@@ -132,10 +131,25 @@ class Daemon:
             # budget and clear any stale error so `status` reflects the recovery, not a ghost.
             self._relapse_count = 0
             self._clear_last_error()
-            log.info("sync done (%s): %s", reason, stats.summary())
             changed = bool(
                 stats.uploaded or stats.downloaded or stats.deleted_local or stats.deleted_remote
             )
+            # No-op passes used to log 2 INFO lines each (~3k/day on an idle vault). Log the
+            # summary at INFO only when the pass did something or errored; otherwise DEBUG,
+            # with an hourly INFO heartbeat so the log still proves liveness.
+            now = time.time()
+            if (
+                changed
+                or stats.errors
+                or stats.conflicts
+                or stats.skipped_deletes
+                or stats.deferred_deletes
+                or (now - self._last_heartbeat) >= _HEARTBEAT_SECONDS
+            ):
+                self._last_heartbeat = now
+                log.info("sync done (%s): %s", reason, stats.summary())
+            else:
+                log.debug("sync done (%s): %s", reason, stats.summary())
             # A watch trigger implies local activity even when the pass moved nothing.
             had_activity = reason == "watch" or changed
             if had_activity:
@@ -392,7 +406,10 @@ class Daemon:
 
             if self.cfg.watch_local:
                 self.watcher = LocalWatcher(
-                    self.cfg.local_path, self._on_local_change, self.cfg.debounce_seconds
+                    self.cfg.local_path,
+                    self._on_local_change,
+                    self.cfg.debounce_seconds,
+                    is_ignored=self.syncer._ignored,
                 )
                 self.watcher.start()
 
