@@ -1341,6 +1341,70 @@ def test_settle_escalation_count_survives_failed_escalation(make_syncer, fake, l
     store.close()
 
 
+# --- Phase C Batch 5: rmdir_local correctness -----------------------------------
+
+
+def test_rmdir_local_ignored_residue_no_resurrection(make_syncer, fake, local_dir):
+    """P1-3: a locally-surviving dir kept alive only by ignored residue (.DS_Store) after
+    its remote was deleted is trashed (dir actually gone -> baseline row dropped), so it
+    is NOT resurrected remotely next pass."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "repo/note.md", b"x", mtime=1000.0)
+    syncer.sync_once()  # baseline + remote get repo/, repo/note.md
+    assert "repo" in store.all() and "repo/note.md" in fake.files
+
+    fake.delete("repo")  # remote deletes the whole folder
+    (local_dir / "repo" / "note.md").unlink()  # local file gone too (drop_baseline)
+    (local_dir / "repo" / ".DS_Store").write_bytes(b"junk")  # ignored residue lingers
+
+    syncer.sync_once()
+    assert "repo" not in store.all()  # baseline row dropped only because the dir is gone
+    assert not (local_dir / "repo").exists()  # residue dir trashed, not left behind
+
+    s = syncer.sync_once()  # the critical check: no resurrection
+    assert "repo" not in fake.files, "a deleted folder must not resurrect remotely"
+    assert s.uploaded == 0, s.summary()
+    store.close()
+
+
+def test_rmdir_local_defers_when_real_file_survives(make_syncer, fake, local_dir):
+    """P1-3: if a non-ignored file still lives in the dir, rmdir_local must NOT drop the
+    baseline row (which would resurrect the dir); it defers and keeps the dir."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer()
+    write_file(local_dir, "d/keep.md", b"real", mtime=1000.0)
+    # Baseline knows the dir but NOT keep.md (so keep.md is a fresh local file that must
+    # survive), and the remote has neither -> the dir's cleanup is rmdir_local.
+    store.upsert(BaselineEntry("d", "dir", 0, 0, 0, 0))
+    store.commit()
+
+    syncer.sync_once()
+    assert "d" in store.all()  # row kept: a real file survives in the dir
+    assert (local_dir / "d").exists()
+    assert "d/keep.md" in fake.files  # the real file was uploaded, not lost
+    store.close()
+
+
+def test_rmdir_local_defers_on_ignored_subdir_with_real_data(make_syncer, fake, local_dir):
+    """P1-3 (review F1): an engine-ignored SUBDIR (.Trash) can hide real untracked files,
+    so rmdir_local must NOT sweep the dir into the soft-delete trash on a name match —
+    a subdirectory is opaque, so defer instead."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "repo/keep.md", b"x", mtime=1000.0)
+    syncer.sync_once()
+
+    fake.delete("repo")
+    (local_dir / "repo" / "keep.md").unlink()
+    (local_dir / "repo" / ".Trash").mkdir()  # ignored subdir...
+    (local_dir / "repo" / ".Trash" / "real.md").write_bytes(b"precious")  # ...with real data
+
+    syncer.sync_once()
+    assert (local_dir / "repo" / ".Trash" / "real.md").read_bytes() == b"precious"  # NOT swept
+    assert (local_dir / "repo").exists()  # deferred, not trashed
+    store.close()
+
+
 def test_remote_edit_husk_does_not_truncate_local(make_syncer, fake, local_dir):
     """P1-10: when a baseline-known remote file briefly drops to 0 bytes (an edit
     publishing its record before content), the local file is NOT truncated."""

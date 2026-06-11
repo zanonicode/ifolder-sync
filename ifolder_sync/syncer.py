@@ -725,16 +725,51 @@ class Syncer:
                     log.error("remote dir delete failed %s: %s", relpath, exc)
                     stats.errors += 1
         elif op == "rmdir_local":
-            stats.deleted_local += 1
-            if not dry_run:
-                try:
-                    p = self.local_root / relpath
-                    if p.exists() and not any(p.iterdir()):
-                        p.rmdir()
-                    self.store.delete(relpath)
-                except Exception as exc:  # noqa: BLE001
-                    log.error("local dir delete failed %s: %s", relpath, exc)
-                    stats.errors += 1
+            if dry_run:
+                stats.deleted_local += 1
+            else:
+                self._rmdir_local(relpath, stats)
+
+    def _rmdir_local(self, relpath: str, stats) -> None:
+        """Remove a locally-surviving dir whose remote was deleted, dropping the baseline
+        row ONLY when the dir is actually gone (P1-3). If it lingers with non-ignored
+        entries, dropping the row would make it look new and resurrect the folder remotely
+        next pass; ignored-only residue (e.g. .DS_Store) is trashed along with the dir."""
+        p = self.local_root / relpath
+        try:
+            if not p.exists():
+                self.store.delete(relpath)
+                stats.deleted_local += 1
+            elif not any(p.iterdir()):
+                p.rmdir()
+                self.store.delete(relpath)
+                stats.deleted_local += 1
+            elif self._only_ignored_residue(relpath, p):
+                trash_local(self.local_root, relpath, self.trash_dir)
+                self.store.delete(relpath)
+                stats.deleted_local += 1
+            else:
+                # Real entries survive (their own deletes are pending, or the user kept
+                # them). Keep the dir AND its baseline row so it is not resurrected; the
+                # rmdir retries once they are gone.
+                log.info("rmdir_local deferred: %s still has non-ignored entries", relpath)
+        except OSError as exc:
+            log.error("local dir delete failed %s: %s", relpath, exc)
+            stats.errors += 1
+
+    def _only_ignored_residue(self, relpath: str, p: Path) -> bool:
+        """True only if every immediate child of p is an engine-ignored regular FILE
+        (e.g. .DS_Store, *.part) — so trashing the dir loses no real data. A subdirectory
+        is an OPAQUE container: even an engine-ignored one (.Trash, a user dir-ignore) can
+        hide real untracked files, and `_ignored` matches an ignore name in any segment,
+        so a name match alone is not proof the subtree is junk. Any subdir, symlink, or
+        non-ignored file therefore means defer, never trash."""
+        for child in p.iterdir():
+            if child.is_symlink() or child.is_dir():
+                return False
+            if not self._ignored(f"{relpath}/{child.name}"):
+                return False
+        return True
 
     def _verify_adopt(self, relpath, lentry: LocalEntry, rentry: RemoteEntry, stats, dry_run):
         """Adopt-identical with proof: fetch the remote to a temp and byte-compare to the
