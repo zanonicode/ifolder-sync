@@ -944,6 +944,28 @@ def test_run_sync_retries_on_transient_during_reconnect(tmp_path, monkeypatch):
     d.store.close()
 
 
+def test_unhandled_op_is_loud_not_silent(make_syncer):
+    """P3-1: an unknown op must be a loud error, not a silent drop (file) nor a baseline
+    fall-through (dir/cleanup). Guards the exhaustive `else: raise` dispatch."""
+    from ifolder_sync.syncer import Op, SyncStats
+
+    syncer, store = make_syncer()
+    # dir + cleanup dispatchers raise directly (no internal try/except)
+    with pytest.raises(ValueError):
+        syncer._apply_dir("d", "bogus_op", SyncStats(), dry_run=False)
+    with pytest.raises(ValueError):
+        syncer._apply_cleanup("d", "bogus_op", SyncStats(), dry_run=False)
+    # the file dispatcher wraps reconcile errors -> counts an error, records nothing
+    stats = SyncStats()
+    syncer._apply_file("f", "bogus_op", {}, {}, stats, dry_run=False)
+    assert stats.errors == 1
+    assert store.all() == {}  # the bogus dir op did NOT fall through to a baseline upsert
+    # Op renders as its wire value (not "Op.UPLOAD") on every supported Python, so a future
+    # %s/f-string interpolation of an op cannot silently diverge from the string form.
+    assert str(Op.UPLOAD) == "upload" and f"{Op.DELETE_REMOTE}" == "delete_remote"
+    store.close()
+
+
 def test_dangling_and_circular_symlinks_do_not_abort_the_pass(make_syncer, fake, local_dir):
     """P1-12 (adversarial follow-up): a broken/circular symlink must be skipped, never
     reaching p.stat() in a way that raises LocalScanError (invariant 2 false-positive).

@@ -27,6 +27,7 @@ import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -52,8 +53,43 @@ MTIME_TOL = 2.0  # seconds
 # which would then be overwritten by the other side.
 MTIME_TOL_LOCAL = 0.0
 
-_FILE_DESTRUCTIVE = {"delete_local", "delete_remote"}
-_DIR_DESTRUCTIVE = {"rmdir_local", "rmdir_remote"}
+
+class Op(str, Enum):
+    """Every per-path action the engine can decide. A str-Enum so members ARE their wire
+    string (Op.UPLOAD == "upload"): existing comparisons, sets, and the destructive-op
+    guards keep working unchanged, while the apply dispatchers gain a terminal `else: raise`
+    so an unhandled op is a loud error, never a silent drop or baseline fall-through."""
+
+    # Render as the wire value, not "Op.UPLOAD": on Python 3.10/3.11 the default Enum
+    # __str__ shows the member name, so an `%s`/f-string interpolation (a log line, a future
+    # persisted field) would silently diverge from the "upload" string. This pins it to value.
+    __str__ = str.__str__
+
+    # file ops (decide_file)
+    UPLOAD = "upload"
+    DOWNLOAD = "download"
+    CONFLICT = "conflict"
+    RESCUE_UPLOAD = "rescue_upload"
+    RESCUE_DOWNLOAD = "rescue_download"
+    DELETE_LOCAL = "delete_local"
+    DELETE_REMOTE = "delete_remote"
+    SETTLE_WAIT = "settle_wait"
+    RECORD = "record"
+    VERIFY_ADOPT = "verify_adopt"
+    DROP_BASELINE = "drop_baseline"
+    # dir ops (decide_dir)
+    RECORD_DIR = "record_dir"
+    LEAVE_DIR = "leave_dir"
+    MKDIR_REMOTE = "mkdir_remote"
+    MKDIR_LOCAL = "mkdir_local"
+    # cleanup ops (decide_dir_cleanup)
+    DROP_BASELINE_DIR = "drop_baseline_dir"
+    RMDIR_REMOTE = "rmdir_remote"
+    RMDIR_LOCAL = "rmdir_local"
+
+
+_FILE_DESTRUCTIVE = {Op.DELETE_LOCAL, Op.DELETE_REMOTE}
+_DIR_DESTRUCTIVE = {Op.RMDIR_LOCAL, Op.RMDIR_REMOTE}
 
 # After this many consecutive download failures for an UNCHANGED remote signature, stop
 # re-attempting that file every pass. iCloud can serve a broken blob (HTTP 200 +
@@ -538,8 +574,8 @@ class Syncer:
             if cop is not None:
                 effective[p] = cop
 
-        doomed = {"delete_remote", "rmdir_remote", "drop_baseline", "drop_baseline_dir"}
-        kept = {p for p, op in effective.items() if op not in doomed and op != "leave_dir"}
+        doomed = {Op.DELETE_REMOTE, Op.RMDIR_REMOTE, Op.DROP_BASELINE, Op.DROP_BASELINE_DIR}
+        kept = {p for p, op in effective.items() if op not in doomed and op != Op.LEAVE_DIR}
 
         def under(parent: str, p: str) -> bool:
             return p.startswith(parent + "/")
@@ -547,7 +583,7 @@ class Syncer:
         prunable = [
             d
             for d, op in effective.items()
-            if op == "rmdir_remote" and not any(under(d, k) for k in kept)
+            if op == Op.RMDIR_REMOTE and not any(under(d, k) for k in kept)
         ]
         roots = sorted(d for d in prunable if not any(under(a, d) for a in prunable))
         covered = {p for d in roots for p in effective if under(d, p)} | set(roots)
@@ -671,7 +707,7 @@ class Syncer:
         new_counts: dict[str, int] = {}
         out = []
         for relpath, op in file_actions:
-            if op != "settle_wait":
+            if op != Op.SETTLE_WAIT:
                 out.append((relpath, op))  # resolved/other -> its count drops out below
                 continue
             n = counts.get(relpath, 0) + 1
@@ -685,7 +721,7 @@ class Syncer:
                     relpath,
                     n,
                 )
-                out.append((relpath, "conflict"))
+                out.append((relpath, Op.CONFLICT))
             else:
                 out.append((relpath, op))
         if not dry_run and new_counts != counts:
@@ -700,7 +736,7 @@ class Syncer:
             return {}
 
     # ------------------------------------------------------------ decisions ---
-    def _decide_file(self, relpath, local, remote, baseline) -> str:
+    def _decide_file(self, relpath, local, remote, baseline) -> Op:
         lentry: Optional[LocalEntry] = local.get(relpath)
         rentry: Optional[RemoteEntry] = remote.get(relpath)
         base: Optional[BaselineEntry] = baseline.get(relpath)
@@ -727,15 +763,15 @@ class Syncer:
                     # divergence with no backup. verify_adopt downloads + byte-compares,
                     # then records (truly identical) or resolves as a conflict (different).
                     if lentry.size == rentry.size and abs(lentry.mtime - rentry.mtime) <= MTIME_TOL:
-                        return "verify_adopt"
+                        return Op.VERIFY_ADOPT
                     # Simultaneous create where the remote is an empty husk: iCloud
                     # publishes the record before the content finishes uploading from the
                     # other device. Wait rather than back up 0 bytes over the live file.
                     if rentry.size == 0 and lentry.size > 0:
-                        return "settle_wait"
-                return "conflict"
+                        return Op.SETTLE_WAIT
+                return Op.CONFLICT
             if local_changed:
-                return "upload"
+                return Op.UPLOAD
             if remote_changed:
                 # Publish-before-content on an EDIT: the remote record dropped to 0 bytes
                 # while its new content uploads from another device. Downloading the husk
@@ -747,8 +783,8 @@ class Syncer:
                     and base is not None
                     and base.remote_size > 0
                 ):
-                    return "settle_wait"
-                return "download"
+                    return Op.SETTLE_WAIT
+                return Op.DOWNLOAD
             if (
                 self.cfg.verify_remote_etag
                 and base is not None
@@ -759,45 +795,45 @@ class Syncer:
                 # Same size+mtime but the iCloud etag moved: the remote content changed
                 # under an identical signature (a same-size edit, or publish-before-
                 # content). Rescue it; _do_download records the new etag so this fires once.
-                return "download"
-            return "record"
+                return Op.DOWNLOAD
+            return Op.RECORD
         if lentry and not rentry:
             if base is None:
-                return "upload"
-            return "rescue_upload" if local_changed else "delete_local"
+                return Op.UPLOAD
+            return Op.RESCUE_UPLOAD if local_changed else Op.DELETE_LOCAL
         if rentry and not lentry:
             if base is None:
-                return "download"
-            return "rescue_download" if remote_changed else "delete_remote"
-        return "drop_baseline"
+                return Op.DOWNLOAD
+            return Op.RESCUE_DOWNLOAD if remote_changed else Op.DELETE_REMOTE
+        return Op.DROP_BASELINE
 
     @staticmethod
-    def _decide_dir(relpath, local, remote, baseline) -> str:
+    def _decide_dir(relpath, local, remote, baseline) -> Op:
         in_local = relpath in local
         in_remote = relpath in remote
         if in_local and in_remote:
-            return "record_dir"
+            return Op.RECORD_DIR
         # Known in the baseline but gone from one side = a deletion in progress; the
         # cleanup phase owns it. Recreating it here (two-way logic) resurrects every
         # directory the user deletes.
         if relpath in baseline:
-            return "leave_dir"
+            return Op.LEAVE_DIR
         if in_local:
-            return "mkdir_remote"
-        return "mkdir_local"
+            return Op.MKDIR_REMOTE
+        return Op.MKDIR_LOCAL
 
     @staticmethod
-    def _decide_dir_cleanup(relpath, local, remote, baseline) -> Optional[str]:
+    def _decide_dir_cleanup(relpath, local, remote, baseline) -> Optional[Op]:
         if relpath not in baseline:
             return None
         in_local = relpath in local
         in_remote = relpath in remote
         if not in_local and not in_remote:
-            return "drop_baseline_dir"
+            return Op.DROP_BASELINE_DIR
         if not in_local and in_remote:
-            return "rmdir_remote"
+            return Op.RMDIR_REMOTE
         if in_local and not in_remote:
-            return "rmdir_local"
+            return Op.RMDIR_LOCAL
         return None
 
     # ------------------------------------------------------------- apply io ---
@@ -805,44 +841,47 @@ class Syncer:
         lentry = local.get(relpath)
         rentry = remote.get(relpath)
         try:
-            if op == "upload":
+            if op == Op.UPLOAD:
                 self._do_upload(relpath, stats, dry_run)
-            elif op == "download":
+            elif op == Op.DOWNLOAD:
                 self._do_download(relpath, rentry, stats, dry_run)
-            elif op == "conflict":
+            elif op == Op.CONFLICT:
                 self._resolve_conflict(relpath, lentry, rentry, stats, dry_run)
-            elif op == "rescue_upload":
+            elif op == Op.RESCUE_UPLOAD:
                 log.warning("remote deleted but local edited; re-uploading %s", relpath)
                 self._do_upload(relpath, stats, dry_run)
                 stats.conflicts += 1
-            elif op == "rescue_download":
+            elif op == Op.RESCUE_DOWNLOAD:
                 log.warning("local deleted but remote edited; downloading %s", relpath)
                 self._do_download(relpath, rentry, stats, dry_run)
                 stats.conflicts += 1
-            elif op == "delete_local":
+            elif op == Op.DELETE_LOCAL:
                 self._delete_local(relpath, stats, dry_run)
-            elif op == "delete_remote":
+            elif op == Op.DELETE_REMOTE:
                 self._delete_remote(relpath, stats, dry_run)
-            elif op == "settle_wait":
+            elif op == Op.SETTLE_WAIT:
                 log.info(
                     "remote %s is empty and unknown to the baseline (likely still "
                     "uploading from another device); deferring to the next pass",
                     relpath,
                 )
-            elif op == "record":
+            elif op == Op.RECORD:
                 self._record(relpath, lentry, rentry, dry_run)
-            elif op == "verify_adopt":
+            elif op == Op.VERIFY_ADOPT:
                 self._verify_adopt(relpath, lentry, rentry, stats, dry_run)
-            elif op == "drop_baseline" and not dry_run:
-                self.store.delete(relpath)
+            elif op == Op.DROP_BASELINE:
+                if not dry_run:
+                    self.store.delete(relpath)
+            else:
+                raise ValueError(f"unhandled file op {op!r}")
         except Exception as exc:  # noqa: BLE001
             log.error("error reconciling %s: %s", relpath, exc)
             stats.errors += 1
 
     def _apply_dir(self, relpath, op, stats, dry_run):
-        if op == "leave_dir":
+        if op == Op.LEAVE_DIR:
             return
-        if op == "mkdir_remote":
+        if op == Op.MKDIR_REMOTE:
             stats.uploaded += 1
             if not dry_run:
                 try:
@@ -851,23 +890,28 @@ class Syncer:
                     log.error("remote mkdir failed %s: %s", relpath, exc)
                     stats.errors += 1
                     return
-        elif op == "mkdir_local" and not dry_run:
-            try:
-                (self.local_root / relpath).mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                # e.g. a regular file already occupies the path (kind conflict). Record
-                # nothing: a dir that was not created must not enter the baseline.
-                log.error("local mkdir failed %s: %s", relpath, exc)
-                stats.errors += 1
-                return
+        elif op == Op.MKDIR_LOCAL:
+            if not dry_run:
+                try:
+                    (self.local_root / relpath).mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    # e.g. a regular file already occupies the path (kind conflict). Record
+                    # nothing: a dir that was not created must not enter the baseline.
+                    log.error("local mkdir failed %s: %s", relpath, exc)
+                    stats.errors += 1
+                    return
+        elif op != Op.RECORD_DIR:
+            # RECORD_DIR falls through to the shared upsert (both sides already have it);
+            # any other op reaching here is a bug, not a silent baseline write.
+            raise ValueError(f"unhandled dir op {op!r}")
         if not dry_run:
             self.store.upsert(BaselineEntry(relpath, "dir", 0, 0, 0, 0))
 
     def _apply_cleanup(self, relpath, op, stats, dry_run):
-        if op == "drop_baseline_dir":
+        if op == Op.DROP_BASELINE_DIR:
             if not dry_run:
                 self.store.delete(relpath)
-        elif op == "rmdir_remote":
+        elif op == Op.RMDIR_REMOTE:
             stats.deleted_remote += 1
             if not dry_run:
                 try:
@@ -876,11 +920,13 @@ class Syncer:
                 except Exception as exc:  # noqa: BLE001
                     log.error("remote dir delete failed %s: %s", relpath, exc)
                     stats.errors += 1
-        elif op == "rmdir_local":
+        elif op == Op.RMDIR_LOCAL:
             if dry_run:
                 stats.deleted_local += 1
             else:
                 self._rmdir_local(relpath, stats)
+        else:
+            raise ValueError(f"unhandled cleanup op {op!r}")
 
     def _rmdir_local(self, relpath: str, stats) -> None:
         """Remove a locally-surviving dir whose remote was deleted, dropping the baseline
