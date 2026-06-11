@@ -1007,16 +1007,36 @@ class Syncer:
         try:
             self.client.download(relpath, bkp)
         except Exception as exc:  # noqa: BLE001
-            # Never run action() (which removes the remote loser) without a saved
-            # backup: a transient download error would otherwise hard-delete the only
-            # copy of the losing version. Abort; the conflict re-derives next pass.
-            log.error(
-                "could not save remote backup of %s; aborting conflict resolution this "
-                "pass (will retry): %s",
+            try:
+                bkp.unlink()  # remove the partial/empty backup
+            except OSError:
+                pass
+            fails = self._note_download_failure(relpath, rentry)
+            if fails < DOWNLOAD_MAX_FAILS:
+                # Transient: never run action() (which removes the remote loser) without a
+                # saved backup — a network blip would otherwise drop the only copy of the
+                # losing version. Abort; the conflict re-derives next pass.
+                log.error(
+                    "could not save remote backup of %s; aborting conflict resolution this "
+                    "pass (will retry): %s",
+                    relpath,
+                    exc,
+                )
+                return
+            # Persistent: a remote blob that cannot be downloaded after several tries (a
+            # broken iCloud blob) has NO recoverable content to protect, and blocking
+            # forever loops the conflict every pass. Resolve WITHOUT the backup — the prior
+            # remote goes to iCloud Recently Deleted via the upload's move-to-trash when
+            # remote_trash is on.
+            log.warning(
+                "remote backup of %s failed %d times (broken/undownloadable remote blob); "
+                "resolving the conflict WITHOUT a backup so the good local copy can win",
                 relpath,
-                exc,
+                fails,
             )
+            action()
             return
+        self._download_fail.pop(relpath, None)  # success clears the backoff
         action()
 
     # -------------------------------------------------------------- actions ---
@@ -1047,16 +1067,28 @@ class Syncer:
             BaselineEntry(relpath, "file", st.st_size, st.st_mtime, st.st_size, st.st_mtime)
         )
 
-    def _do_download(self, relpath, rentry: RemoteEntry, stats, dry_run):
+    # --- download-failure backoff (a broken iCloud blob: 200 + Content-Length N + 0 bytes)
+    def _download_backed_off(self, relpath, rentry) -> bool:
         prev = self._download_fail.get(relpath)
-        same_remote = bool(
-            prev and prev[0] == rentry.size and abs(prev[1] - rentry.mtime) <= MTIME_TOL
+        return bool(
+            prev
+            and prev[0] == rentry.size
+            and abs(prev[1] - rentry.mtime) <= MTIME_TOL
+            and prev[2] >= DOWNLOAD_MAX_FAILS
         )
-        fails = prev[2] if same_remote and prev else 0
-        if fails >= DOWNLOAD_MAX_FAILS:
-            # Backed off: this remote has failed to download repeatedly without changing
-            # (a broken blob). Skip without re-attempting; auto-retries when it changes.
-            log.debug("skipping %s: download backed off after %d failures", relpath, fails)
+
+    def _note_download_failure(self, relpath, rentry) -> int:
+        prev = self._download_fail.get(relpath)
+        same = bool(prev and prev[0] == rentry.size and abs(prev[1] - rentry.mtime) <= MTIME_TOL)
+        fails = (prev[2] if same and prev else 0) + 1
+        self._download_fail[relpath] = (rentry.size, rentry.mtime, fails)
+        return fails
+
+    def _do_download(self, relpath, rentry: RemoteEntry, stats, dry_run):
+        if self._download_backed_off(relpath, rentry):
+            # The remote has failed to download repeatedly without changing (a broken
+            # blob). Skip without re-attempting; auto-retries when the remote changes.
+            log.debug("skipping %s: download backed off", relpath)
             return
         stats.downloaded += 1
         log.info("DOWN %s", relpath)
@@ -1067,14 +1099,13 @@ class Syncer:
         try:
             self.client.download(relpath, dest)
         except Exception:
-            self._download_fail[relpath] = (rentry.size, rentry.mtime, fails + 1)
-            if fails + 1 == DOWNLOAD_MAX_FAILS:
+            if self._note_download_failure(relpath, rentry) == DOWNLOAD_MAX_FAILS:
                 log.warning(
                     "download of %s failed %d times against an unchanged remote (iCloud "
                     "is serving fewer bytes than its listed size — a broken remote blob); "
                     "backing off until the remote changes",
                     relpath,
-                    fails + 1,
+                    DOWNLOAD_MAX_FAILS,
                 )
             raise
         self._download_fail.pop(relpath, None)  # success clears the backoff

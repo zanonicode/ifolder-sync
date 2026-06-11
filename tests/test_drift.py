@@ -1605,6 +1605,37 @@ def test_persistent_download_failure_backs_off(make_syncer, fake, local_dir):
     store.close()
 
 
+def test_conflict_backup_failure_backs_off_then_resolves(make_syncer, fake, local_dir):
+    """A conflict whose remote loser can't be backed up (broken iCloud blob) retries the
+    backup a few times then resolves WITHOUT it — the good local copy is uploaded and
+    wins — instead of aborting (and looping) every pass forever."""
+    from ifolder_sync.state import BaselineEntry
+    from ifolder_sync.syncer import DOWNLOAD_MAX_FAILS
+
+    syncer, store = make_syncer("newer")
+    write_file(local_dir, "n.md", b"GOOD-LOCAL", mtime=5000.0)
+    fake.put("n.md", b"whatever", mtime=2000.0)
+    store.upsert(BaselineEntry("n.md", "file", 3, 1.0, 3, 1.0, ""))  # both sides differ -> conflict
+    store.commit()
+
+    real_dl = fake.download
+    fails = {"n": 0}
+
+    def boom(relpath, dest):  # the remote backup download (broken blob) always fails
+        if relpath == "n.md":
+            fails["n"] += 1
+            raise OSError("download size mismatch: got 0 bytes, expected 8")
+        return real_dl(relpath, dest)
+
+    fake.download = boom
+    for _ in range(6):
+        syncer.sync_once()
+
+    assert fails["n"] == DOWNLOAD_MAX_FAILS, fails["n"]  # backup attempts bounded
+    assert fake.files["n.md"]["content"] == b"GOOD-LOCAL"  # good local won, no infinite loop
+    store.close()
+
+
 def test_normalization_downgrade_defers_deletes_persistently(
     make_syncer, fake, local_dir, monkeypatch
 ):
