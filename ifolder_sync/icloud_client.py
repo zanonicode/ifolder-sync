@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timezone
@@ -604,7 +605,7 @@ class ICloudClient:
         if not self.remote_root:
             return node
         for part in PurePosixPath(self.remote_root).parts:
-            node = node[part]
+            node = self._child(node, part)
         return node
 
     def ensure_remote_root(self) -> None:
@@ -614,10 +615,26 @@ class ICloudClient:
             return
         for part in PurePosixPath(self.remote_root).parts:
             try:
-                node = node[part]
+                node = self._child(node, part)
             except (KeyError, IndexError):
                 node.mkdir(part)
                 node = self._fresh_child(node, part)
+
+    @staticmethod
+    def _child(node, name: str):
+        """Resolve a child by name, NFC-insensitively. iCloud usually stores NFC, but a
+        file placed by Apple's NATIVE client can be NFD; the engine navigates by an NFC
+        identity key, so an exact-only match would miss the NFD node -> KeyError -> a
+        phantom 'remote deleted' or (post-rebaseline) a duplicate. Fall back to comparing
+        NFC-normalized names so the reverse key->node trip always finds the real node."""
+        try:
+            return node[name]
+        except (KeyError, IndexError):
+            target = unicodedata.normalize("NFC", name)
+            for child in node.get_children():
+                if unicodedata.normalize("NFC", child.name) == target:
+                    return child
+            raise KeyError(name) from None
 
     @staticmethod
     def _fresh_child(parent, name):
@@ -768,7 +785,7 @@ class ICloudClient:
         parts = PurePosixPath(relpath).parts
         for part in parts[:-1]:
             try:
-                node = node[part]
+                node = self._child(node, part)
             except (KeyError, IndexError):
                 if not create_dirs:
                     raise
@@ -778,7 +795,7 @@ class ICloudClient:
 
     def download(self, relpath: str, dest: "os.PathLike") -> None:
         parent, name = self._navigate(relpath)
-        node = parent[name]
+        node = self._child(parent, name)
         tmp = str(dest) + PART_SUFFIX
         # The listing size for a real file equals its byte count; 0/unknown skips the
         # check by design (0-byte notes stream empty; folders are never downloaded).
@@ -825,7 +842,7 @@ class ICloudClient:
     def mkdir(self, relpath: str) -> None:
         parent, name = self._navigate(relpath, create_dirs=True)
         try:
-            parent[name]
+            self._child(parent, name)
             return  # already exists
         except (KeyError, IndexError):
             self._retry(lambda: parent.mkdir(name))
@@ -833,14 +850,14 @@ class ICloudClient:
     def delete(self, relpath: str) -> None:
         try:
             parent, name = self._navigate(relpath)
-            node = parent[name]
+            node = self._child(parent, name)
         except (KeyError, IndexError):
             return  # already gone
         self._retry(lambda: self._remove_node(node))
 
     def _remove_existing(self, parent, name) -> None:
         try:
-            node = parent[name]
+            node = self._child(parent, name)
         except (KeyError, IndexError):
             return
         try:

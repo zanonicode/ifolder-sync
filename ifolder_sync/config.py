@@ -205,6 +205,12 @@ class Config:
     interval_active_seconds: int = 20
     active_window_seconds: int = 300
     remote_trash: bool = True
+    # Normalize filenames to NFC for identity (Syncthing's "normalize for identity, not
+    # for I/O"). macOS may store accented names decomposed (NFD) while iCloud reports
+    # them composed (NFC); without this the same note reads as two paths -> phantom
+    # create+delete -> deletion of accented files. On by default; relies on APFS being
+    # normalization-insensitive for lookups.
+    normalize_unicode: bool = True
     # A 0-byte remote file shadowing a non-empty local file is usually a publish-before-
     # content upload from another device, so the engine waits (settle_wait). If it stays
     # empty this many passes it is judged genuinely empty and escalated to a conflict.

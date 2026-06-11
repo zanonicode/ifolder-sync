@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -1402,6 +1403,196 @@ def test_rmdir_local_defers_on_ignored_subdir_with_real_data(make_syncer, fake, 
     syncer.sync_once()
     assert (local_dir / "repo" / ".Trash" / "real.md").read_bytes() == b"precious"  # NOT swept
     assert (local_dir / "repo").exists()  # deferred, not trashed
+    store.close()
+
+
+# --- Phase C Batch 6: filename identity (NFC/NFD, casefold) ----------------------
+
+
+def test_nfd_local_nfc_remote_is_one_identity(make_syncer, fake, local_dir):
+    """P1-2: a local file stored decomposed (NFD) and the same remote name composed (NFC)
+    are ONE identity — no phantom create+delete, no deletion of the accented file."""
+    name_nfc = unicodedata.normalize("NFC", "Anotações.md")
+    name_nfd = unicodedata.normalize("NFD", "Anotações.md")
+    assert name_nfc != name_nfd  # the bytes really differ
+
+    syncer, store = make_syncer()
+    write_file(local_dir, name_nfd, b"data", mtime=1000.0)  # local on disk: NFD
+    fake.put(name_nfc, b"data", mtime=1000.0)  # remote: NFC, same bytes
+    from ifolder_sync.state import BaselineEntry
+
+    store.upsert(BaselineEntry(name_nfc, "file", 4, 1000.0, 4, 1000.0, ""))
+    store.commit()
+
+    s = syncer.sync_once()
+    assert s.deleted_local == 0 and s.deleted_remote == 0, s.summary()  # no phantom delete
+    assert s.uploaded == 0 and s.downloaded == 0, s.summary()  # recognized as identical
+    assert list(fake.files) == [name_nfc]  # no NFD duplicate created remotely
+    store.close()
+
+
+def test_case_collision_is_skipped_not_clobbered(make_syncer, fake, local_dir):
+    """P1-2: local `note.md` vs remote `Note.md` (differ only by case) is a collision the
+    engine refuses to guess — skip both, warn, count; never clobber the local original."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "note.md", b"local", mtime=1000.0)
+    fake.put("Note.md", b"remote", mtime=2000.0)
+
+    s = syncer.sync_once()
+    assert s.errors >= 1, s.summary()  # collision surfaced
+    assert (local_dir / "note.md").read_bytes() == b"local"  # local original untouched
+    assert fake.files["Note.md"]["content"] == b"remote"  # remote untouched
+    assert "note.md" not in store.all() and "Note.md" not in store.all()  # neither recorded
+    store.close()
+
+
+def test_vault_marker_hard_ignore_is_case_insensitive(make_syncer, fake, local_dir):
+    """P1-2: a remote `.IFOLDER-SYNC-VAULT` (any case) is hard-ignored, so it can never be
+    downloaded and clobber the local `.ifolder-sync-vault` identity marker."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "real.md", b"x", mtime=1000.0)
+    fake.put(".IFOLDER-SYNC-VAULT", b'{"uuid":"evil"}', mtime=1000.0)
+
+    syncer.sync_once()
+    assert "real.md" in fake.files
+    # On case-insensitive APFS the evil remote would clobber the real marker IF synced.
+    # The hard-ignore must keep it out, so the local marker keeps its real UUID.
+    assert read_vault_marker(local_dir) != "evil"
+    assert ".IFOLDER-SYNC-VAULT" not in store.all()  # never recorded/synced
+    store.close()
+
+
+def test_baseline_nfc_migration_rekeys_legacy_rows(make_syncer, fake, local_dir):
+    """P1-2: a legacy baseline row stored under an NFD key is re-keyed to NFC on the first
+    pass (so it matches the NFC scan and does not read as delete + re-create)."""
+    from ifolder_sync.state import BaselineEntry
+
+    name_nfc = unicodedata.normalize("NFC", "Café.md")
+    name_nfd = unicodedata.normalize("NFD", "Café.md")
+    syncer, store = make_syncer()
+    store.upsert(BaselineEntry(name_nfd, "file", 4, 1000.0, 4, 1000.0, ""))  # legacy NFD row
+    store.commit()
+    assert name_nfd in store.all()
+
+    write_file(local_dir, name_nfd, b"data", mtime=1000.0)
+    fake.put(name_nfc, b"data", mtime=1000.0)
+    s = syncer.sync_once()
+
+    rows = store.all()
+    assert name_nfc in rows and name_nfd not in rows  # migrated to NFC
+    assert s.deleted_local == 0 and s.deleted_remote == 0, s.summary()
+    assert store.get_meta("nfc_migrated") == "1"
+    store.close()
+
+
+def test_ignore_change_defers_deletions_one_pass(make_syncer, fake, local_dir):
+    """F-P1-14: when the effective ignore set changed since the last pass, deletions are
+    deferred for one pass (so an ignore edit that coincides with apparent deletions can
+    never propagate them blindly — the rclone-bisync 'filters changed' safeguard)."""
+    syncer, store = make_syncer(ignore=[".DS_Store"])
+    write_file(local_dir, "keep.md", b"x", mtime=1000.0)
+    write_file(local_dir, "gone.md", b"y", mtime=1000.0)
+    syncer.sync_once()  # records the ignore_hash; uploads both
+    assert "gone.md" in fake.files
+    assert syncer._ignore_changed(dry_run=True) is False  # stable -> no trip
+
+    (local_dir / "gone.md").unlink()  # a real local deletion...
+    syncer.ignore_patterns = [".DS_Store", "tmp-*"]  # ...coinciding with an ignore edit
+    s = syncer.sync_once()
+    assert s.deferred_deletes >= 1, s.summary()
+    assert "gone.md" in fake.files  # deletion deferred this pass, not propagated
+    store.close()
+
+
+def test_client_child_resolves_nfd_remote_by_nfc_key():
+    """Batch 6 H1: navigating by an NFC key resolves a remote node stored NFD (placed by
+    Apple's native client), so a remote NFD file never reads as a phantom deletion or
+    spawns a duplicate."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    nfd = unicodedata.normalize("NFD", "Café.md")
+    nfc = unicodedata.normalize("NFC", "Café.md")
+    assert nfd != nfc
+    child = _FakeNode(nfd, "file", size=3)
+
+    class _Parent:
+        def __getitem__(self, name):
+            if name == nfd:
+                return child
+            raise KeyError(name)  # exact NFC lookup misses the NFD node
+
+        def get_children(self):
+            return [child]
+
+    assert ICloudClient._child(_Parent(), nfc) is child  # NFC-insensitive fallback
+
+
+def test_normalize_unicode_opt_out_uses_raw_keys(make_syncer):
+    """Batch 6 M1: the config opt-out (and a normalization-sensitive volume) fall back to
+    raw identity keys — no NFC folding."""
+    nfd = unicodedata.normalize("NFD", "Café.md")
+    syncer_off, store_off = make_syncer(normalize_unicode=False)
+    assert syncer_off._normalize_active() is False
+    assert syncer_off._ident(nfd) == nfd  # unchanged
+    store_off.close()
+
+    syncer_on, store_on = make_syncer()  # default on; tmp_path is APFS (insensitive)
+    assert syncer_on._normalize_active() is True
+    assert syncer_on._ident(nfd) == unicodedata.normalize("NFC", nfd)
+    store_on.close()
+
+
+def test_part_exact_case_marker_case_insensitive(make_syncer):
+    """Batch 6 L1: `*.part` hard-ignore stays exact-case (a real `gearbox.PART` syncs),
+    while the vault marker is matched case-insensitively (anti-clobber)."""
+    syncer, store = make_syncer()
+    assert syncer._ignored("gearbox.PART") is False  # real user file, not the engine temp
+    assert syncer._ignored("download.part") is True  # engine temp
+    assert syncer._ignored(".IFOLDER-SYNC-VAULT") is True  # marker, any case
+    assert syncer._ignored(".ifolder-sync-vault") is True
+    store.close()
+
+
+def test_migration_collision_drops_both(make_syncer):
+    """Batch 6 M2: when a legacy NFD row and an NFC row both exist for one path, the
+    migration drops BOTH and lets the next pass re-derive (verify_adopt) rather than keep
+    a possibly-stale signature."""
+    from ifolder_sync.state import BaselineEntry
+
+    nfd = unicodedata.normalize("NFD", "Café.md")
+    nfc = unicodedata.normalize("NFC", "Café.md")
+    syncer, store = make_syncer()
+    store.upsert(BaselineEntry(nfd, "file", 1, 1.0, 1, 1.0, "old"))
+    store.upsert(BaselineEntry(nfc, "file", 2, 2.0, 2, 2.0, "new"))
+    store.commit()
+
+    migrated = syncer._migrate_baseline_nfc(store.all(), dry_run=False)
+    assert nfd not in migrated and nfc not in migrated  # both dropped
+    assert nfd not in store.all() and nfc not in store.all()
+    store.close()
+
+
+def test_normalization_downgrade_defers_deletes_persistently(
+    make_syncer, fake, local_dir, monkeypatch
+):
+    """Batch 6 W1: a baseline NFC-migrated on an insensitive volume, then run on a volume
+    that reports raw names, defers deletions on EVERY pass (not one-shot) so accented
+    files are never phantom-deleted while the state is inconsistent."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "keep.md", b"x", mtime=1000.0)
+    syncer.sync_once()  # normalize active; sets nfc_migrated
+    assert store.get_meta("nfc_migrated") == "1"
+
+    # The vault volume now reports as normalization-sensitive.
+    monkeypatch.setattr(syncer, "_probe_nfc_insensitive", lambda: False)
+    syncer._nfc_active = None  # force a re-probe
+    assert syncer._normalization_downgraded() is True
+
+    (local_dir / "keep.md").unlink()  # a real deletion
+    s1 = syncer.sync_once()
+    assert s1.deferred_deletes >= 1 and "keep.md" in fake.files  # deferred, not applied
+    s2 = syncer.sync_once()
+    assert s2.deferred_deletes >= 1 and "keep.md" in fake.files  # STILL deferred (persistent)
     store.close()
 
 

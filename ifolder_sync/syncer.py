@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import filecmp
 import fnmatch
+import hashlib
 import json
 import logging
 import os
 import shutil
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -52,6 +54,10 @@ MTIME_TOL_LOCAL = 0.0
 
 _FILE_DESTRUCTIVE = {"delete_local", "delete_remote"}
 _DIR_DESTRUCTIVE = {"rmdir_local", "rmdir_remote"}
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
 
 
 class LocalScanError(RuntimeError):
@@ -141,6 +147,7 @@ class Syncer:
         self.trash_dir = trash_dir or default_trash_dir()
         self.ignore_patterns = config.effective_ignore
         self._symlink_warned: set[str] = set()
+        self._nfc_active: Optional[bool] = None  # probed once (volume normalization)
         # The daemon passes its _stop predicate so a SIGTERM mid-apply breaks the loop
         # promptly; per-action commits keep what was already applied durable.
         self._stop_check = stop_check
@@ -157,12 +164,55 @@ class Syncer:
             self.store.commit()
 
     # ----------------------------------------------------------- snapshots ---
+    def _ident(self, relpath: str) -> str:
+        """The canonical identity key for a path. NFC-normalized so a macOS NFD name and
+        the iCloud NFC name of the same note map to ONE key (no phantom create/delete).
+        Used as the dict/baseline key; IO resolves it on APFS (normalization-insensitive)."""
+        return _nfc(relpath) if self._normalize_active() else relpath
+
+    def _normalize_active(self) -> bool:
+        """NFC identity is only safe on a normalization-INSENSITIVE volume (APFS), where
+        an NFC key resolves the NFD on-disk file for IO. On a sensitive volume (some
+        network / case-sensitive mounts) it would create NFC/NFD duplicate files, so fall
+        back to raw keys there. Config opt-out wins; otherwise probe the volume once."""
+        if not self.cfg.normalize_unicode:
+            return False
+        if self._nfc_active is None:
+            self._nfc_active = self._probe_nfc_insensitive()
+        return self._nfc_active
+
+    def _probe_nfc_insensitive(self) -> bool:
+        root = self.local_root
+        nfd = ".ifolder-nfc-probe" + unicodedata.normalize("NFD", "é") + PART_SUFFIX
+        nfc = ".ifolder-nfc-probe" + unicodedata.normalize("NFC", "é") + PART_SUFFIX
+        try:
+            (root / nfd).write_text("")
+            try:
+                insensitive = (root / nfc).exists()
+            finally:
+                for n in (nfd, nfc):
+                    try:
+                        (root / n).unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            return False  # cannot probe (e.g. TCC) -> conservative: no normalization
+        if not insensitive:
+            log.warning(
+                "vault volume is Unicode-normalization-sensitive; filename normalization "
+                "disabled (NFC and NFD names are treated as distinct on this volume)"
+            )
+        return insensitive
+
     def _ignored(self, relpath: str) -> bool:
-        segs = relpath.split("/")
+        segs = _nfc(relpath).split("/")
         # Engine-internal exclusions, independent of the user's ignore list: configs
-        # saved by older versions never pick up new DEFAULT_IGNORE entries.
+        # saved by older versions never pick up new DEFAULT_IGNORE entries. The vault
+        # marker is matched case-insensitively so a remote `.IFOLDER-SYNC-VAULT` can never
+        # sync and clobber the local marker; `*.part` stays exact-case (the only .part the
+        # engine creates is lowercase) so a real user file `foo.PART` is not hidden.
         name = segs[-1]
-        if name == VAULT_MARKER_NAME or name.endswith(PART_SUFFIX):
+        if name.casefold() == _nfc(VAULT_MARKER_NAME).casefold() or name.endswith(PART_SUFFIX):
             return True
         return any(path_is_ignored(pat, segs) for pat in self.ignore_patterns)
 
@@ -254,7 +304,8 @@ class Syncer:
                     continue
                 except OSError as exc:
                     raise LocalScanError(f"local scan failed at {rel}: {exc}") from exc
-                out[rel] = LocalEntry(rel, "dir", 0, st.st_mtime)
+                key = self._ident(rel)
+                out[key] = LocalEntry(key, "dir", 0, st.st_mtime)
             for f in filenames:
                 rel = f"{rel_dir}/{f}" if rel_dir else f
                 if self._ignored(rel):
@@ -268,17 +319,19 @@ class Syncer:
                     continue
                 except OSError as exc:
                     raise LocalScanError(f"local scan failed at {rel}: {exc}") from exc
-                out[rel] = LocalEntry(rel, "file", st.st_size, st.st_mtime)
+                key = self._ident(rel)
+                out[key] = LocalEntry(key, "file", st.st_size, st.st_mtime)
         return out
 
     def _scan_remote(self) -> dict[str, RemoteEntry]:
         remote = self.client.walk(self._ignored)
         safe: dict[str, RemoteEntry] = {}
         for rel, entry in remote.items():
-            if self._is_safe_rel(rel):
-                safe[rel] = entry
-            else:
+            if not self._is_safe_rel(rel):
                 log.warning("skipping unsafe remote path: %s", rel)
+                continue
+            key = self._ident(rel)
+            safe[key] = RemoteEntry(key, entry.kind, entry.size, entry.mtime, entry.etag)
         return safe
 
     # ----------------------------------------------------- change detection ---
@@ -312,12 +365,31 @@ class Syncer:
 
         baseline = self.store.all()
         self._preflight_local(baseline, dry_run)  # raises -> pass aborts, zero actions
+        baseline = self._migrate_baseline_nfc(baseline, dry_run)
+        if not defer_deletes and self._ignore_changed(dry_run):
+            log.warning(
+                "ignore set changed since the last pass; deferring deletions this pass "
+                "(a widened ignore would otherwise read as mass deletion)"
+            )
+            defer_deletes = True
+        if not defer_deletes and self._normalization_downgraded():
+            # Unlike a filter edit, this does not self-heal: the baseline is NFC-keyed but
+            # the volume now reports raw (NFD) names, so accented files would read as
+            # deletions every pass. Defer deletions PERSISTENTLY until the volume is
+            # restored (probe re-passes) or the operator rebaselines.
+            log.critical(
+                "baseline is NFC-migrated but the vault volume is now normalization-"
+                "sensitive; deferring deletions until resolved (restore the original "
+                "volume, or run `ifolder-sync rebaseline`)"
+            )
+            defer_deletes = True
         local = self._scan_local()  # raises on permission errors -> pass aborts
         remote = self._scan_remote()  # raises on a failed remote walk -> pass aborts
         if defer_deletes:
             self._log_direction(local, remote)
         all_paths = set(local) | set(remote) | set(baseline)
         all_paths = self._exclude_kind_conflicts(all_paths, local, remote, stats)
+        all_paths = self._exclude_case_collisions(all_paths, stats)
 
         dirs = sorted(
             (p for p in all_paths if self._is_dir(p, local, remote, baseline)),
@@ -487,6 +559,77 @@ class Syncer:
         self.store.delete(root)
         for p in items:
             self.store.delete(p)
+
+    def _migrate_baseline_nfc(self, baseline: dict, dry_run: bool) -> dict:
+        """P1-2 one-time migration: re-key any baseline relpath that is not NFC so it
+        aligns with the NFC-keyed scans. Without it, an accented file recorded by the old
+        engine under its NFD name would not match the NFC scan key and read as a delete +
+        re-create on the first pass. Idempotent (a meta flag), returns the migrated dict."""
+        if not self._normalize_active() or self.store.get_meta("nfc_migrated") == "1":
+            return baseline
+        for rel in [r for r in baseline if _nfc(r) != r]:
+            nfc = _nfc(rel)
+            entry = baseline.pop(rel)
+            if not dry_run:
+                self.store.delete(rel)
+            if nfc in baseline:
+                # Collision: an NFC row already exists. Drop BOTH and let the next pass
+                # re-derive the truth (both-present, base None -> verify_adopt) rather than
+                # guess which stale signature to keep.
+                baseline.pop(nfc, None)
+                if not dry_run:
+                    self.store.delete(nfc)
+                continue
+            entry.relpath = nfc
+            baseline[nfc] = entry
+            if not dry_run:
+                self.store.upsert(entry)
+        if not dry_run:
+            self.store.set_meta("nfc_migrated", "1")
+        return baseline
+
+    def _normalization_downgraded(self) -> bool:
+        """True when the baseline was NFC-migrated on a previous (insensitive-volume) run
+        but the volume is no longer normalization-insensitive — an inconsistent state that
+        would phantom-delete accented files, so deletions must defer until it is fixed."""
+        return self.store.get_meta("nfc_migrated") == "1" and not self._normalize_active()
+
+    def _ignore_changed(self, dry_run: bool) -> bool:
+        """F-P1-14: if the effective ignore set changed since the last pass, a previously
+        synced file may now be ignored and read as a deletion. Returns True (→ defer
+        deletes one pass, the rclone-bisync 'filters changed' safeguard) and records the
+        new hash. The very first pass never trips it (no prior hash)."""
+        # Fold in the active normalization policy: flipping it (config opt-out, or the
+        # volume probe) re-keys every accented path — a bigger upheaval than a filter edit
+        # — so it must defer deletes one pass exactly like a changed ignore set.
+        state = "\n".join(self.ignore_patterns) + f"\x00normalize={self._normalize_active()}"
+        h = hashlib.sha256(state.encode("utf-8")).hexdigest()
+        prev = self.store.get_meta("ignore_hash")
+        if not dry_run and prev != h:
+            self.store.set_meta("ignore_hash", h)
+        return prev is not None and prev != h
+
+    def _exclude_case_collisions(self, all_paths: set, stats) -> set:
+        """P1-2: two distinct identity keys that casefold to the same value (local
+        `note.md` vs remote `Note.md`) are a collision the engine cannot reconcile on
+        case-insensitive macOS — guessing risks clobbering the local original. Skip every
+        variant this pass (no transfer, no delete, baseline untouched) and warn; the user
+        renames to one canonical form to resolve."""
+        groups: dict[str, list[str]] = {}
+        for p in all_paths:
+            groups.setdefault(_nfc(p).casefold(), []).append(p)
+        collided = {p for variants in groups.values() if len(variants) > 1 for p in variants}
+        if not collided:
+            return all_paths
+        for variants in groups.values():
+            if len(variants) > 1:
+                log.warning(
+                    "name collision (differ only by case/normalization): %s — skipping all "
+                    "this pass; rename to a single canonical form",
+                    ", ".join(sorted(variants)),
+                )
+                stats.errors += 1
+        return all_paths - collided
 
     def _exclude_kind_conflicts(self, all_paths: set, local, remote, stats) -> set:
         """P1-9: a path that is a file on one side and a directory on the other cannot be
