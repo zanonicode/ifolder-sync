@@ -628,3 +628,95 @@ def test_sync_progress_suppressed_in_json_mode(tmp_path, monkeypatch, capsys):
     cap = capsys.readouterr()
     assert "Connecting" not in cap.err  # quiet for machine consumers
     json.loads(cap.out)
+
+
+# =============================================================== E4 (P4-8/9) ===
+# ----------------------------------------------- P4-8 plist program shim ---
+def _make_exe(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_agent_program_prefers_external_shim(tmp_path, monkeypatch):
+    # An absolute, executable shim OUTSIDE the current venv is stable across upgrades; use it.
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path / "venv"))
+    shim = _make_exe(tmp_path / "external" / "ifolder-sync")
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: str(shim))
+    assert cli._agent_program() == [str(shim)]
+
+
+def test_agent_program_skips_venv_internal_shim(tmp_path, monkeypatch):
+    # A shim INSIDE the running venv is recreated/destroyed with it; prefer `python -m`,
+    # which does not depend on the shim file surviving a rebuild.
+    fake_prefix = tmp_path / "venv"
+    shim = _make_exe(fake_prefix / "bin" / "ifolder-sync")
+    monkeypatch.setattr(cli.sys, "prefix", str(fake_prefix))
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: str(shim))
+    assert cli._agent_program() == [cli.sys.executable, "-m", "ifolder_sync"]
+
+
+def test_agent_program_rejects_relative_shim(monkeypatch):
+    # A relative which() result (a '.'/empty PATH segment) cannot be exec'd by launchd.
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: "relbin/ifolder-sync")
+    assert cli._agent_program() == [cli.sys.executable, "-m", "ifolder_sync"]
+
+
+def test_agent_program_no_shim_uses_module(monkeypatch):
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: None)
+    assert cli._agent_program() == [cli.sys.executable, "-m", "ifolder_sync"]
+
+
+def test_agent_program_never_freezes_nonshim_argv0(monkeypatch):
+    # No shim + a non-shim executable argv[0] (pytest, a wrapper) must NOT be frozen as the
+    # launchd program — launchd would crash-loop the wrong binary with sync args.
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(cli.sys, "argv", ["/usr/bin/pytest"])
+    assert cli._agent_program() == [cli.sys.executable, "-m", "ifolder_sync"]
+
+
+def test_agent_plist_uses_program_from_agent_program(isolate_home, tmp_path, monkeypatch):
+    import plistlib
+
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path / "venv"))
+    shim = _make_exe(tmp_path / "external" / "ifolder-sync")
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: str(shim))
+    payload = plistlib.loads(cli._write_agent_plist("default").read_bytes())
+    # The shim leads the ProgramArguments; the invariant-9 tail is preserved.
+    assert payload["ProgramArguments"][0] == str(shim)
+    assert payload["ProgramArguments"][-4:] == ["start", "--profile", "default", "--launchd"]
+
+
+# ----------------------------------------------- P4-9 shtab completion ---
+def test_print_completion_zsh_emits_script(capsys):
+    # shtab is in the dev/test deps, so the flag is present and prints a #compdef script.
+    with pytest.raises(SystemExit) as ei:
+        main(["--print-completion", "zsh"])
+    assert ei.value.code == 0
+    out = capsys.readouterr().out
+    assert "#compdef" in out
+    assert "ifolder-sync" in out
+
+
+def test_print_completion_bash_emits_script(capsys):
+    with pytest.raises(SystemExit) as ei:
+        main(["--print-completion", "bash"])
+    assert ei.value.code == 0
+    assert "ifolder-sync" in capsys.readouterr().out
+
+
+def test_completion_flag_absent_without_shtab(monkeypatch):
+    # Without shtab installed the flag is simply not added (base install stays dep-free).
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_shtab(name, *a, **k):
+        if name == "shtab":
+            raise ImportError("no shtab")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_shtab)
+    parser = cli.build_parser()
+    assert "--print-completion" not in parser._option_string_actions

@@ -678,12 +678,44 @@ def _agent_label(profile: str) -> str:
     return f"com.ifolder-sync.{profile}"
 
 
+def _shim_in_current_venv(shim: str) -> bool:
+    """True if `shim` resolves inside the running interpreter's environment (sys.prefix).
+    Such a shim is recreated/destroyed with that venv, so freezing its path into the plist
+    would ENOENT-crash-loop launchd after a rebuild — `python -m` is the stabler target."""
+    try:
+        return Path(shim).resolve().is_relative_to(Path(sys.prefix).resolve())
+    except OSError:
+        return True
+
+
+def _agent_program() -> list[str]:
+    """The command launchd should exec, chosen to survive a venv rebuild / upgrade.
+
+    Prefer an `ifolder-sync` shim on PATH ONLY when it is absolute, executable, and lives
+    OUTSIDE the current venv — a pipx/uv-tool/Homebrew shim (~/.local/bin, /opt/homebrew/
+    bin) is a stable name across upgrades. It is taken UNRESOLVED (a Homebrew symlink points
+    into a version-specific Cellar dir; resolving would re-break on `brew upgrade`).
+    Otherwise fall back to `[sys.executable, "-m", "ifolder_sync"]`, which is always correct
+    in the running interpreter and stable across rebuilds — never a bare argv[0] (which
+    could be pytest, a wrapper, or a throwaway launcher that launchd would crash-loop)."""
+    shim = shutil.which("ifolder-sync")
+    if (
+        shim
+        and os.path.isabs(shim)
+        and os.access(shim, os.X_OK)
+        and not _shim_in_current_venv(shim)
+    ):
+        return [shim]
+    return [sys.executable, "-m", "ifolder_sync"]
+
+
 def _write_agent_plist(profile: str) -> Path:
     """Write (overwrite) the profile's launchd LaunchAgent .plist; return its path.
 
     The agent runs `start --profile <profile>` in the foreground *inside* launchd; launchd
     provides the detachment, restart-on-crash (KeepAlive), and start-at-login (RunAtLoad).
-    Shared by `install-agent` and `start --background`.
+    Shared by `install-agent` and `start --background`, both of which regenerate it every
+    run so an upgrade that moves the interpreter refreshes the embedded path.
 
     KeepAlive uses SuccessfulExit=false: restart only on a non-zero exit, so a daemon
     that exits cleanly on purpose (failed preflight/auth) cannot crash-loop;
@@ -696,13 +728,7 @@ def _write_agent_plist(profile: str) -> Path:
     log_dir = state_dir(profile) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    exe = Path(sys.argv[0]).resolve()
-    if exe.suffix == ".py" or not os.access(exe, os.X_OK):
-        # Started via `python -m ifolder_sync`: argv[0] is not an executable entry
-        # point, so the agent must go through the interpreter.
-        program = [sys.executable, "-m", "ifolder_sync"]
-    else:
-        program = [str(exe)]
+    program = _agent_program()
 
     payload = {
         "Label": label,
@@ -899,7 +925,22 @@ def build_parser() -> argparse.ArgumentParser:
     pia = sub.add_parser("install-agent", help="generate a launchd LaunchAgent")
     _add_profile(pia)
     pia.set_defaults(func=cmd_install_agent)
+
+    _add_completion_arg(p)
     return p
+
+
+def _add_completion_arg(parser: argparse.ArgumentParser) -> None:
+    """Add `--print-completion {bash,zsh,...}` when shtab is installed. shtab is an optional
+    dependency (`ifolder-sync[completion]`), so without it the flag is simply absent — the
+    base install keeps zero non-essential deps."""
+    try:
+        import shtab
+    except ImportError:
+        return
+    shtab.add_argument_to(
+        parser, ["--print-completion"], help="print a shell completion script and exit"
+    )
 
 
 def _start_is_launchd(args) -> bool:
