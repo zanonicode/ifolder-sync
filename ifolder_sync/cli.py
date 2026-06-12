@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from . import __version__
 from .config import (
+    CONFLICT_POLICIES,
     DEFAULT_PROFILE,
     Config,
     baseline_path,
@@ -215,31 +216,65 @@ def _confirm_root_scope(args) -> None:
         raise ValueError("root sync not confirmed; set a remote folder or pass --allow-root.")
 
 
+def _ask(prompt: str, current: Any) -> str:
+    """Free-text prompt: empty input keeps the current value."""
+    return input(f"{prompt} [{current}]: ").strip() or str(current)
+
+
+def _ask_required(prompt: str, current: str) -> str:
+    """Re-prompt until a non-empty value is given (empty keeps a non-empty default)."""
+    while True:
+        val = input(f"{prompt} [{current}]: ").strip() or current
+        if val:
+            return val
+        print("  This value is required — please enter it.")
+
+
+def _ask_int(prompt: str, current: int) -> int:
+    """Re-prompt until the input parses as an integer, instead of aborting the interview
+    on a typo like '60s'."""
+    while True:
+        raw = input(f"{prompt} [{current}]: ").strip()
+        if not raw:
+            return current
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"  '{raw}' is not a whole number — please try again.")
+
+
+def _ask_choice(prompt: str, current: str, choices: tuple[str, ...]) -> str:
+    """Re-prompt until the input is one of `choices`."""
+    while True:
+        val = input(f"{prompt} [{current}]: ").strip() or current
+        if val in choices:
+            return val
+        print(f"  '{val}' is not one of {'/'.join(choices)} — please try again.")
+
+
 def cmd_init(args):
     profile = _profile(args)
     path = config_path(profile)
     cfg = Config.load(path) if path.exists() else Config()
 
-    def ask(prompt, current):
-        val = input(f"{prompt} [{current}]: ").strip()
-        return val or current
-
     print(f"== ifolder-sync configuration (profile: {profile}) ==")
-    cfg.apple_id = ask("Apple ID (email of the iCloud account to sync)", cfg.apple_id)
-    cfg.remote_folder = ask("Folder inside iCloud Drive (empty = root)", cfg.remote_folder)
-    cfg.local_folder = ask(
+    cfg.apple_id = _ask_required("Apple ID (email of the iCloud account to sync)", cfg.apple_id)
+    cfg.remote_folder = _ask("Folder inside iCloud Drive (empty = root)", cfg.remote_folder)
+    cfg.local_folder = _ask(
         "Local folder to mirror", cfg.local_folder or str(Path.home() / "iCloudSync")
     )
-    cfg.interval_seconds = int(ask("Poll interval (seconds)", cfg.interval_seconds))
-    cfg.conflict_policy = ask("Conflict policy (newer/local/remote/both)", cfg.conflict_policy)
-    watch = ask("Watch local changes in real time? (y/n)", "y" if cfg.watch_local else "n")
+    cfg.interval_seconds = _ask_int("Poll interval (seconds)", cfg.interval_seconds)
+    cfg.conflict_policy = _ask_choice(
+        "Conflict policy (newer/local/remote/both)", cfg.conflict_policy, CONFLICT_POLICIES
+    )
+    watch = _ask("Watch local changes in real time? (y/n)", "y" if cfg.watch_local else "n")
     cfg.watch_local = watch.lower().startswith("y")
     if args.obsidian:
         cfg.obsidian = True
         print("Is this an Obsidian vault? yes (--obsidian)")
     else:
         obs_default = "y" if cfg.obsidian else "n"
-        cfg.obsidian = ask("Is this an Obsidian vault? (y/n)", obs_default).lower().startswith("y")
+        cfg.obsidian = _ask("Is this an Obsidian vault? (y/n)", obs_default).lower().startswith("y")
 
     if not cfg.remote_folder.strip():
         _confirm_root_scope(args)
@@ -301,16 +336,27 @@ def cmd_sync(args):
                 file=sys.stderr,
             )
             sys.exit(1)
+    # Progress to stderr (never stdout — keeps --json clean) so the user sees the slow
+    # connect+scan is working and is not tempted to Ctrl-C mid-bootstrap (the worst moment).
+    json_mode = getattr(args, "json", False)
+    show_progress = sys.stderr.isatty() and not json_mode
+
+    def progress(msg: str) -> None:
+        if show_progress:
+            print(msg, file=sys.stderr)
+
     try:
         client = ICloudClient.from_config(cfg)
         # --json is a machine contract: a 2FA/password prompt can't be answered by a
         # consumer and its text would land on stdout before the JSON, so force
         # non-interactive when --json is set (an auth gap then fails fast to stderr + exit 3).
-        interactive = not args.non_interactive and not getattr(args, "json", False)
+        interactive = not args.non_interactive and not json_mode
+        progress(f"Connecting to iCloud as {cfg.apple_id}…")
         client.connect(interactive=interactive)
         with StateStore(baseline_path(profile)) as store:
             store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
             syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
+            progress("Scanning local and remote… (the first sync can take ~1 minute)")
             stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
         if getattr(args, "json", False):
             print(json.dumps(_sync_json(stats, args.dry_run), indent=2))
@@ -511,7 +557,30 @@ def cmd_status(args):
 
 def cmd_purge_trash(args):
     profile = _profile(args)
-    n = purge_trash(trash_dir(profile))
+    td = trash_dir(profile)
+    count = trash_count(td)
+    if count == 0:
+        print(f"Local trash of profile '{profile}' is already empty.")
+        return
+    # The soft-delete trash IS the recovery net for a wrongly-propagated deletion, so this
+    # is the one zero-friction destructive command — confirm before emptying it.
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            print(
+                f"Refusing to purge {count} file(s) non-interactively. Re-run with --yes.",
+                file=sys.stderr,
+            )
+            sys.exit(Exit.ERROR)
+        try:
+            answer = input(
+                f"Delete {count} file(s) from the local trash of '{profile}'? [y/N]: "
+            ).strip()
+        except EOFError:
+            answer = ""  # Ctrl-D / closed stdin = decline; never empty the safety net
+        if not answer.lower().startswith("y"):
+            print("Aborted; trash kept.")
+            return
+    n = purge_trash(td)
     print(f"Purged {n} file(s) from the local trash of profile '{profile}'.")
 
 
@@ -806,6 +875,7 @@ def build_parser() -> argparse.ArgumentParser:
     pstat.set_defaults(func=cmd_status)
 
     ppt = sub.add_parser("purge-trash", help="empty a profile's local soft-delete trash")
+    ppt.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     _add_profile(ppt)
     ppt.set_defaults(func=cmd_purge_trash)
 
@@ -916,7 +986,8 @@ def main(argv=None):
     migrate_legacy()
     try:
         args.func(args)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
+        # Ctrl-C or Ctrl-D/closed stdin at any prompt: a clean line, never a traceback.
         print("\nInterrupted.")
         sys.exit(Exit.INTERRUPTED)
     except Exception as exc:  # noqa: BLE001

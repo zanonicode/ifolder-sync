@@ -42,6 +42,9 @@ ENGINE_IGNORE = ("*.conflict-*",)
 # vault" detection could never fire.
 VAULT_MARKER_NAME = ".ifolder-sync-vault"
 
+# Single source for the conflict-resolution policies (validate() + the `init` prompt).
+CONFLICT_POLICIES = ("newer", "local", "remote", "both")
+
 # launchd-started daemons cannot read these without Full Disk Access (macOS TCC),
 # while a Terminal-started one can -- which masks the problem during testing.
 _TCC_PROTECTED = ("Downloads", "Desktop", "Documents")
@@ -295,7 +298,7 @@ class Config:
             raise ValueError("apple_id is empty in the config.")
         if not self.local_folder:
             raise ValueError("local_folder is empty in the config.")
-        if self.conflict_policy not in {"newer", "local", "remote", "both"}:
+        if self.conflict_policy not in CONFLICT_POLICIES:
             raise ValueError(f"invalid conflict_policy: {self.conflict_policy}")
         if not isinstance(self.ignore, list):
             raise ValueError("`ignore` must be a list of patterns.")

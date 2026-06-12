@@ -23,12 +23,20 @@ from pyicloud.exceptions import (
 import ifolder_sync.icloud_client as ic_module
 from ifolder_sync import cli
 from ifolder_sync.cli import main
-from ifolder_sync.config import Config, baseline_path, config_path, lock_path
+from ifolder_sync.config import (
+    CONFLICT_POLICIES,
+    Config,
+    baseline_path,
+    config_path,
+    lock_path,
+    trash_dir,
+)
 from ifolder_sync.exitcodes import Exit
 from ifolder_sync.icloud_client import AuthError, ICloudClient
 from ifolder_sync.locking import SingleInstanceLock
 from ifolder_sync.state import CorruptBaselineError
 from ifolder_sync.syncer import LocalScanError, SyncStats, VaultIdentityError
+from ifolder_sync.trash import trash_count
 
 from .helpers import sandbox_home
 
@@ -462,3 +470,161 @@ def test_sync_without_json_stays_interactive(tmp_path, monkeypatch):
     monkeypatch.setattr(sy.Syncer, "sync_once", lambda self, *a, **k: SyncStats())
     main(["sync", "--dry-run", "--profile", "work"])
     assert seen["interactive"] is True
+
+
+# =============================================================== E3 (P4-5/6/7) ===
+def _answers(monkeypatch, *seq):
+    it = iter(seq)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(it))
+
+
+# --------------------------------------------------- P4-6 init re-prompt ---
+def test_ask_int_reprompts_on_typo(monkeypatch, capsys):
+    _answers(monkeypatch, "60s", "60")
+    assert cli._ask_int("Interval", 30) == 60
+    assert "not a whole number" in capsys.readouterr().out
+
+
+def test_ask_int_empty_keeps_default(monkeypatch):
+    _answers(monkeypatch, "")
+    assert cli._ask_int("Interval", 45) == 45
+
+
+def test_ask_choice_reprompts_until_valid(monkeypatch, capsys):
+    _answers(monkeypatch, "bogus", "remote")
+    assert cli._ask_choice("Policy", "newer", CONFLICT_POLICIES) == "remote"
+    assert "not one of" in capsys.readouterr().out
+
+
+def test_ask_required_reprompts_on_empty(monkeypatch, capsys):
+    _answers(monkeypatch, "", "x@y.com")
+    assert cli._ask_required("Apple ID", "") == "x@y.com"
+    assert "required" in capsys.readouterr().out
+
+
+def test_init_survives_interval_and_policy_typos(tmp_path, monkeypatch):
+    # P4-6: a typo in a validated field re-prompts instead of discarding the interview.
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    # apple_id, remote, local, interval(typo->valid), conflict(typo->valid), watch, obsidian
+    _answers(monkeypatch, "x@y.com", "Notes", str(vault), "60s", "90", "bad", "newer", "n", "n")
+    main(["init", "--profile", "work"])
+    cfg = Config.load(config_path("work"))
+    assert cfg.interval_seconds == 90
+    assert cfg.conflict_policy == "newer"
+
+
+# ------------------------------------------------ P4-7 purge-trash confirm ---
+def _make_trash(profile, n):
+    td = trash_dir(profile)
+    td.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (td / f"deleted{i}.md").write_text("x")
+    return td
+
+
+def test_purge_trash_empty_is_noop(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    main(["purge-trash", "--profile", "work"])
+    assert "already empty" in capsys.readouterr().out
+
+
+def test_purge_trash_yes_skips_prompt(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    _make_trash("work", 2)
+    main(["purge-trash", "--yes", "--profile", "work"])
+    assert "Purged 2 file(s)" in capsys.readouterr().out
+    assert trash_count(trash_dir("work")) == 0
+
+
+def test_purge_trash_interactive_abort_keeps_files(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    _make_trash("work", 3)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    _answers(monkeypatch, "n")
+    main(["purge-trash", "--profile", "work"])
+    assert "Aborted" in capsys.readouterr().out
+    assert trash_count(trash_dir("work")) == 3  # kept — the safety net survives
+
+
+def test_purge_trash_interactive_confirm_purges(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    _make_trash("work", 2)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    _answers(monkeypatch, "y")
+    main(["purge-trash", "--profile", "work"])
+    assert trash_count(trash_dir("work")) == 0
+
+
+def test_purge_trash_non_interactive_without_yes_refuses(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    _make_trash("work", 2)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+    with pytest.raises(SystemExit) as ei:
+        main(["purge-trash", "--profile", "work"])
+    assert ei.value.code == Exit.ERROR
+    assert trash_count(trash_dir("work")) == 2  # not purged
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_purge_trash_eof_declines_and_keeps_files(tmp_path, monkeypatch, capsys):
+    # Ctrl-D at the confirm prompt = decline; the safety net survives and no traceback.
+    sandbox_home(tmp_path, monkeypatch)
+    _make_trash("work", 3)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+
+    def _eof(*_a, **_k):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof)
+    main(["purge-trash", "--profile", "work"])  # no SystemExit, no traceback
+    assert "Aborted; trash kept." in capsys.readouterr().out
+    assert trash_count(trash_dir("work")) == 3
+
+
+def test_main_eof_exits_cleanly_without_traceback(isolate_home, monkeypatch, capsys):
+    # EOFError at any prompt must exit cleanly (like Ctrl-C), not dump a traceback.
+    monkeypatch.setattr(cli, "cmd_status", _raise(EOFError()))
+    with pytest.raises(SystemExit) as ei:
+        cli.main(["status"])
+    assert ei.value.code == Exit.INTERRUPTED
+    assert "Traceback" not in capsys.readouterr().err
+
+
+# ------------------------------------------------ P4-5 first-sync feedback ---
+def test_sync_progress_to_stderr_on_tty(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+    monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(ic_module, "ICloudClient", _connect_spy({}))
+    import ifolder_sync.syncer as sy
+
+    monkeypatch.setattr(sy.Syncer, "sync_once", lambda self, *a, **k: SyncStats())
+    main(["sync", "--dry-run", "--profile", "work"])
+    cap = capsys.readouterr()
+    assert "Connecting to iCloud" in cap.err
+    assert "Scanning" in cap.err
+    assert "Connecting" not in cap.out  # progress never pollutes stdout
+
+
+def test_sync_progress_suppressed_in_json_mode(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+    monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(ic_module, "ICloudClient", _connect_spy({}))
+    import ifolder_sync.syncer as sy
+
+    monkeypatch.setattr(sy.Syncer, "sync_once", lambda self, *a, **k: SyncStats())
+    main(["sync", "--dry-run", "--json", "--profile", "work"])
+    cap = capsys.readouterr()
+    assert "Connecting" not in cap.err  # quiet for machine consumers
+    json.loads(cap.out)
