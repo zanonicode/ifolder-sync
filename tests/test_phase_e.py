@@ -35,10 +35,10 @@ from ifolder_sync.exitcodes import Exit
 from ifolder_sync.icloud_client import AuthError, ICloudClient
 from ifolder_sync.locking import SingleInstanceLock
 from ifolder_sync.state import CorruptBaselineError
-from ifolder_sync.syncer import LocalScanError, SyncStats, VaultIdentityError
+from ifolder_sync.syncer import LocalScanError, SyncClient, SyncStats, VaultIdentityError
 from ifolder_sync.trash import trash_count
 
-from .helpers import sandbox_home
+from .helpers import FakeICloud, sandbox_home
 
 
 @pytest.fixture
@@ -720,3 +720,75 @@ def test_completion_flag_absent_without_shtab(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _no_shtab)
     parser = cli.build_parser()
     assert "--print-completion" not in parser._option_string_actions
+
+
+# =============================================================== E6 (P5-3/5/7) ===
+# ------------------------------------------ P5-3 plist asserted by VALUES ---
+def test_agent_plist_values_enforce_invariant_9(isolate_home):
+    import plistlib
+
+    payload = plistlib.loads(cli._write_agent_plist("default").read_bytes())
+    # Invariant 9: SuccessfulExit MUST be False. A string-presence assert ("<key>
+    # SuccessfulExit</key>") passes even if the value were flipped to True (the crash-loop);
+    # asserting the parsed VALUE is what actually guards it.
+    assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert payload["RunAtLoad"] is True
+    assert payload["ThrottleInterval"] == 60
+    assert payload["ExitTimeOut"] == 30
+    assert payload["ProcessType"] == "Background"
+    assert payload["Label"] == "com.ifolder-sync.default"
+    assert payload["ProgramArguments"][-4:] == ["start", "--profile", "default", "--launchd"]
+
+
+# ------------------------------------ P5-3 Daemon lifecycle: clean stop ---
+def _daemon(tmp_path, monkeypatch, profile="work"):
+    from ifolder_sync.daemon import Daemon
+
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir(exist_ok=True)
+    Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path(profile))
+    return Daemon(Config.load(config_path(profile)), profile)
+
+
+def test_daemon_stops_clean_on_vault_identity_error(tmp_path, monkeypatch):
+    # Invariant 8: a vault identity mismatch is unrecoverable without `rebaseline`; the daemon
+    # must stop cleanly (set _stop) rather than loop the mismatch every poll.
+    d = _daemon(tmp_path, monkeypatch)
+
+    def _raise(*_a, **_k):
+        raise VaultIdentityError("marker mismatch")
+
+    monkeypatch.setattr(d.syncer, "sync_once", _raise)
+    assert not d._stop.is_set()
+    d._run_sync("test")
+    assert d._stop.is_set()
+    assert "marker mismatch" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+def test_daemon_local_scan_error_does_not_stop(tmp_path, monkeypatch):
+    # A LocalScanError is transient (a permission blip): record it, but DO NOT stop — the
+    # next poll retries. Caught before the broad handler so it never kills the daemon.
+    d = _daemon(tmp_path, monkeypatch)
+
+    def _raise(*_a, **_k):
+        raise LocalScanError("permission denied")
+
+    monkeypatch.setattr(d.syncer, "sync_once", _raise)
+    d._run_sync("test")
+    assert not d._stop.is_set()  # transient -> keep running
+    assert "permission denied" in (d.store.get_meta("last_error") or "")
+    d.store.close()
+
+
+# ----------------------------------- P5-5 SyncClient Protocol conformance ---
+def test_fakeicloud_satisfies_syncclient_at_runtime():
+    # Complements the compile-time check in helpers.py: the @runtime_checkable Protocol means
+    # a missing/renamed engine-facing method fails this isinstance, not just mypy.
+    assert isinstance(FakeICloud(), SyncClient)
+
+
+def test_real_client_satisfies_syncclient_at_runtime(tmp_path):
+    client = ICloudClient.from_config(Config(apple_id="x@y.com", local_folder=str(tmp_path)))
+    assert isinstance(client, SyncClient)

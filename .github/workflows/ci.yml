@@ -40,7 +40,7 @@ jobs:
       - run: ruff check ifolder_sync tests
       - run: ruff format --check ifolder_sync tests
       - run: mypy ifolder_sync tests
-      - run: pytest --cov=ifolder_sync --cov-report=term --cov-fail-under=65
+      - run: pytest --cov=ifolder_sync --cov-report=term --cov-fail-under=75
 
   canary:
     name: pyicloud canary (latest in-range)
