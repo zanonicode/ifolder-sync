@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ifolder-sync"
-version = "0.11.0"
+version = "0.12.0"
 description = "Bidirectional sync daemon between a specific iCloud Drive folder and a local folder on macOS."
 readme = "README.md"
 license = "MIT"

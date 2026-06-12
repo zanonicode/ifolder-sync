@@ -7,6 +7,45 @@ carry behavior changes).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-12
+
+Phase E — CLI/UX surface and test debt. User-visible additions (exit codes, `--json`, shell
+completion, friendlier prompts) plus a large coverage expansion (163 → 255 tests).
+
+### Added
+- **Exit-code taxonomy** so scripts/monitoring can tell *why* a command ended: `0` ok,
+  `2` usage, `3` auth-required, `4` scan-guard abort, `5` vault-identity mismatch,
+  `6` deletions suppressed by the safety threshold, `7` sync ran but some file ops failed,
+  `130` interrupted. Documented in `--help`. (`sync` no longer exits `0` when every upload
+  failed.)
+- **`--json`** for `status` and `sync`: machine-readable JSON to stdout, human/diagnostic
+  text to stderr — for menu-bar / Raycast / Obsidian-plugin integrations.
+- **Shell completion** via the optional `shtab` dependency:
+  `ifolder-sync --print-completion zsh|bash` (install `ifolder-sync[completion]`).
+- **First-sync feedback** (`Connecting…` / `Scanning…`) on a TTY so the slow bootstrap is
+  visible; never on stdout, so `--json` stays pure.
+
+### Changed
+- `init` re-prompts on a bad value — a typo like `60s` for the interval no longer discards
+  the whole interview.
+- `purge-trash` confirms before emptying the soft-delete trash (`-y`/`--yes` to skip; a
+  non-interactive run without `--yes` refuses rather than silently deleting the safety net).
+- `main()` catches `PyiCloudException` (a 503/429 prints one clean line, not a multi-screen
+  traceback; `-v` re-raises). A rejected/absent password or a cancelled 2FA now exits `3`
+  consistently. `Ctrl-D` at a prompt exits cleanly instead of dumping a traceback.
+- The launchd agent runs `start … --launchd`, keeping deliberate stops at exit `0`
+  (invariant 9); its program prefers a stable PATH shim *outside* the venv, else
+  `python -m ifolder_sync`, so login auto-start survives a venv rebuild / upgrade.
+- `NO_COLOR` is honored.
+
+### Tests
+- 163 → 255 tests: conflict-policy matrix (all four policies + the `newer` remote-wins
+  backup + the 0-byte guard), the delete-threshold pct branch and drift escalation/reset,
+  `MTIME_TOL` boundaries, property-based decide-table invariants (hypothesis — never deletes
+  without a baseline; unchanged orphans are deleted), the plist asserted **by value**
+  (invariant-9 `SuccessfulExit=false`), the daemon clean-stop lifecycle, and runtime
+  `SyncClient` Protocol conformance. CI coverage gate raised 65% → 75% (currently ~79%).
+
 ## [0.11.0] - 2026-06-11
 
 Phase D — refactor & performance, no behavior change beyond the items called out below.
@@ -83,7 +122,8 @@ Phase D — refactor & performance, no behavior change beyond the items called o
   installed no dependencies. Moved into `[project]`, added an SPDX license and a CI build
   gate (build + install across Python 3.10–3.14, ruff + mypy + pytest).
 
-[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.12.0
 [0.11.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.11.0
 [0.10.3]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.10.3
 [0.10.2]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.10.2

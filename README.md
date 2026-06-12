@@ -126,15 +126,44 @@ ifolder-sync auth                 # authenticate with iCloud (one-time 2FA, then
 ifolder-sync auth --fresh         # same, but discard the saved session and log in clean
 ifolder-sync sync                 # run ONE sync pass and exit (good for testing)
 ifolder-sync sync --dry-run       # preview a pass without writing anything
+ifolder-sync sync --json          # emit the pass outcome as JSON (pairs with --dry-run)
 ifolder-sync sync --force-delete  # apply deletions even past the safety threshold
 ifolder-sync start                # run the daemon in foreground (poll + watch)
 ifolder-sync start --background   # run it detached via launchd (returns your terminal)
 ifolder-sync stop                 # stop the background (launchd) daemon
 ifolder-sync status               # show every profile's state (--profile <name> for just one)
+ifolder-sync status --json        # machine-readable state (for menu-bar/Raycast integrations)
 ifolder-sync logs -f              # tail the daemon log and keep following (Ctrl-C stops)
 ifolder-sync rebaseline           # reset the baseline (backup first) after the vault moved/drifted
-ifolder-sync purge-trash          # empty the local soft-delete trash
+ifolder-sync purge-trash          # empty the local soft-delete trash (confirms; -y to skip)
 ifolder-sync install-agent        # generate the launchd LaunchAgent without loading it
+```
+
+JSON goes to **stdout**, human/diagnostic text to **stderr** — so `status --json | jq` and
+`sync --dry-run --json` are stable to script against. `NO_COLOR` is honored.
+
+### Exit codes
+
+`ifolder-sync` returns a distinct code per outcome so cron/monitoring can react (not just a
+blanket `0`):
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | success |
+| 2 | usage error (bad arguments) |
+| 3 | authentication required — run `ifolder-sync auth` |
+| 4 | a scan guard aborted the pass (zero deletions; check permissions/network) |
+| 5 | vault identity mismatch — run `ifolder-sync rebaseline` |
+| 6 | sync ran, but deletions were suppressed by the safety threshold |
+| 7 | sync ran, but some file operations failed |
+| 130 | interrupted (Ctrl-C) |
+
+### Shell completion (optional)
+
+```bash
+pip install "ifolder-sync[completion]"          # adds shtab
+ifolder-sync --print-completion zsh  > "${fpath[1]}/_ifolder-sync"   # zsh
+ifolder-sync --print-completion bash > ifolder-sync.bash            # bash
 ```
 
 ### Password
