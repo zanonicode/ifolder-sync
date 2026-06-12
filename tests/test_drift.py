@@ -1884,3 +1884,71 @@ def test_kind_conflict_file_vs_dir_is_skipped(make_syncer, fake, local_dir):
     assert "x" in fake.files and fake.files["x"]["kind"] == "dir"  # remote dir untouched
     assert "x" not in store.all()  # nothing recorded for the conflicted path
     store.close()
+
+
+# ============================================ P5-2 threshold-pct + drift escalation ===
+def test_delete_threshold_pct_branch_suppresses(make_syncer, fake, local_dir):
+    """The PCT branch (distinct from the count branch): a deletion count BELOW the count
+    threshold but ABOVE the fraction-of-tracked threshold suppresses all deletes."""
+    syncer, store = make_syncer(delete_threshold_pct=10, delete_threshold_count=1000)
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        write_file(local_dir, name, b"x", mtime=1000)
+    syncer.sync_once()  # baseline: 4 files on both sides
+
+    (local_dir / "a.txt").unlink()
+    (local_dir / "b.txt").unlink()  # delete 2/4 = 50% > 10% pct, but 2 < 1000 count
+    s = syncer.sync_once()
+
+    assert s.skipped_deletes == 2, s.summary()
+    assert s.deleted_remote == 0, s.summary()
+    assert "a.txt" in fake.files and "b.txt" in fake.files  # remote intact
+    store.close()
+
+
+def _make_daemon(tmp_path, monkeypatch):
+    from ifolder_sync.daemon import Daemon
+
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("work"))
+    return Daemon(Config.load(config_path("work")), "work")
+
+
+def test_track_drift_escalates_after_three_trips(tmp_path, monkeypatch):
+    from ifolder_sync.syncer import SyncStats
+
+    d = _make_daemon(tmp_path, monkeypatch)
+    d._apply_passes = 5  # past startup, so no DRIFT-SUSPECTED special-casing
+    assert d._backoff is None
+    for _ in range(2):
+        d._track_drift(SyncStats(skipped_deletes=1))
+        assert d._backoff is None  # not yet escalated
+    d._track_drift(SyncStats(skipped_deletes=1))  # 3rd consecutive trip
+    assert d._trips == 3
+    assert d._backoff is not None and d._backoff > 0
+    d.store.close()
+
+
+def test_track_drift_resets_on_clean_pass(tmp_path, monkeypatch):
+    from ifolder_sync.syncer import SyncStats
+
+    d = _make_daemon(tmp_path, monkeypatch)
+    d._apply_passes = 5
+    for _ in range(3):
+        d._track_drift(SyncStats(skipped_deletes=1))
+    assert d._backoff is not None
+    d._track_drift(SyncStats())  # a clean pass restores the normal interval
+    assert d._trips == 0
+    assert d._backoff is None
+    d.store.close()
+
+
+def test_track_drift_flags_drift_suspected_at_startup(tmp_path, monkeypatch):
+    from ifolder_sync.syncer import SyncStats
+
+    d = _make_daemon(tmp_path, monkeypatch)
+    d._apply_passes = 1  # the first applying pass: a suppression here is a startup red flag
+    d._track_drift(SyncStats(skipped_deletes=2))
+    assert "DRIFT SUSPECTED" in (d.store.get_meta("last_error") or "")
+    d.store.close()

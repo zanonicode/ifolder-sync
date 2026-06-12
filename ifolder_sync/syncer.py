@@ -116,6 +116,24 @@ class Op(str, Enum):
 _FILE_DESTRUCTIVE = {Op.DELETE_LOCAL, Op.DELETE_REMOTE}
 _DIR_DESTRUCTIVE = {Op.RMDIR_LOCAL, Op.RMDIR_REMOTE}
 
+# The complete set of ops `_decide_file` can return — the single source the property tests
+# assert closure over, so a new file-decision Op forces an explicit entry here.
+_FILE_DECISION_OPS = frozenset(
+    {
+        Op.UPLOAD,
+        Op.DOWNLOAD,
+        Op.CONFLICT,
+        Op.RESCUE_UPLOAD,
+        Op.RESCUE_DOWNLOAD,
+        Op.DELETE_LOCAL,
+        Op.DELETE_REMOTE,
+        Op.SETTLE_WAIT,
+        Op.RECORD,
+        Op.VERIFY_ADOPT,
+        Op.DROP_BASELINE,
+    }
+)
+
 # After this many consecutive download failures for an UNCHANGED remote signature, stop
 # re-attempting that file every pass. iCloud can serve a broken blob (HTTP 200 +
 # Content-Length N + 0 bytes); without a backoff the pass re-decides "download" forever,
