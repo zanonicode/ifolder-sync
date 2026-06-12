@@ -2,10 +2,13 @@
 
 E1: exit-code taxonomy + PyiCloudException catch in main (P4-1, P4-4), and the
 --launchd plist flag that keeps the daemon at exit 0 on deliberate stops (invariant 9).
+E2: --json for status and sync (P4-2), NO_COLOR honoring, and the data/presentation
+split that keeps the human status output byte-identical.
 """
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -272,3 +275,190 @@ def test_cmd_start_launchd_flag_keeps_corrupt_baseline_at_exit_0(tmp_path, monke
     _corrupt_baseline("corrupt")
     main(["start", "--launchd", "--profile", "corrupt"])  # no SystemExit
     assert "rebaseline" in capsys.readouterr().err
+
+
+# =============================================================== E2 (P4-2) ===
+# ------------------------------------------------------------- NO_COLOR ---
+def test_no_color_env_disables_color(monkeypatch):
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert cli._color("running", "32;1") == "running"  # no ANSI escape
+
+
+def test_color_wraps_on_tty_without_no_color(monkeypatch):
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert cli._color("running", "32;1") == "\033[32;1mrunning\033[0m"
+
+
+def test_no_color_present_even_empty_disables(monkeypatch):
+    # no-color.org: presence disables regardless of value, so "" still means off.
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setenv("NO_COLOR", "")
+    assert cli._color("x", "31") == "x"
+
+
+# ------------------------------------------------------- status --json ---
+def test_profile_status_data_shape(tmp_path, monkeypatch):
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(
+        apple_id="x@y.com",
+        remote_folder="Notes",
+        local_folder=str(vault),
+        conflict_policy="newer",
+        obsidian=True,
+    ).save(config_path("work"))
+
+    data = cli._profile_status_data("work")
+    assert data["configured"] is True
+    assert data["profile"] == "work"
+    assert data["apple_id"] == "x@y.com"
+    assert data["remote_folder"] == "Notes"
+    assert data["conflict_policy"] == "newer"
+    assert data["obsidian"] is True
+    assert data["daemon"] == {"running": False, "pid": None}
+    # No session saved -> the structured session state, not a colored string.
+    assert data["session"]["state"] == "not found"
+    assert data["baseline"] == "absent"
+    assert data["last_sync"] is None
+
+
+def test_profile_status_data_unconfigured(tmp_path, monkeypatch):
+    sandbox_home(tmp_path, monkeypatch)
+    data = cli._profile_status_data("ghost")
+    assert data == {"profile": "ghost", "configured": False}
+
+
+def test_status_json_emits_valid_json_to_stdout(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+    main(["status", "--json"])
+    out = capsys.readouterr().out
+    payload = json.loads(out)  # stdout is pure JSON (no human lines)
+    assert [p["profile"] for p in payload["profiles"]] == ["work"]
+    assert payload["profiles"][0]["configured"] is True
+
+
+def test_status_json_single_profile(tmp_path, monkeypatch, capsys):
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    for prof in ("default", "work"):
+        Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path(prof))
+    main(["status", "--json", "--profile", "work"])
+    payload = json.loads(capsys.readouterr().out)
+    assert [p["profile"] for p in payload["profiles"]] == ["work"]
+
+
+def test_status_text_output_unchanged_by_refactor(tmp_path, monkeypatch, capsys):
+    # The data/presentation split must not move the human lines the existing suite pins.
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("work"))
+    main(["status", "--profile", "work"])
+    out = capsys.readouterr().out
+    assert "Daemon:        stopped" in out
+    assert "Session:       not found" in out
+    assert "{" not in out  # text mode emits no JSON
+
+
+# --------------------------------------------------------- sync --json ---
+def test_sync_json_serializes_stats():
+    stats = SyncStats(uploaded=3, downloaded=1, conflicts=2, skipped_deletes=5)
+    payload = cli._sync_json(stats, dry_run=True)
+    assert payload["dry_run"] is True
+    assert payload["uploaded"] == 3
+    assert payload["downloaded"] == 1
+    assert payload["conflicts"] == 2
+    assert payload["skipped_deletes"] == 5
+    assert payload["exit_code"] == int(Exit.DELETES_SUPPRESSED)
+
+
+def test_sync_json_clean_pass_exit_code_zero():
+    assert cli._sync_json(SyncStats(), dry_run=False)["exit_code"] == int(Exit.OK)
+
+
+def test_sync_dry_run_json_end_to_end(tmp_path, monkeypatch, capsys):
+    # Drive `sync --dry-run --json` through main with a stub client + stub pass; stdout must
+    # be pure JSON carrying the outcome.
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+
+    class _StubClient:
+        @classmethod
+        def from_config(cls, _cfg):
+            return cls()
+
+        def connect(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(ic_module, "ICloudClient", _StubClient)
+
+    import ifolder_sync.syncer as sy
+
+    monkeypatch.setattr(sy.Syncer, "sync_once", lambda self, *a, **k: SyncStats(downloaded=2))
+
+    main(["sync", "--dry-run", "--json", "--profile", "work"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["downloaded"] == 2
+    assert payload["exit_code"] == int(Exit.OK)
+
+
+def _connect_spy(seen):
+    class _StubClient:
+        @classmethod
+        def from_config(cls, _cfg):
+            return cls()
+
+        def connect(self, *a, interactive=True, **k):
+            seen["interactive"] = interactive
+
+    return _StubClient
+
+
+def test_sync_json_forces_non_interactive_connect(tmp_path, monkeypatch, capsys):
+    # The pure-JSON contract: a 2FA/password prompt prints to stdout and would precede the
+    # JSON. --json must force connect non-interactive so an auth gap fails to stderr+exit 3
+    # instead of polluting stdout.
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+    seen: dict = {}
+    monkeypatch.setattr(ic_module, "ICloudClient", _connect_spy(seen))
+    import ifolder_sync.syncer as sy
+
+    monkeypatch.setattr(sy.Syncer, "sync_once", lambda self, *a, **k: SyncStats())
+    main(["sync", "--dry-run", "--json", "--profile", "work"])
+    assert seen["interactive"] is False
+    json.loads(capsys.readouterr().out)  # stdout stays pure JSON
+
+
+def test_sync_without_json_stays_interactive(tmp_path, monkeypatch):
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", remote_folder="Notes", local_folder=str(vault)).save(
+        config_path("work")
+    )
+    seen: dict = {}
+    monkeypatch.setattr(ic_module, "ICloudClient", _connect_spy(seen))
+    import ifolder_sync.syncer as sy
+
+    monkeypatch.setattr(sy.Syncer, "sync_once", lambda self, *a, **k: SyncStats())
+    main(["sync", "--dry-run", "--profile", "work"])
+    assert seen["interactive"] is True

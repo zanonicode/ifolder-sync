@@ -34,7 +34,7 @@ from datetime import datetime
 from http.cookiejar import LoadError, LWPCookieJar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from . import __version__
 from .config import (
@@ -60,16 +60,23 @@ from .trash import purge_trash, trash_count
 
 
 def _color(text: str, code: str) -> str:
-    """ANSI-wrap only on a TTY so piped/captured output stays plain."""
-    if not sys.stdout.isatty():
+    """ANSI-wrap only on a TTY so piped/captured output stays plain; never when NO_COLOR
+    is set (no-color.org: presence disables color regardless of value)."""
+    if "NO_COLOR" in os.environ or not sys.stdout.isatty():
         return text
     return f"\033[{code}m{text}\033[0m"
 
 
-def _daemon_state(profile: str) -> str:
+def _daemon_status(profile: str) -> dict[str, Any]:
+    """Raw daemon liveness for both the text and --json renderers."""
     pid = holder_pid(lock_path(profile))
-    if pid:
-        return _color("running", "32;1") + f" (pid {pid})"
+    return {"running": bool(pid), "pid": pid}
+
+
+def _daemon_state(profile: str) -> str:
+    s = _daemon_status(profile)
+    if s["running"]:
+        return _color("running", "32;1") + f" (pid {s['pid']})"
     return _color("stopped", "31")
 
 
@@ -89,25 +96,37 @@ def _trust_cookie_expiry(cookie_file: Path) -> Optional[float]:
     return max(expiries, default=None)
 
 
-def _auth_state(apple_id: str) -> str:
+def _auth_status(apple_id: str) -> dict[str, Any]:
+    """Raw session/auth state for both the text and --json renderers. `detail` is the
+    human suffix (kept so the text output is byte-identical); `trusted_until` is the cookie
+    expiry date (YYYY-MM-DD) or None."""
+
+    def s(state: str, color: str, detail: str, trusted_until: Optional[str] = None):
+        return {"state": state, "color": color, "detail": detail, "trusted_until": trusted_until}
+
     if not apple_id:
-        return _color("unknown", "33") + " (no apple_id in config)"
+        return s("unknown", "33", " (no apple_id in config)")
     session_file, cookie_file = session_paths(apple_id)
     try:
         data = json.loads(session_file.read_text())
     except FileNotFoundError:
-        return _color("not found", "31") + " — run `ifolder-sync auth`"
+        return s("not found", "31", " — run `ifolder-sync auth`")
     except (OSError, ValueError):
-        return _color("corrupted", "31") + " — run `ifolder-sync auth --fresh`"
+        return s("corrupted", "31", " — run `ifolder-sync auth --fresh`")
     if data.get("session_token") and not data.get("trust_token"):
-        return _color("poisoned", "33") + " — 2FA never trusted; run `ifolder-sync auth --fresh`"
+        return s("poisoned", "33", " — 2FA never trusted; run `ifolder-sync auth --fresh`")
     expires = _trust_cookie_expiry(cookie_file)
     if expires is None:
-        return _color("untrusted", "33") + " — daemon would need 2FA; run `ifolder-sync auth`"
+        return s("untrusted", "33", " — daemon would need 2FA; run `ifolder-sync auth`")
     when = datetime.fromtimestamp(expires).strftime("%Y-%m-%d")
     if expires > time.time():
-        return _color("valid", "32;1") + f" — trusted until {when}"
-    return _color("expired", "31") + f" on {when} — run `ifolder-sync auth`"
+        return s("valid", "32;1", f" — trusted until {when}", when)
+    return s("expired", "31", f" on {when} — run `ifolder-sync auth`", when)
+
+
+def _auth_state(apple_id: str) -> str:
+    st = _auth_status(apple_id)
+    return _color(st["state"], st["color"]) + st["detail"]
 
 
 def _warn_tcc(path: Path) -> None:
@@ -284,13 +303,20 @@ def cmd_sync(args):
             sys.exit(1)
     try:
         client = ICloudClient.from_config(cfg)
-        client.connect(interactive=not args.non_interactive)
+        # --json is a machine contract: a 2FA/password prompt can't be answered by a
+        # consumer and its text would land on stdout before the JSON, so force
+        # non-interactive when --json is set (an auth gap then fails fast to stderr + exit 3).
+        interactive = not args.non_interactive and not getattr(args, "json", False)
+        client.connect(interactive=interactive)
         with StateStore(baseline_path(profile)) as store:
             store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
             syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
             stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
-        prefix = "Dry-run (no changes written)" if args.dry_run else "Sync done"
-        print(f"{prefix}: {stats.summary()}")
+        if getattr(args, "json", False):
+            print(json.dumps(_sync_json(stats, args.dry_run), indent=2))
+        else:
+            prefix = "Dry-run (no changes written)" if args.dry_run else "Sync done"
+            print(f"{prefix}: {stats.summary()}")
     finally:
         if lock is not None:
             lock.release()
@@ -370,9 +396,60 @@ def _has_session(apple_id: str) -> bool:
     return session_paths(apple_id)[0].exists()
 
 
-def _print_profile_status(profile: str) -> None:
+def _baseline_meta(profile: str) -> tuple[str, dict[str, Any]]:
+    """(state, meta) where state is 'absent' | 'ok' | 'corrupt' and meta carries
+    last_sync/last_error/last_stats (empty unless 'ok'). Single source for both the text
+    and --json status views so they cannot drift."""
     from .state import CorruptBaselineError, StateStore
 
+    db = baseline_path(profile)
+    if not db.exists():
+        return "absent", {}
+    try:
+        with StateStore(db) as store:
+            return "ok", {
+                "last_sync": store.get_meta("last_sync"),
+                "last_error": store.get_meta("last_error"),
+                "last_stats": store.get_meta("last_stats"),
+            }
+    except CorruptBaselineError:
+        return "corrupt", {}
+
+
+def _profile_status_data(profile: str) -> dict[str, Any]:
+    """Presentation-free profile status for `status --json`. The text view below is the
+    human renderer; both read the same low-level helpers."""
+    path = config_path(profile)
+    if not path.exists():
+        return {"profile": profile, "configured": False}
+    cfg = Config.load(path)
+    auth = _auth_status(cfg.apple_id)
+    state, meta = _baseline_meta(profile)
+    last_sync = meta.get("last_sync")
+    return {
+        "profile": profile,
+        "configured": True,
+        "daemon": _daemon_status(profile),
+        "config": str(path),
+        "apple_id": cfg.apple_id,
+        "remote_folder": cfg.remote_folder,
+        "local_folder": str(cfg.local_path),
+        "interval_seconds": cfg.interval_seconds,
+        "watch_local": cfg.watch_local,
+        "conflict_policy": cfg.conflict_policy,
+        "obsidian": cfg.obsidian,
+        "remote_trash": cfg.remote_trash,
+        "state_dir": str(state_dir(profile)),
+        "session": {"state": auth["state"], "trusted_until": auth["trusted_until"]},
+        "local_trash_files": trash_count(trash_dir(profile)),
+        "baseline": state,
+        "last_sync": float(last_sync) if last_sync else None,
+        "last_stats": meta.get("last_stats"),
+        "last_error": meta.get("last_error"),
+    }
+
+
+def _print_profile_status(profile: str) -> None:
     path = config_path(profile)
     if not path.exists():
         print(f"Profile '{profile}': no config. Run `ifolder-sync init --profile {profile}`.")
@@ -394,28 +471,29 @@ def _print_profile_status(profile: str) -> None:
     print(f"Session:       {_auth_state(cfg.apple_id)}")
     print(f"Local trash:   {trash_count(trash_dir(profile))} file(s)")
 
-    db = baseline_path(profile)
-    if db.exists():
-        try:
-            with StateStore(db) as store:
-                last_sync = store.get_meta("last_sync")
-                last_error = store.get_meta("last_error")
-                last_stats = store.get_meta("last_stats")
-        except CorruptBaselineError:
-            print(
-                f"Baseline:      {_color('corrupt', '31')} — run "
-                f"`ifolder-sync rebaseline --profile {profile}`"
-            )
-            return
-        if last_sync:
-            ts = datetime.fromtimestamp(float(last_sync)).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"Last sync:     {ts} ({last_stats or ''})")
-        if last_error:
-            print(f"Last error:    {last_error}")
+    state, meta = _baseline_meta(profile)
+    if state == "corrupt":
+        print(
+            f"Baseline:      {_color('corrupt', '31')} — run "
+            f"`ifolder-sync rebaseline --profile {profile}`"
+        )
+        return
+    if state == "ok":
+        if meta["last_sync"]:
+            ts = datetime.fromtimestamp(float(meta["last_sync"])).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"Last sync:     {ts} ({meta['last_stats'] or ''})")
+        if meta["last_error"]:
+            print(f"Last error:    {meta['last_error']}")
 
 
 def cmd_status(args):
     profiles = list_profiles()
+    if getattr(args, "json", False):
+        # JSON to stdout as a stable contract; human messaging (none here) would go to
+        # stderr. --profile selects one; otherwise every profile.
+        selected = [args.profile] if args.profile is not None else profiles
+        print(json.dumps({"profiles": [_profile_status_data(p) for p in selected]}, indent=2))
+        return
     if profiles:
         print(f"Profiles:      {', '.join(profiles)}\n")
     # --profile omitted (None) -> show every profile; given -> that one in detail.
@@ -693,6 +771,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="apply deletions even if they exceed the safety threshold",
     )
+    ps.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the pass outcome as JSON to stdout (pair with --dry-run for a preview)",
+    )
     _add_profile(ps)
     ps.set_defaults(func=cmd_sync)
 
@@ -719,6 +802,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_profile_name,
         help="show one profile in detail; omit to show all profiles",
     )
+    pstat.add_argument("--json", action="store_true", help="emit machine-readable JSON to stdout")
     pstat.set_defaults(func=cmd_status)
 
     ppt = sub.add_parser("purge-trash", help="empty a profile's local soft-delete trash")
@@ -763,6 +847,24 @@ def _outcome_exit_code(stats) -> Exit:
     if stats.skipped_deletes:
         return Exit.DELETES_SUPPRESSED
     return Exit.OK
+
+
+def _sync_json(stats, dry_run: bool) -> dict[str, Any]:
+    """Serialize a pass outcome for `sync --json`. The per-action plan is not exposed yet
+    (no Plan object — P3-2 deferred), so these aggregate counts are the structured view;
+    in dry-run they are the would-be plan tallies."""
+    return {
+        "dry_run": dry_run,
+        "uploaded": stats.uploaded,
+        "downloaded": stats.downloaded,
+        "deleted_local": stats.deleted_local,
+        "deleted_remote": stats.deleted_remote,
+        "conflicts": stats.conflicts,
+        "skipped_deletes": stats.skipped_deletes,
+        "deferred_deletes": stats.deferred_deletes,
+        "errors": stats.errors,
+        "exit_code": int(_outcome_exit_code(stats)),
+    }
 
 
 def _exception_exit_code(exc: BaseException) -> Optional[Exit]:
