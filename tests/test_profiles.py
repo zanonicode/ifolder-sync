@@ -426,14 +426,10 @@ def test_dry_run_sync_allowed_while_lock_held(tmp_path, monkeypatch):
 
         monkeypatch.setattr(ic, "ICloudClient", _StubClient)
 
-        class _StubStats:
-            def summary(self):
-                return "up=0 down=0"
-
         import ifolder_sync.syncer as sy
 
         def _stub_sync_once(self, *a, **k):
-            return _StubStats()
+            return sy.SyncStats()
 
         monkeypatch.setattr(sy.Syncer, "sync_once", _stub_sync_once)
 

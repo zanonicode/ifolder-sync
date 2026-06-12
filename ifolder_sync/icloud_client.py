@@ -54,6 +54,13 @@ except ImportError:  # pragma: no cover - upstream renamed/removed the symbol
 log = logging.getLogger("ifolder-sync.icloud")
 
 
+class AuthError(RuntimeError):
+    """Authentication cannot proceed without operator action: a rejected/absent password
+    or a cancelled/failed 2FA. Subclasses RuntimeError so the daemon's existing
+    `except RuntimeError` auth handler keeps working unchanged, while the CLI can map it to
+    a dedicated exit code (AUTH_REQUIRED) instead of the generic error code."""
+
+
 def is_session_relapse(exc: BaseException) -> bool:
     """True for a RECOVERABLE expired-session signal — the iCloud login token lapsed
     mid-run (HTTP 421 ``AppleAuthError.LOGIN_TOKEN_EXPIRED``, which pyicloud surfaces as a
@@ -260,7 +267,7 @@ class ICloudClient:
         try:
             self.api = PyiCloudService(self.apple_id, password, cookie_directory=str(cookie_dir))
         except PyiCloudFailedLoginException as exc:
-            raise RuntimeError("Apple ID or password rejected by Apple.") from exc
+            raise AuthError("Apple ID or password rejected by Apple.") from exc
         finally:
             os.umask(old_umask)
 
@@ -271,7 +278,12 @@ class ICloudClient:
             except Exception as exc:  # noqa: BLE001
                 print(f"(Warning: could not store the password in the Keychain: {exc})")
 
-        twofa.handle_2fa(self.api, interactive=interactive)
+        try:
+            twofa.handle_2fa(self.api, interactive=interactive)
+        except RuntimeError as exc:
+            # twofa raises RuntimeError on a cancelled/failed 2FA challenge — all
+            # operator-actionable. Re-tag as AuthError so the CLI exits AUTH_REQUIRED.
+            raise AuthError(str(exc)) from exc
         self._secure_session_files()
         self._install_request_timeout()
         self._install_atomic_session_save()
@@ -368,7 +380,7 @@ class ICloudClient:
             pass  # keyring unavailable -> fall back to prompt
         if interactive:
             return getpass.getpass(f"iCloud password for {self.apple_id}: "), "prompt"
-        raise RuntimeError(
+        raise AuthError(
             "No password available (neither IFOLDER_SYNC_PASSWORD nor Keychain). "
             "Run `ifolder-sync auth` in a terminal first."
         )

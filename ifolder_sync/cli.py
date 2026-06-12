@@ -54,6 +54,7 @@ from .config import (
     trash_dir,
     write_vault_marker,
 )
+from .exitcodes import Exit
 from .locking import holder_pid
 from .trash import purge_trash, trash_count
 
@@ -293,6 +294,13 @@ def cmd_sync(args):
     finally:
         if lock is not None:
             lock.release()
+    # A pass can "succeed" yet leave work unfinished: the safety threshold suppressed
+    # deletions, or some file operations failed. Surface that as a distinct exit code so
+    # cron/monitoring can react instead of trusting a blanket 0. (Reached only on success;
+    # an exception above propagates straight to main's taxonomy.)
+    code = _outcome_exit_code(stats)
+    if code:
+        sys.exit(code)
 
 
 def cmd_start(args):
@@ -306,16 +314,25 @@ def cmd_start(args):
         return
     # The foreground daemon (also the process launchd runs) owns a rotating file log.
     _setup_logging(getattr(args, "verbose", False), log_path=log_file(profile))
+    # invariant 9: under launchd (KeepAlive SuccessfulExit=false) a non-zero exit on an
+    # operator-actionable stop becomes a restart loop. The agent passes --launchd; agents
+    # written before the flag are caught by the TTY fallback (launchd redirects stderr to a
+    # file, so it is never a TTY). An interactive terminal gets a real code so a human or a
+    # monitor sees the failure.
+    launchd_mode = _start_is_launchd(args)
     try:
         Daemon(cfg, profile).run()
     except AlreadyRunning as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        if not launchd_mode:
+            sys.exit(Exit.ERROR)
     except CorruptBaselineError as exc:
-        # invariant 9: a corrupt baseline is operator-actionable (rebaseline), not
-        # transient. Clean exit (0) so launchd KeepAlive=SuccessfulExit:false does not
-        # crash-loop; the message tells the operator what to run.
+        # A corrupt baseline is operator-actionable (rebaseline), not transient. Under
+        # launchd, exit clean (0) so KeepAlive=SuccessfulExit:false does not crash-loop;
+        # interactively, surface a code. Either way the message says what to run.
         print(f"Error: {exc}", file=sys.stderr)
+        if not launchd_mode:
+            sys.exit(Exit.ERROR)
 
 
 def _start_background(profile: str) -> None:
@@ -542,7 +559,8 @@ def _write_agent_plist(profile: str) -> Path:
 
     payload = {
         "Label": label,
-        "ProgramArguments": [*program, "start", "--profile", profile],
+        # --launchd: keep deliberate stops at exit 0 so KeepAlive cannot crash-loop them.
+        "ProgramArguments": [*program, "start", "--profile", profile, "--launchd"],
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": 60,
@@ -613,8 +631,27 @@ def _add_profile(p: argparse.ArgumentParser):
     )
 
 
+_EXIT_CODE_HELP = """\
+exit codes:
+  0   success
+  1   error (unexpected/uncategorized)
+  2   usage error (bad arguments)
+  3   authentication required (run `ifolder-sync auth`)
+  4   scan guard aborted the pass (zero deletions; check permissions/network)
+  5   vault identity mismatch (run `ifolder-sync rebaseline`)
+  6   sync ran but deletions were suppressed by the safety threshold
+  7   sync ran but some file operations failed
+  130 interrupted (Ctrl-C)
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="ifolder-sync", description=__doc__)
+    p = argparse.ArgumentParser(
+        prog="ifolder-sync",
+        description=__doc__,
+        epilog=_EXIT_CODE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--version", action="version", version=f"ifolder-sync {__version__}")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = p.add_subparsers(dest="command", required=True)
@@ -665,6 +702,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="detach via launchd: restarts on crash, starts at each login",
     )
+    # Set by the generated launchd plist. Keeps operator-actionable stops at exit 0 so
+    # KeepAlive cannot turn them into a restart loop (invariant 9). Hidden: not for humans.
+    pst.add_argument("--launchd", action="store_true", help=argparse.SUPPRESS)
     _add_profile(pst)
     pst.set_defaults(func=cmd_start)
 
@@ -708,18 +748,84 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _start_is_launchd(args) -> bool:
+    """True when `start` is being run by launchd, where invariant 9 requires exit 0 on a
+    deliberate stop. The plist passes --launchd; agents written before the flag are still
+    caught because launchd redirects stderr to a file (never a TTY)."""
+    return getattr(args, "launchd", False) or not sys.stderr.isatty()
+
+
+def _outcome_exit_code(stats) -> Exit:
+    """Map a completed pass to an exit code: errors outrank a threshold suppression, both
+    outrank a clean pass. Pure so the contract is unit-testable without a real sync."""
+    if stats.errors:
+        return Exit.SYNC_ERRORS
+    if stats.skipped_deletes:
+        return Exit.DELETES_SUPPRESSED
+    return Exit.OK
+
+
+def _exception_exit_code(exc: BaseException) -> Optional[Exit]:
+    """Map an exception to an exit code, most-specific first (LocalScanError/
+    VaultIdentityError subclass RuntimeError; the auth exceptions subclass PyiCloudException).
+    Returns None for an unrecognized type so main() re-raises it with a full traceback —
+    only known, explained failures get the clean one-line treatment."""
+    from pyicloud.exceptions import (
+        PyiCloud2FARequiredException,
+        PyiCloudAuthRequiredException,
+        PyiCloudException,
+        PyiCloudFailedLoginException,
+        PyiCloudServiceNotActivatedException,
+    )
+
+    from .icloud_client import AuthError
+    from .state import CorruptBaselineError
+    from .syncer import LocalScanError, VaultIdentityError
+
+    if isinstance(
+        exc,
+        (
+            AuthError,
+            PyiCloud2FARequiredException,
+            PyiCloudFailedLoginException,
+            PyiCloudAuthRequiredException,
+            PyiCloudServiceNotActivatedException,
+        ),
+    ):
+        # AuthError (a RuntimeError) is checked here, before the generic RuntimeError
+        # branch below, so a rejected/absent password and a cancelled 2FA all exit 3.
+        return Exit.AUTH_REQUIRED
+    if isinstance(exc, VaultIdentityError):
+        return Exit.VAULT_IDENTITY
+    if isinstance(exc, LocalScanError):
+        return Exit.SCAN_GUARD
+    if isinstance(exc, (PyiCloudException, CorruptBaselineError)):
+        # P4-4: a 503/429/service error must not dump a multi-screen traceback.
+        return Exit.ERROR
+    if isinstance(exc, (ValueError, RuntimeError, OSError)):
+        return Exit.ERROR
+    return None
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    _setup_logging(getattr(args, "verbose", False))
+    verbose = getattr(args, "verbose", False)
+    _setup_logging(verbose)
     migrate_legacy()
     try:
         args.func(args)
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        sys.exit(130)
-    except (ValueError, RuntimeError, OSError) as exc:
+        sys.exit(Exit.INTERRUPTED)
+    except Exception as exc:  # noqa: BLE001
+        code = _exception_exit_code(exc)
+        if code is None or verbose:
+            # Unknown failure, or the operator asked for the traceback with -v.
+            raise
         print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        if code == Exit.AUTH_REQUIRED:
+            print("Run `ifolder-sync auth` to (re)authenticate.", file=sys.stderr)
+        sys.exit(code)
 
 
 if __name__ == "__main__":
