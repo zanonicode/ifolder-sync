@@ -1,0 +1,22 @@
+# Dependabot keeps GitHub Actions and Python deps current (Phase 0 deterministic
+# baseline, DESIGN_03 Decision 9). github-actions itself is owned by Dependabot;
+# app deps may later move to Renovate, but pip stays here for now.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

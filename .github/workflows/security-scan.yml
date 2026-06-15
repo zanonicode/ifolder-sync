@@ -1,0 +1,48 @@
+name: security-scan
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # weekly: Trivy fs + gitleaks secret scan
+  workflow_dispatch:
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  trivy:
+    name: trivy filesystem scan (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to the Security tab
+    steps:
+      - uses: actions/checkout@v6
+      - name: trivy fs -> SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (SHA-pinned; GHSA-69fq-xp46-6x23)
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0" # advisory: never fail the build
+      - name: upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+  gitleaks:
+    name: gitleaks secret scan (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # gitleaks needs full history
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # No GITLEAKS_LICENSE: personal account; the license env is org-only and would break the run.
