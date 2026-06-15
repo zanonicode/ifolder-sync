@@ -10,6 +10,8 @@ from typing import Callable, TypeVar
 import requests
 from pyicloud.exceptions import PyiCloudAPIResponseException
 
+from .errors import UnreadableRemoteError
+
 log = logging.getLogger("ifolder-sync.retry")
 
 T = TypeVar("T")
@@ -22,6 +24,11 @@ _NON_TRANSIENT_ERRNO = {errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EROFS, er
 
 
 def _is_transient(exc: Exception) -> bool:
+    # Publish-before-content lag lasts far longer than the in-call 1/2/4s backoff; surface
+    # it immediately so the engine owns the long, quiet per-pass deferral instead of burning
+    # ~6s and logging "transient error; retry" on every pass.
+    if isinstance(exc, UnreadableRemoteError):
+        return False
     if isinstance(exc, PyiCloudAPIResponseException):
         try:
             return int(exc.code) in _TRANSIENT_STATUS  # type: ignore[arg-type]

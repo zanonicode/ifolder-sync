@@ -40,6 +40,7 @@ from .config import (
     write_vault_marker,
 )
 from .config import trash_dir as default_trash_dir
+from .errors import UnreadableRemoteError
 from .icloud_client import PART_SUFFIX, RemoteEntry
 from .state import BaselineEntry, StateStore
 from .trash import trash_local
@@ -205,6 +206,9 @@ class SyncStats:
     conflicts: int = 0
     skipped_deletes: int = 0
     deferred_deletes: int = 0
+    # Paths whose remote body is not yet materialized (publish-before-content lag): deferred
+    # to a later pass, NOT errors. Distinct from deferred_deletes (a destructive op held back).
+    pending: int = 0
     errors: int = 0
 
     def summary(self) -> str:
@@ -212,7 +216,7 @@ class SyncStats:
             f"up={self.uploaded} down={self.downloaded} "
             f"del_local={self.deleted_local} del_remote={self.deleted_remote} "
             f"conflicts={self.conflicts} skipped_deletes={self.skipped_deletes} "
-            f"deferred={self.deferred_deletes} errors={self.errors}"
+            f"deferred={self.deferred_deletes} pending={self.pending} errors={self.errors}"
         )
 
 
@@ -820,6 +824,86 @@ class Syncer:
         except ValueError:
             return {}
 
+    # ----------------------------------------- unreadable-remote (lag) escalation ---
+    # A remote whose record lists size N>0 but whose body fetches as 0 bytes (publish-
+    # before-content lag) is DEFERRED each pass, never errored. The count is persisted in
+    # its OWN meta key (NOT settle_counts: _escalate_settle rebuilds settle_counts at
+    # decide-time from the current SETTLE_WAIT set and would erase a key it does not see).
+    # Each entry is [size, mtime, etag, count, warned]; the count RESETS whenever the remote
+    # signature changes, so an actively-edited file that briefly hits a fresh 0-byte window
+    # every pass is never mistaken for genuine corruption.
+    def _load_unreadable_counts(self) -> dict[str, list]:
+        try:
+            data = json.loads(self.store.get_meta("unreadable_counts") or "{}")
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def _unreadable_sig_matches(entry: list, rentry: Optional[RemoteEntry]) -> bool:
+        if rentry is None or len(entry) < 3:
+            return False
+        return (
+            entry[0] == rentry.size
+            and abs(entry[1] - rentry.mtime) <= MTIME_TOL
+            and entry[2] == rentry.etag
+        )
+
+    def _unreadable_escalated(self, relpath: str, rentry: Optional[RemoteEntry]) -> bool:
+        """True if this path has been unreadable for the SAME remote signature at least
+        unreadable_max_passes times — i.e. the lag window has elapsed and it is judged
+        genuine corruption. Read-only: the conflict path consults this to decide whether to
+        let the good local side win, while a still-changing signature keeps deferring."""
+        entry = self._load_unreadable_counts().get(relpath)
+        if not entry or not self._unreadable_sig_matches(entry, rentry):
+            return False
+        threshold = max(1, int(self.cfg.unreadable_max_passes))
+        return int(entry[3]) >= threshold
+
+    def _defer_unreadable(
+        self,
+        relpath: str,
+        rentry: Optional[RemoteEntry],
+        stats: SyncStats,
+        exc: UnreadableRemoteError,
+        dry_run: bool,
+    ) -> None:
+        """Convert an UnreadableRemoteError into a clean per-path defer: count it as pending
+        (NOT an error), leave the baseline untouched (so it retries next pass), and stay
+        quiet (DEBUG) during the lag window — emitting exactly ONE warning once the sustained
+        window crosses unreadable_max_passes against an unchanged remote signature."""
+        stats.pending += 1
+        threshold = max(1, int(self.cfg.unreadable_max_passes))
+        counts = self._load_unreadable_counts()
+        prev = counts.get(relpath)
+        if prev and self._unreadable_sig_matches(prev, rentry):
+            count = int(prev[3]) + 1
+            warned = bool(prev[4]) if len(prev) > 4 else False
+        else:
+            count, warned = 1, False  # new path or the remote signature changed: reset
+        if count >= threshold and not warned:
+            log.warning(
+                "remote blob for %s unreadable for %d passes; likely genuine corruption — "
+                "rewrite it at the source to heal",
+                relpath,
+                count,
+            )
+            warned = True
+        else:
+            log.debug("deferring %s: remote body not yet materialized (%s)", relpath, exc)
+        if rentry is not None and not dry_run:
+            counts[relpath] = [rentry.size, rentry.mtime, rentry.etag, count, warned]
+            self.store.set_meta("unreadable_counts", json.dumps(counts))
+
+    def _clear_unreadable(self, relpath: str, dry_run: bool) -> None:
+        """Drop a path's unreadable backoff once its body is readable again (a successful
+        download/conflict resolution), so a later lag starts a fresh window."""
+        if dry_run:
+            return
+        counts = self._load_unreadable_counts()
+        if counts.pop(relpath, None) is not None:
+            self.store.set_meta("unreadable_counts", json.dumps(counts))
+
     # ------------------------------------------------------------ decisions ---
     def _decide_file(
         self,
@@ -992,6 +1076,12 @@ class Syncer:
                     self.store.delete(relpath)
             else:
                 raise ValueError(f"unhandled file op {op!r}")
+        except UnreadableRemoteError as exc:
+            # The remote body has not materialized (publish-before-content lag). Any reader
+            # under apply (download, conflict-backup, verify-adopt) lands here; convert it to
+            # a clean per-path DEFER — baseline row untouched so the op re-derives next pass,
+            # never an error, never a conflict clobber.
+            self._defer_unreadable(relpath, rentry, stats, exc, dry_run)
         except Exception as exc:  # noqa: BLE001
             log.error("error reconciling %s: %s", relpath, exc)
             stats.errors += 1
@@ -1107,6 +1197,11 @@ class Syncer:
             try:
                 self.client.download(relpath, tmp)
                 identical = src.exists() and filecmp.cmp(src, tmp, shallow=False)
+            except UnreadableRemoteError:
+                # The remote body has not materialized: defer the whole adopt (re-raise to
+                # _apply_file's typed handler) instead of escalating to a conflict against a
+                # side we cannot read — which would risk the same clobber. Retries next pass.
+                raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("adopt verify failed for %s; resolving as conflict: %s", relpath, exc)
                 self._resolve_conflict(relpath, lentry, rentry, stats, dry_run)
@@ -1126,11 +1221,43 @@ class Syncer:
         stats: SyncStats,
         dry_run: bool,
     ) -> None:
-        stats.conflicts += 1
         policy = self.cfg.conflict_policy
-        log.warning("CONFLICT on %s (policy=%s)", relpath, policy)
         if dry_run:
+            # Counted/logged only on a real (non-dry-run) resolution, so the dry-run preview
+            # still surfaces the conflict; an unreadable remote cannot be probed without I/O.
+            stats.conflicts += 1
+            log.warning("CONFLICT on %s (policy=%s)", relpath, policy)
             return
+        # Probe the remote's readability BEFORE counting the conflict, logging it, moving the
+        # local file aside, uploading, or move-to-trashing — for EVERY policy, including
+        # policy=local and the empty-side valve (which otherwise never read the remote and
+        # could clobber an in-flight edit). An unreadable remote raises UnreadableRemoteError;
+        # unless the sustained window has elapsed, that propagates to _apply_file -> defer
+        # (no conflict count, no clobber). The probe's bytes are reused so the resolution
+        # reads the remote only once.
+        remote_unreadable = self._probe_remote_unreadable(relpath, rentry)
+        if remote_unreadable is not None:
+            if not self._unreadable_escalated(relpath, rentry):
+                raise remote_unreadable
+            # Sustained corruption AND local also changed (a conflict always means both
+            # sides changed): converge by letting the good local side win via the empty-
+            # side-never-wins valve — the never-materializing remote goes to recoverable
+            # trash on upload — so the two devices no longer diverge forever.
+            stats.conflicts += 1
+            log.warning(
+                "%s: remote blob unreadable for the escalation window; treating it as an "
+                "empty husk and keeping local content (an empty side never wins)",
+                relpath,
+            )
+            self._do_upload(relpath, stats, False)
+            self._clear_unreadable(relpath, dry_run)
+            return
+        # Remote is readable from here on. The probe above discarded its bytes; the policy
+        # resolution below re-reads it via its own backup/download. A genuinely 0-byte remote
+        # (size 0) is treated as readable and handled by the empty-side-never-wins valve.
+        self._clear_unreadable(relpath, dry_run)
+        stats.conflicts += 1
+        log.warning("CONFLICT on %s (policy=%s)", relpath, policy)
         # Engine-wide safety invariant: a 0-byte side NEVER overwrites a non-empty side,
         # regardless of policy or mtime. An empty file is almost always a publish-before-
         # content husk or an accidental/observed truncation, and its mtime is set by the
@@ -1166,6 +1293,24 @@ class Syncer:
             self._do_upload(relpath, stats, False)
             log.warning("conflict preserved as %s", conflict_rel)
 
+    def _probe_remote_unreadable(
+        self, relpath: str, rentry: RemoteEntry
+    ) -> Optional[UnreadableRemoteError]:
+        """Return the UnreadableRemoteError if the remote body has not materialized, else
+        None (readable). A genuinely 0-byte remote (size 0) is readable: nothing to probe,
+        the empty-side valve handles it. The probe discards the bytes; the resolution
+        re-reads via its own backup/download — a small extra fetch, but it keeps the conflict
+        resolution paths unchanged and lets the readability check cover EVERY policy."""
+        if rentry.size == 0:
+            return None
+        with tempfile.TemporaryDirectory(prefix="ifolder-sync-probe-") as td:
+            tmp = Path(td) / "remote"
+            try:
+                self.client.download(relpath, tmp)
+            except UnreadableRemoteError as exc:
+                return exc
+        return None
+
     def _conflict_name(self, relpath: str) -> str:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         p = Path(relpath)
@@ -1186,35 +1331,30 @@ class Syncer:
         bkp.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.client.download(relpath, bkp)
+        except UnreadableRemoteError:
+            # Should not happen (the caller probed readability first), but if the blob
+            # un-materializes between the probe and here, re-raise so _apply_file defers
+            # rather than running action() (which removes the remote loser) without a backup.
+            try:
+                bkp.unlink()
+            except OSError:
+                pass
+            raise
         except Exception as exc:  # noqa: BLE001
             try:
                 bkp.unlink()  # remove the partial/empty backup
             except OSError:
                 pass
-            fails = self._note_download_failure(relpath, rentry)
-            if fails < DOWNLOAD_MAX_FAILS:
-                # Transient: never run action() (which removes the remote loser) without a
-                # saved backup — a network blip would otherwise drop the only copy of the
-                # losing version. Abort; the conflict re-derives next pass.
-                log.error(
-                    "could not save remote backup of %s; aborting conflict resolution this "
-                    "pass (will retry): %s",
-                    relpath,
-                    exc,
-                )
-                return
-            # Persistent: a remote blob that cannot be downloaded after several tries (a
-            # broken iCloud blob) has NO recoverable content to protect, and blocking
-            # forever loops the conflict every pass. Resolve WITHOUT the backup — the prior
-            # remote goes to iCloud Recently Deleted via the upload's move-to-trash when
-            # remote_trash is on.
-            log.warning(
-                "remote backup of %s failed %d times (broken/undownloadable remote blob); "
-                "resolving the conflict WITHOUT a backup so the good local copy can win",
+            # Never run action() (which removes the remote loser) without a saved backup — a
+            # failure here would otherwise drop the only copy of the losing version. Abort;
+            # the conflict re-derives next pass and retries the backup.
+            self._note_download_failure(relpath, rentry)
+            log.error(
+                "could not save remote backup of %s; aborting conflict resolution this "
+                "pass (will retry): %s",
                 relpath,
-                fails,
+                exc,
             )
-            action()
             return
         self._download_fail.pop(relpath, None)  # success clears the backoff
         action()
@@ -1319,14 +1459,19 @@ class Syncer:
             # blob). Skip without re-attempting; auto-retries when the remote changes.
             log.debug("skipping %s: download backed off", relpath)
             return
-        stats.downloaded += 1
-        log.info("DOWN %s", relpath)
         if dry_run:
+            stats.downloaded += 1
+            log.info("DOWN %s", relpath)
             return
         dest = self.local_root / relpath
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.client.download(relpath, dest)
+        except UnreadableRemoteError:
+            # Publish-before-content lag: re-raise so _apply_file's typed handler DEFERS
+            # (counts pending, not downloaded, not error). Never bumps the partial-read
+            # backoff — its escalation is the separate, signature-reset unreadable window.
+            raise
         except Exception:
             if self._note_download_failure(relpath, rentry) == DOWNLOAD_MAX_FAILS:
                 log.warning(
@@ -1337,7 +1482,10 @@ class Syncer:
                     DOWNLOAD_MAX_FAILS,
                 )
             raise
+        stats.downloaded += 1
+        log.info("DOWN %s", relpath)
         self._download_fail.pop(relpath, None)  # success clears the backoff
+        self._clear_unreadable(relpath, dry_run)  # readable again: reset the lag window
         # Stamp the local file's mtime to the remote's, so Obsidian's recent-files and
         # Dataview `file.mtime` show the real edit time vault-wide instead of the download
         # instant (which would change on every device on every sync). This also mirrors the

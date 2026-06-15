@@ -253,6 +253,14 @@ class Config:
     # content upload from another device, so the engine waits (settle_wait). If it stays
     # empty this many passes it is judged genuinely empty and escalated to a conflict.
     settle_max_passes: int = 3
+    # A remote whose record lists size N>0 but whose body fetches as 0 bytes (publish-
+    # before-content lag, e.g. an iPhone-rewritten plugin data.json) is DEFERRED silently
+    # each pass — never errored, never clobbered. After this many sustained passes against
+    # the SAME remote signature it is judged genuine corruption (one warning, then the good
+    # side is allowed to win). Distinct from settle_max_passes (which governs 0-byte husks):
+    # this window is intentionally long so a slow-propagating real edit is never mistaken
+    # for corruption.
+    unreadable_max_passes: int = 20
     # Treat a same-size/same-mtime remote file whose iCloud etag differs from the
     # baseline as a remote change (download it). Safe: the loser is the local copy only
     # when local is otherwise unchanged, and the new etag is recorded so it cannot loop.
@@ -314,6 +322,7 @@ class Config:
             "request_timeout_seconds",
             "baseline_backups",
             "settle_max_passes",
+            "unreadable_max_passes",
             "max_file_size_mb",
         ):
             value = getattr(self, name)

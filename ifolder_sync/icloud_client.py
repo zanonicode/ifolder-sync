@@ -39,6 +39,7 @@ from pyicloud.utils import (
 
 from . import twofa
 from .config import Config, session_paths, sessions_dir
+from .errors import UnreadableRemoteError
 from .retry import with_retry
 
 try:
@@ -649,7 +650,17 @@ class ICloudClient:
             # a mismatch is retried (transient), and on final failure the .part is removed
             # so the old local file is kept (no half-file ever lands in the vault).
             got = os.path.getsize(tmp)
+            if expected and got == 0:
+                # Publish-before-content lag: Apple listed size N>0 but the blob is still
+                # in flight, so the body fetch returned nothing. A typed error so the engine
+                # DEFERS (no error, no conflict clobber) instead of treating it as corruption.
+                raise UnreadableRemoteError(
+                    f"remote blob for {relpath} not materialized: got 0 bytes, expected {expected}"
+                )
             if expected and got != expected:
+                # A genuine truncated/dropped stream (0<got<N): a real transient network
+                # fault. Keep today's short retry; on final failure the .part is discarded
+                # so the existing local file is kept (no half-file lands in the vault).
                 raise OSError(
                     f"download size mismatch for {relpath}: got {got} bytes, expected {expected}"
                 )

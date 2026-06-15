@@ -21,6 +21,12 @@ OBSIDIAN_VOLATILE: tuple[str, ...] = (
     ".obsidian/hotkeys.json",  # keybindings
     ".obsidian/cache",  # link/metadata cache (whole subtree)
     ".obsidian/graph.json",  # graph view state
+    # Per-plugin settings/state. Like community-plugins.json above (the enabled-plugin list,
+    # already volatile), a plugin's data.json is per-device: plugins rewrite it on nearly every
+    # app launch -- especially on mobile -- so syncing it produces constant conflicts and it is
+    # the main victim of iCloud's publish-before-content lag. manifest.json and the plugin code
+    # (main.js/styles.css) still sync, so a plugin a device enables still has working files.
+    ".obsidian/plugins/*/data.json",  # per-plugin settings (per-device, churn/lag-prone)
 )
 
 # Shared assets under .obsidian/ (plugins/, themes/, snippets/, icons/, plugin code)

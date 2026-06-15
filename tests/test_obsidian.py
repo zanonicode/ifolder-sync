@@ -28,6 +28,9 @@ def test_ignore_matcher():
         (".DS_Store", "a/b/.DS_Store"),
         ("*.icloud", "a/b/file.icloud"),
         ("*.conflict-*", "c.conflict-20260101-000000.txt"),
+        # Per-plugin data.json is volatile (per-device settings), at root or nested depth
+        (".obsidian/plugins/*/data.json", ".obsidian/plugins/excalidraw/data.json"),
+        (".obsidian/plugins/*/data.json", "vault/.obsidian/plugins/kanban/data.json"),
     ]
     for pat, rel in must_ignore:
         assert _ign(pat, rel), f"should IGNORE {rel!r} via {pat!r}"
@@ -37,6 +40,10 @@ def test_ignore_matcher():
         (".obsidian/workspace.json", ".obsidian/app.json"),  # other config
         (".obsidian/community-plugins.json", ".obsidian/plugins/calendar/data.json"),
         ("*.icloud", "notes/icloud.md"),  # not a .icloud
+        # data.json glob must NOT swallow plugin code/manifest or the vault property schema
+        (".obsidian/plugins/*/data.json", ".obsidian/plugins/excalidraw/manifest.json"),
+        (".obsidian/plugins/*/data.json", ".obsidian/plugins/excalidraw/main.js"),
+        (".obsidian/plugins/*/data.json", ".obsidian/types.json"),
     ]
     for pat, rel in must_keep:
         assert not _ign(pat, rel), f"should NOT ignore {rel!r} via {pat!r}"
@@ -76,4 +83,32 @@ def test_obsidian_off_syncs_config(make_syncer, fake, local_dir):
     syncer.sync_once()
 
     assert (local_dir / ".obsidian/appearance.json").read_bytes() == b'{"cssTheme":"X"}'
+    store.close()
+
+
+def test_plugin_data_json_not_synced_but_manifest_and_types_are(make_syncer, fake, local_dir):
+    """Per-plugin data.json is per-device (volatile); manifest.json and the vault-level
+    types.json still sync, so an enabled plugin keeps working files and property types stay
+    consistent across devices."""
+    syncer, store = make_syncer(obsidian=True)
+    fake.put(".obsidian/plugins/foo/data.json", b'{"setting":1}', mtime=2000)
+    fake.put(".obsidian/plugins/foo/manifest.json", b'{"id":"foo"}', mtime=2000)
+    fake.put(".obsidian/types.json", b'{"prop":"text"}', mtime=2000)
+
+    syncer.sync_once()
+
+    assert not (local_dir / ".obsidian/plugins/foo/data.json").exists()
+    assert (local_dir / ".obsidian/plugins/foo/manifest.json").read_bytes() == b'{"id":"foo"}'
+    assert (local_dir / ".obsidian/types.json").read_bytes() == b'{"prop":"text"}'
+    store.close()
+
+
+def test_plugin_data_json_syncs_when_obsidian_off(make_syncer, fake, local_dir):
+    """With obsidian=False (default), plugin data.json is not special -- it syncs."""
+    syncer, store = make_syncer(obsidian=False)
+    fake.put(".obsidian/plugins/foo/data.json", b'{"setting":1}', mtime=2000)
+
+    syncer.sync_once()
+
+    assert (local_dir / ".obsidian/plugins/foo/data.json").read_bytes() == b'{"setting":1}'
     store.close()

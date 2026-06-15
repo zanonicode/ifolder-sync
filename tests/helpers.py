@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
+from ifolder_sync.errors import UnreadableRemoteError
 from ifolder_sync.icloud_client import RemoteEntry
 
 if TYPE_CHECKING:
@@ -32,6 +33,10 @@ class FakeICloud:
     def __init__(self) -> None:
         self.files: dict[str, dict] = {}
         self.fail_walk = False
+        # Paths whose record reports size N>0 in walk()/stat() but whose download() raises
+        # UnreadableRemoteError — a faithful publish-before-content fixture (the blob is not
+        # yet materialized).
+        self.unreadable: set[str] = set()
         self.calls = {
             k: 0
             for k in ("refresh", "walk", "upload", "download", "delete", "stat", "mkdir", "connect")
@@ -60,6 +65,11 @@ class FakeICloud:
     def download(self, relpath: str, dest: os.PathLike[str]) -> None:
         self.calls["download"] += 1
         m = self.files[relpath]
+        if relpath in self.unreadable:
+            raise UnreadableRemoteError(
+                f"remote blob for {relpath} not materialized: got 0 bytes, "
+                f"expected {m.get('size', 0)}"
+            )
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
         with open(dest, "wb") as fh:
             fh.write(m["content"])
@@ -94,6 +104,19 @@ class FakeICloud:
             "size": len(content),
             "etag": etag,
         }
+        self.unreadable.discard(relpath)  # writing real content heals an unreadable path
+
+    def put_unreadable(self, relpath: str, size: int, mtime: float, etag: str = "") -> None:
+        """Publish-before-content: the record lists size N>0 (so walk/stat see a real file)
+        but download() raises UnreadableRemoteError (the blob has not materialized)."""
+        self.files[relpath] = {
+            "kind": "file",
+            "content": b"",
+            "mtime": mtime,
+            "size": size,
+            "etag": etag,
+        }
+        self.unreadable.add(relpath)
 
 
 if TYPE_CHECKING:

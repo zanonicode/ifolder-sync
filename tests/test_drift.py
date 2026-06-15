@@ -1763,11 +1763,11 @@ def test_migration_collision_drops_both(make_syncer):
     store.close()
 
 
-def test_persistent_download_failure_backs_off(make_syncer, fake, local_dir):
-    """A remote whose download persistently fails against an UNCHANGED signature (a broken
-    iCloud blob: HTTP 200 + Content-Length N + 0 bytes) must back off after
-    DOWNLOAD_MAX_FAILS, not retry every pass forever (which hammers Apple + spams the log
-    + churns a .part that re-triggers the watcher)."""
+def test_persistent_partial_download_failure_backs_off(make_syncer, fake, local_dir):
+    """A genuine PARTIAL read (0<got<N: a dropped stream, not publish-before-content lag)
+    raises a plain transient OSError and must back off after DOWNLOAD_MAX_FAILS, not retry
+    every pass forever (which hammers Apple + spams the log + churns a .part that re-triggers
+    the watcher). This is the unchanged broken-blob class; got==0 is handled separately."""
     from ifolder_sync.state import BaselineEntry
     from ifolder_sync.syncer import DOWNLOAD_MAX_FAILS
 
@@ -1783,7 +1783,7 @@ def test_persistent_download_failure_backs_off(make_syncer, fake, local_dir):
     def boom(relpath, dest):
         if relpath == "broken.md":
             attempts["n"] += 1
-            raise OSError("download size mismatch: got 0 bytes, expected 4")
+            raise OSError("download size mismatch: got 2 bytes, expected 4")  # partial read
         return real_dl(relpath, dest)
 
     fake.download = boom
@@ -1796,34 +1796,267 @@ def test_persistent_download_failure_backs_off(make_syncer, fake, local_dir):
     store.close()
 
 
-def test_conflict_backup_failure_backs_off_then_resolves(make_syncer, fake, local_dir):
-    """A conflict whose remote loser can't be backed up (broken iCloud blob) retries the
-    backup a few times then resolves WITHOUT it — the good local copy is uploaded and
-    wins — instead of aborting (and looping) every pass forever."""
+def test_unreadable_download_defers_not_backs_off(make_syncer, fake, local_dir):
+    """The got==0 (publish-before-content) class is NOT a broken-blob backoff: it defers
+    silently every pass (UnreadableRemoteError -> stats.pending), leaving the baseline and
+    local file untouched, never reaching stats.errors. (The companion of the partial-read
+    backoff test above; together they cover both halves of the old got!=expected branch.)"""
     from ifolder_sync.state import BaselineEntry
-    from ifolder_sync.syncer import DOWNLOAD_MAX_FAILS
+
+    syncer, store = make_syncer()
+    fake.put_unreadable("lag.md", size=4, mtime=2000.0)  # listed size 4, body 0 bytes
+    write_file(local_dir, "lag.md", b"AAAA", mtime=1000.0)
+    store.upsert(BaselineEntry("lag.md", "file", 4, 1000.0, 4, 1000.0, ""))
+    store.commit()
+
+    for _ in range(6):
+        s = syncer.sync_once()
+        assert s.errors == 0, s.summary()
+        assert s.pending >= 1, s.summary()
+
+    assert (local_dir / "lag.md").read_bytes() == b"AAAA"  # local untouched
+    store.close()
+
+
+def test_conflict_backup_failure_aborts_and_retries(make_syncer, fake, local_dir):
+    """A conflict whose remote loser cannot be backed up for a NON-lag reason (a real,
+    non-zero-byte download error) must abort-and-retry every pass — NEVER upload the good
+    local copy over the unbacked-up remote loser (the removed resolve-without-backup clobber).
+    The remote stays in place until the backup succeeds."""
+    from ifolder_sync.state import BaselineEntry
 
     syncer, store = make_syncer("newer")
     write_file(local_dir, "n.md", b"GOOD-LOCAL", mtime=5000.0)
-    fake.put("n.md", b"whatever", mtime=2000.0)
+    fake.put("n.md", b"REMOTE-V", mtime=2000.0)
     store.upsert(BaselineEntry("n.md", "file", 3, 1.0, 3, 1.0, ""))  # both sides differ -> conflict
     store.commit()
 
     real_dl = fake.download
-    fails = {"n": 0}
 
-    def boom(relpath, dest):  # the remote backup download (broken blob) always fails
+    def boom(relpath, dest):  # a genuine (non-lag) backup failure on every attempt
         if relpath == "n.md":
-            fails["n"] += 1
-            raise OSError("download size mismatch: got 0 bytes, expected 8")
+            raise OSError("transient backup read error")
         return real_dl(relpath, dest)
 
     fake.download = boom
     for _ in range(6):
         syncer.sync_once()
 
-    assert fails["n"] == DOWNLOAD_MAX_FAILS, fails["n"]  # backup attempts bounded
-    assert fake.files["n.md"]["content"] == b"GOOD-LOCAL"  # good local won, no infinite loop
+    # No clobber: the remote loser is never uploaded over without a saved backup.
+    assert fake.files["n.md"]["content"] == b"REMOTE-V", "remote must not be clobbered"
+    assert fake.calls["upload"] == 0, "local must not be uploaded over an unbacked-up remote"
+    assert (local_dir / "n.md").read_bytes() == b"GOOD-LOCAL"  # local intact
+    store.close()
+
+
+def test_unreadable_remote_download_defers_silently(make_syncer, fake, local_dir, caplog):
+    """Publish-before-content lag on a DOWNLOAD-only path (remote edited, local unchanged):
+    several passes defer silently (errors=0, pending>=1, no 'error reconciling', baseline row
+    unchanged, local untouched). Once the blob materializes it downloads, records both
+    signatures, and the next pass is fully clean."""
+    import logging
+
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer()
+    write_file(local_dir, "data.json", b"LOCAL", mtime=1000.0)  # local == baseline (unchanged)
+    store.upsert(BaselineEntry("data.json", "file", 5, 1000.0, 5, 1000.0, "e0"))
+    store.commit()
+    # Remote rewritten (new size/mtime/etag) but the body has not materialized yet.
+    fake.put_unreadable("data.json", size=7, mtime=2000.0, etag="e1")
+
+    with caplog.at_level(logging.DEBUG, logger="ifolder-sync.syncer"):
+        for _ in range(4):
+            s = syncer.sync_once()
+            assert s.errors == 0, s.summary()
+            assert s.pending >= 1, s.summary()
+            assert s.downloaded == 0, s.summary()
+            base = store.all()["data.json"]
+            assert (base.remote_size, base.remote_mtime) == (5, 1000.0)  # row UNCHANGED
+            assert (local_dir / "data.json").read_bytes() == b"LOCAL"  # local untouched
+
+    assert "error reconciling" not in caplog.text
+
+    # Blob materializes with the real content.
+    fake.put("data.json", b"NEWBODY", mtime=2000.0, etag="e1")
+    s = syncer.sync_once()
+    assert s.downloaded == 1 and s.errors == 0 and s.pending == 0, s.summary()
+    assert (local_dir / "data.json").read_bytes() == b"NEWBODY"
+    base = store.all()["data.json"]
+    assert base.remote_size == 7 and base.remote_etag == "e1"
+
+    s = syncer.sync_once()  # fully clean steady state
+    from ifolder_sync.syncer import SyncStats
+
+    assert s.summary() == SyncStats().summary(), s.summary()
+    store.close()
+
+
+def test_unreadable_remote_conflict_never_clobbers(make_syncer, fake, local_dir, caplog):
+    """Both sides changed, local newer, policy=newer, remote unreadable (publish-before-
+    content). Several passes: conflicts=0, errors=0, pending>=1, NO upload, remote NOT
+    trashed, local intact. Then the remote materializes with DIFFERENT bytes -> a REAL
+    conflict resolves WITH a backup (the iPhone content is preserved as a conflict copy)."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer("newer")
+    write_file(local_dir, "n.md", b"LOCAL-NEW", mtime=5000.0)  # local newer
+    store.upsert(BaselineEntry("n.md", "file", 3, 1.0, 3, 1.0, "e0"))  # both sides differ
+    store.commit()
+    fake.put_unreadable("n.md", size=8, mtime=2000.0, etag="e1")
+
+    for _ in range(4):
+        s = syncer.sync_once()
+        assert s.conflicts == 0, s.summary()
+        assert s.errors == 0, s.summary()
+        assert s.pending >= 1, s.summary()
+        assert fake.calls["upload"] == 0, "no upload while remote unreadable"
+        assert "n.md" in fake.files, "remote must not be trashed"
+        assert (local_dir / "n.md").read_bytes() == b"LOCAL-NEW"  # local intact
+        assert not list(local_dir.glob("n.conflict-*.md")), "no premature backup"
+
+    # The iPhone's edit finally materializes with DIFFERENT bytes -> a genuine conflict.
+    fake.put("n.md", b"IPHONE-X", mtime=2000.0, etag="e1")
+    s = syncer.sync_once()
+    assert s.conflicts == 1, s.summary()
+    backups = list(local_dir.glob("n.conflict-*.md"))
+    assert backups, "the remote loser must be preserved as a backup, never silently dropped"
+    assert backups[0].read_bytes() == b"IPHONE-X"  # iPhone content preserved
+    assert fake.files["n.md"]["content"] == b"LOCAL-NEW"  # newer (local) won
+    store.close()
+
+
+def test_partial_download_still_transient():
+    """A genuine partial read (0<got<N) stays a plain transient OSError — NOT reclassified
+    as UnreadableRemoteError — so real truncation keeps its retry + .part-discard semantics."""
+    from unittest.mock import patch
+
+    from ifolder_sync.errors import UnreadableRemoteError
+    from ifolder_sync.icloud_client import ICloudClient
+
+    client = ICloudClient("x@y.com", max_retries=1)
+
+    class _Resp:
+        def __init__(self, data):
+            self.raw = io.BytesIO(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Node:
+        size = 4
+        name = "f"
+
+        def open(self, stream=True):
+            return _Resp(b"AB")  # got=2 of expected 4 -> partial
+
+    with (
+        patch.object(client, "_navigate", return_value=(_Node(), "f")),
+        patch.object(client, "_child", return_value=_Node()),
+    ):
+        dest = Path(os.environ.get("TMPDIR", "/tmp")) / "ifolder-partial-probe"
+        try:
+            with pytest.raises(OSError) as ei:
+                client.download("f", dest)
+        finally:
+            for p in (dest, Path(str(dest) + ".part")):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    assert not isinstance(ei.value, UnreadableRemoteError), "partial read must stay plain OSError"
+
+
+def test_unreadable_got_zero_raises_typed():
+    """A got==0 body (the empirically-confirmed publish-before-content shape) raises the
+    typed UnreadableRemoteError from the real download() path (proves the fake mirrors it)."""
+    from unittest.mock import patch
+
+    from ifolder_sync.errors import UnreadableRemoteError
+    from ifolder_sync.icloud_client import ICloudClient
+
+    client = ICloudClient("x@y.com", max_retries=1)
+
+    class _Resp:
+        def __init__(self, data):
+            self.raw = io.BytesIO(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Node:
+        size = 4
+        name = "f"
+
+        def open(self, stream=True):
+            return _Resp(b"")  # got=0 of expected 4 -> publish-before-content
+
+    with (
+        patch.object(client, "_navigate", return_value=(_Node(), "f")),
+        patch.object(client, "_child", return_value=_Node()),
+    ):
+        dest = Path(os.environ.get("TMPDIR", "/tmp")) / "ifolder-gotzero-probe"
+        try:
+            with pytest.raises(UnreadableRemoteError):
+                client.download("f", dest)
+        finally:
+            for p in (dest, Path(str(dest) + ".part")):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+
+def test_unreadable_sustained_escalates_one_warning(make_syncer, fake, local_dir, caplog):
+    """A permanently-unreadable remote (same signature every pass) defers silently until the
+    sustained window elapses, then emits EXACTLY ONE 'likely genuine corruption' warning,
+    with stats.errors==0 throughout."""
+    import logging
+
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    write_file(local_dir, "x.json", b"LOCAL", mtime=1000.0)  # local unchanged -> DOWNLOAD
+    store.upsert(BaselineEntry("x.json", "file", 5, 1000.0, 5, 1000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("x.json", size=9, mtime=2000.0, etag="e1")  # fixed signature
+
+    with caplog.at_level(logging.WARNING, logger="ifolder-sync.syncer"):
+        for _ in range(8):  # well past the 3-pass window
+            s = syncer.sync_once()
+            assert s.errors == 0, s.summary()
+
+    corruption_warnings = [r for r in caplog.records if "likely genuine corruption" in r.message]
+    assert len(corruption_warnings) == 1, [r.message for r in corruption_warnings]
+    store.close()
+
+
+def test_unreadable_fast_churn_no_false_corruption(make_syncer, fake, local_dir, caplog):
+    """The real scenario: an actively-edited remote (signature changes EVERY pass) that keeps
+    hitting a fresh 0-byte window must NOT false-escalate to 'corruption' — the per-signature
+    timer resets on each change, so the sustained-corruption warning never fires."""
+    import logging
+
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    write_file(local_dir, "churn.json", b"LOCAL", mtime=1000.0)  # local unchanged -> DOWNLOAD
+    store.upsert(BaselineEntry("churn.json", "file", 5, 1000.0, 5, 1000.0, "e0"))
+    store.commit()
+
+    with caplog.at_level(logging.WARNING, logger="ifolder-sync.syncer"):
+        for i in range(8):  # each pass a fresh edit (new mtime+etag), still 0-byte body
+            fake.put_unreadable("churn.json", size=9, mtime=2000.0 + i, etag=f"e{i}")
+            s = syncer.sync_once()
+            assert s.errors == 0 and s.pending >= 1, s.summary()
+
+    assert not any("likely genuine corruption" in r.message for r in caplog.records), caplog.text
     store.close()
 
 
