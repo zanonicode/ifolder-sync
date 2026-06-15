@@ -1,0 +1,38 @@
+# CodeQL advanced setup (Decision 9): Python SAST -> GitHub Security tab.
+# Hard merge gate, free for public repos. build-mode: none (Python needs no build).
+# codeql-action/analyze uploads its SARIF internally -- do NOT add a manual
+# upload-sarif step, or alerts get duplicated.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 9 * * 1" # weekly CodeQL refresh against the default query suite
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # advanced setup uploads SARIF to the Security tab
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python]
+    steps:
+      - uses: actions/checkout@v6
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - name: perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

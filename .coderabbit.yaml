@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  # Defense-in-depth: .claude/ is the private SDD repo (already gitignored / never in the
+  # public checkout); exclude it explicitly as a backstop against a future `git add -f`.
+  path_filters:
+    - "!.claude/**"
+  # Lane boundary: CodeRabbit (Lane 1) reviews commodity implementation; the data-loss
+  # invariants are owned by a separate custom reviewer (the Invariant Guardian, Lane 2).
+  path_instructions:
+    - path: "ifolder_sync/syncer.py"
+      instructions: |
+        Flag concrete implementation bugs only. Do NOT comment on the data-loss invariants
+        as policy — a separate custom reviewer (the Invariant Guardian) owns those.
+  # Advisory by construction: post a commit status as a badge, but never flip it on a
+  # CodeRabbit error and never escalate to a "Request changes" review. No AI lane is ever
+  # a hard merge gate (the deterministic checks are the only required statuses).
+  commit_status: true
+  fail_commit_status: false
+  request_changes_workflow: false
+  tools:
+    shellcheck:
+      enabled: false
