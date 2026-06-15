@@ -210,16 +210,20 @@ This handling is **opt-in**: enable it with `ifolder-sync init --obsidian` (sets
 Obsidian's `.obsidian/` folder mixes two very different things, and syncing them the
 same way is what breaks cross-device setups:
 
-- **Shared assets** — plugin code (`plugins/<id>/`), `themes/`, `snippets/`, `icons/`.
-  These **sync** so your plugins and themes are available on every device.
+- **Shared assets** — plugin code (`plugins/<id>/main.js`, `manifest.json`,
+  `styles.css`), `themes/`, `snippets/`, `icons/`. These **sync** so your plugins and
+  themes are installed and available on every device.
 - **Volatile per-device config** — rewritten by every device. These are **never
   synced**, because syncing them causes the classic problems: a theme set on the PC
-  **reverts** (`appearance.json` conflicts), and the enabled-plugins list goes
-  incoherent (`community-plugins.json` desyncs).
+  **reverts** (`appearance.json` conflicts), the enabled-plugins list goes incoherent
+  (`community-plugins.json` desyncs), and each plugin's `data.json` thrashes — it is
+  rewritten on nearly every app launch (especially on mobile) and is the chief victim
+  of iCloud's *publish-before-content* lag.
 
 **Never-synced (config-local) set:** `workspace.json`, `workspace-mobile.json`,
 `appearance.json`, `app.json`, `core-plugins.json`, `community-plugins.json`,
-`hotkeys.json`, `cache`, `graph.json`.
+`hotkeys.json`, `cache`, `graph.json`, and every plugin's `plugins/*/data.json`.
+`manifest.json`, the plugin code, and `.obsidian/types.json` **still sync**.
 
 The trade-off: you set your theme and enable plugins **once per device** — usually
 desirable (desktop and mobile often want different appearance/layout).
@@ -229,9 +233,13 @@ desirable (desktop and mobile often want different appearance/layout).
 > `Config.effective_ignore`. Enable with `ifolder-sync init --obsidian`, or add
 > `"obsidian": true` to an existing config.
 >
-> Some plugins keep **live per-device state** in their `data.json` and treat any
-> external writer as corruption (e.g. Iconic). If a plugin complains after device
-> switches, exclude its state per vault: add `plugins/<id>/data.json*` to `ignore`.
+> Each plugin's per-device state (`plugins/<id>/data.json`) is excluded **automatically**
+> when `obsidian: true` — it is rewritten on nearly every launch and several plugins
+> (e.g. Iconic) treat an external writer as corruption. This is almost always what you
+> want: device-specific plugin settings stay local while the plugin itself still travels.
+> If you genuinely need one plugin's settings to sync across devices, leave Obsidian mode
+> off and curate `ignore` by hand. See the
+> [conflicts & recovery playbook](docs/ADVANCED_USAGE.md#conflicts--recovery-playbook).
 
 ## Ignored files (`ignore`)
 
@@ -271,6 +279,11 @@ When **both sides change** the same file between two syncs:
 - `local` / `remote`: the chosen side always wins.
 - `both`: keep both (the remote version becomes a `.conflict-…` file).
 
+> Conflicts, `.conflict-*` files, theme-revert, plugin `data.json`, the
+> publish-before-content lag (`pending` items), vault-identity mismatch, and
+> delete-threshold trips each have step-by-step recovery instructions in the
+> [conflicts & recovery playbook](docs/ADVANCED_USAGE.md#conflicts--recovery-playbook).
+
 ## Safety & resilience
 
 - **Walk guard (both sides):** if the remote listing fails (network/auth) **or the
@@ -302,6 +315,13 @@ When **both sides change** the same file between two syncs:
   `status` shows the local trash count; `purge-trash` empties it.
 - **Retries:** transient iCloud / rate-limit errors are retried with exponential
   backoff (`max_retries`, default 3).
+- **Publish-before-content lag (unreadable remote):** iCloud sometimes lists a file
+  (size N > 0) before its body has propagated, so a fetch returns 0 bytes. The engine
+  **defers** that file — it counts as `pending`, never an error, and your good local
+  copy is never overwritten — and retries on later passes. Only if it stays unreadable
+  for `unreadable_max_passes` (default 20) against an *unchanged* remote signature does
+  the engine treat it as a genuine empty husk and let the good side win (one warning).
+  A conflict is never resolved against an unreadable remote.
 - **Single-instance lock:** a PID lockfile (`state/<profile>/daemon.lock`) stops two
   daemons from racing the baseline; a lock left by a dead process is reclaimed
   automatically. A manual `sync` refuses to run while the daemon is up.
@@ -398,8 +418,15 @@ Each profile's config lives at `~/.config/ifolder-sync/profiles/<name>.json`:
 | `delete_threshold_pct` | Pause deletes above this % of tracked files | `50` |
 | `delete_threshold_count` | Pause deletes above this many files | `100` |
 | `walk_workers` | Concurrent remote folder listings (1 = serial) | `4` |
-| `full_walk_interval_seconds` | Max etag-cache age before a full remote walk (0 = no cache) | `600` |
+| `full_walk_interval_seconds` | Max etag-cache age before a full remote walk (0 = no cache) | `3600` |
 | `ignore` | Patterns ignored on both sides (see above) | see defaults |
+
+The table above lists the everyday options. The remaining tuning/advanced options —
+request timeout, session auto-reconnect bounds, baseline backups, Unicode normalization,
+etag verification, the publish-before-content deferral window (`unreadable_max_passes`),
+the 0-byte settle window, the upload size cap, and strict child-count — are documented in
+full, with when-to-change guidance and example configs, in
+**[docs/ADVANCED_USAGE.md](docs/ADVANCED_USAGE.md)**.
 
 ## Troubleshooting
 
@@ -436,8 +463,8 @@ touched by uninstalling.
 ```bash
 .venv/bin/pytest                       # full suite (in-memory fake iCloud, no credentials)
 .venv/bin/ruff check ifolder_sync tests
-.venv/bin/black ifolder_sync tests
-.venv/bin/mypy ifolder_sync
+.venv/bin/ruff format ifolder_sync tests
+.venv/bin/mypy ifolder_sync tests
 ```
 
 The suite uses an **in-memory fake iCloud** and covers the bidirectional matrix

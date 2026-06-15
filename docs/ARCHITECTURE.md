@@ -30,7 +30,7 @@ flowchart TD
     subgraph CLIENT["icloud_client.py"]
         AUTH["auth + 2FA\n(trusted session, poisoned-session repair)"]
         WALK["walk: etag-cached, parallel\n(zero calls for unchanged subtrees)"]
-        OPS["upload(mtime=) · download(.part)\n· move_to_trash · mkdir"]
+        OPS["upload(mtime=) · download(.part)\n· move_to_trash · mkdir\n· raises typed UnreadableRemoteError (errors.py)"]
     end
 
     STATE[("state.py\nSQLite three-way baseline\n+ meta (last_sync/error, vault_uuid)")]
@@ -105,8 +105,17 @@ Ordered from prevention to recovery; each layer was motivated by a real incident
    instead of generating phantom deletions.
 3. **Bootstrap additive pass** — the first pass after start transfers content but
    defers all deletions to the next pass.
-4. **Settle guard** — a both-sides-create conflict against a 0-byte remote husk
-   (iCloud publishes records before content) waits one pass instead of judging.
+4. **Propagation-lag guards** — iCloud can publish a file's *record* before its *body*
+   propagates over the web API. Two shapes, both deferred rather than judged: a 0-byte
+   remote record shadowing a non-empty local file waits `settle_max_passes` (the settle
+   guard); a record that lists size N > 0 but whose body fetches as 0 bytes raises the
+   typed `UnreadableRemoteError` (`errors.py`) and is deferred — counted as `pending`,
+   never an error, the baseline left untouched, and a conflict is **never** resolved
+   against it (`_resolve_conflict` probes readability first, for every policy). It is
+   retried each pass until it heals; only after `unreadable_max_passes` against an
+   unchanged remote signature is it judged a genuine empty husk and the good side allowed
+   to win (one warning). The earlier "resolve without backup" heal path was removed — it
+   was a data-loss clobber of an in-flight edit from another device.
 5. **Delete threshold** — a pass deleting more than `delete_threshold_pct`/`_count`
    skips all deletions unless `--force-delete`; repeated trips raise `DRIFT SUSPECTED`
    and slow polling.
@@ -153,10 +162,13 @@ exit, **no** restart loop.
 - The vault must not live under `~/Downloads`, `~/Desktop` or `~/Documents`: macOS TCC
   blocks launchd daemons from those folders (a Terminal-started daemon works, masking
   the problem). `init`/`start --background` warn about this.
-- Plugin hot-state files that self-heal (e.g. Iconic's `data.json`) fight any external
-  writer; exclude them per vault via `ignore`.
+- Plugin hot-state files (`plugins/*/data.json`) are per-device and rewritten on nearly
+  every launch; they are excluded from sync automatically under `obsidian: true`
+  (`manifest.json` and the plugin code still sync).
 - Devices syncing through Apple's native iCloud (iPhone Obsidian) propagate on Apple's
-  schedule; opening the app forces a pull.
+  schedule; opening the app forces a pull and can briefly expose the publish-before-
+  content window (a record visible before its body), which the engine defers rather than
+  errors (see the safety model's propagation-lag guards).
 - The pyicloud web API is reverse-engineered and can break when Apple changes it.
 - **Advanced Data Protection (ADP) is incompatible**: enabling ADP on the Apple ID
   ends web-API access to iCloud Drive entirely — this affects every tool in this

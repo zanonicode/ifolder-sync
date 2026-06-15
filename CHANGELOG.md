@@ -7,6 +7,50 @@ carry behavior changes).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-15
+
+Engine-safety fix for iCloud's publish-before-content propagation lag, plus the Obsidian
+plugin-state exclusion that the lag made necessary.
+
+### Fixed
+- **iCloud publish-before-content lag no longer errors or clobbers.** A remote whose
+  record lists size N > 0 but whose body fetches as 0 bytes (transient propagation lag,
+  typically a file an iPhone just rewrote) now raises a typed `UnreadableRemoteError` and
+  is **deferred** — counted as `pending`, never an error, the baseline left untouched —
+  and retried each pass. A conflict is **never** resolved against an unreadable remote
+  (the resolver probes readability first, for every policy). Only after
+  `unreadable_max_passes` against an unchanged remote signature is the blob judged a
+  genuine empty husk and the good local side allowed to win (one warning). This removes
+  the v0.10.2 "resolve without backup" heal path, which was a data-loss clobber of an
+  in-flight edit from another device.
+- Partial reads (`0 < got < N`) remain a transient, retried `OSError` — not silenced.
+
+### Changed
+- **`.obsidian/plugins/*/data.json` is now excluded from sync** under `obsidian: true`.
+  These per-plugin state files are rewritten on nearly every app launch (especially on
+  mobile) and are the chief victim of the lag above; `manifest.json`, the plugin code, and
+  `.obsidian/types.json` still sync. *(Behavior change: a plugin `data.json` that synced
+  before will stop syncing.)*
+
+### Added
+- `unreadable_max_passes` config option (default `20`): the sustained-failure window
+  before an unreadable remote blob is treated as genuine corruption. Distinct from
+  `settle_max_passes` (which governs 0-byte husks); intentionally long so a slow-
+  propagating real edit is never mistaken for corruption.
+
+### Tests
+- 255 → 264 tests: unreadable-remote defer/never-clobber, conflict readability probe,
+  sustained-escalation one-warning, fast-churn no-false-corruption, partial-read still
+  transient, and the `plugins/*/data.json` ignore matrix. Coverage ~79%.
+
+### Docs
+- New **[docs/ADVANCED_USAGE.md](docs/ADVANCED_USAGE.md)**: complete configuration
+  reference (every option), worked example configs, and a conflicts & recovery playbook.
+- README: corrected the `full_walk_interval_seconds` default (600 → 3600); documented the
+  propagation-lag / unreadable-remote handling under Safety & resilience; refreshed the
+  Obsidian `data.json` behavior; fixed the dev `black` → `ruff format` command.
+- ARCHITECTURE: propagation-lag guards in the safety model; `errors.py` on the component map.
+
 ## [0.12.0] - 2026-06-12
 
 Phase E — CLI/UX surface and test debt. User-visible additions (exit codes, `--json`, shell
@@ -122,7 +166,8 @@ Phase D — refactor & performance, no behavior change beyond the items called o
   installed no dependencies. Moved into `[project]`, added an SPDX license and a CI build
   gate (build + install across Python 3.10–3.14, ruff + mypy + pytest).
 
-[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.13.0
 [0.12.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.12.0
 [0.11.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.11.0
 [0.10.3]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.10.3
