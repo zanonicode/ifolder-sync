@@ -2,6 +2,10 @@
 language: en-US
 reviews:
   profile: chill
+  # Quieter output: drop the mascot poem and the auto-generated sequence diagrams
+  # (noise for a small CLI). The high-level + changed-files summaries stay on.
+  poem: false
+  sequence_diagrams: false
   # Defense-in-depth: .claude/ is the private SDD repo (already gitignored / never in the
   # public checkout); exclude it explicitly as a backstop against a future `git add -f`.
   path_filters:
