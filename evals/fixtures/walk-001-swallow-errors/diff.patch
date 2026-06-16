@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..770cab0 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -389,7 +389,7 @@ class Syncer:
+             # os.walk's default silently skips unreadable dirs; a partial tree is
+             # indistinguishable from mass deletion, so abort instead (the local
+             # counterpart of the remote walk guard).
+-            raise LocalScanError(f"local scan failed: {err}") from err
++            return  # swallow the scan error and continue the partial walk
+ 
+         for dirpath, dirnames, filenames in os.walk(root, onerror=_fail):
+             rel_dir = os.path.relpath(dirpath, root)

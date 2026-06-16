@@ -1,0 +1,84 @@
+# yaml-language-server: $schema=https://www.promptfoo.dev/config-schema.json
+#
+# Evaluates the Invariant Guardian ITSELF (the reviewer is the system-under-test).
+# SUT  = Vertex Gemini 2.5 Flash (keyless WIF; the same model the Guardian runs).
+# JUDGE = Anthropic Sonnet via ANTHROPIC_API_KEY (a DIFFERENT model family — the
+#         anti-self-grading design; DESIGN_03 Decision 4/8).
+# The system prompt (prompts/guardian-system.txt) is generated from invariants.yaml by
+# ai-eval.yml before each run, so it never drifts from what the Guardian actually uses.
+# Positives must FAIL the named invariant; negatives must produce NO FAIL. The aggregate
+# recall/false-positive gate + run-twice flip check live in assert_consistent.py.
+description: Invariant Guardian eval — recall on seeded invariant-breaking diffs
+
+providers:
+  - id: vertex:gemini-2.5-flash
+    config:
+      generationConfig:
+        temperature: 0
+        responseMimeType: application/json
+
+defaultTest:
+  options:
+    provider: anthropic:messages:claude-sonnet-4-6 # llm-rubric judge (ANTHROPIC_API_KEY)
+
+prompts:
+  - file://prompts/guardian-system.txt
+
+tests:
+  # --- positives: the named invariant MUST be reported FAIL ---
+  - description: "DELETE_THRESHOLD weakened (count gate * 1000)"
+    vars:
+      fixture: dt-001-disable-count
+      diff: file://fixtures/dt-001-disable-count/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "DELETE_THRESHOLD" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "States that the change weakens the mass-deletion threshold; specific and actionable."
+  - description: "PATH_SAFETY weakened (_is_safe_rel returns True)"
+    vars:
+      fixture: path-001-allow-traversal
+      diff: file://fixtures/path-001-allow-traversal/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "PATH_SAFETY" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "States that path-traversal protection is bypassed; specific and actionable."
+  - description: "WALK_GUARD weakened (scan error swallowed)"
+    vars:
+      fixture: walk-001-swallow-errors
+      diff: file://fixtures/walk-001-swallow-errors/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "WALK_GUARD" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "States that a failed scan no longer aborts (partial-tree / mass-deletion risk)."
+
+  # --- negatives (controls): NO finding may be FAIL ---
+  - description: "benign: inline comment"
+    vars:
+      fixture: neg-001-inline-comment
+      diff: file://fixtures/neg-001-inline-comment/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.every(f => f.status !== "FAIL")'
+  - description: "benign: docstring reword"
+    vars:
+      fixture: neg-002-docstring-reword
+      diff: file://fixtures/neg-002-docstring-reword/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.every(f => f.status !== "FAIL")'
+  - description: "benign: log message reword"
+    vars:
+      fixture: neg-003-log-message
+      diff: file://fixtures/neg-003-log-message/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.every(f => f.status !== "FAIL")'

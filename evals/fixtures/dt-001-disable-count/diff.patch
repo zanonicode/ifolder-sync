@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..9f5e299 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -593,7 +593,7 @@ class Syncer:
+         )
+ 
+     def _over_threshold(self, count: int, baseline: dict[str, BaselineEntry]) -> bool:
+-        if count > self.cfg.delete_threshold_count:
++        if count > self.cfg.delete_threshold_count * 1000:
+             return True
+         tracked = len(baseline)
+         return bool(tracked and (count / tracked) * 100 > self.cfg.delete_threshold_pct)

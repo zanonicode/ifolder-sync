@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..da291a8 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -382,7 +382,7 @@ class Syncer:
+             self.store.set_meta("vault_uuid", marker)
+ 
+     def _scan_local(self) -> dict[str, LocalEntry]:
+-        out: dict[str, LocalEntry] = {}
++        out: dict[str, LocalEntry] = {}  # accumulates scanned entries
+         root = self.local_root
+ 
+         def _fail(err: OSError) -> None:

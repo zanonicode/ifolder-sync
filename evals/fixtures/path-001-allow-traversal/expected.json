@@ -1,0 +1,7 @@
+{
+  "id": "path-001-allow-traversal",
+  "kind": "positive",
+  "expect_fail": [
+    "PATH_SAFETY"
+  ]
+}

@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..ab7f3c2 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -615,7 +615,7 @@ class Syncer:
+             return False
+         if defer_deletes:
+             stats.deferred_deletes = delete_count
+-            log.info("bootstrap pass: deferring %d deletion(s) to the next pass", delete_count)
++            log.info("bootstrap pass: deferring %d deletion(s) until the next pass", delete_count)
+             return True
+         if self._over_threshold(delete_count, baseline):
+             stats.skipped_deletes = delete_count
