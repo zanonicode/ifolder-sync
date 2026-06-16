@@ -1,0 +1,72 @@
+# Public, machine-readable safety contract for the Invariant Guardian (DESIGN_03 Decision 7).
+# It transcribes the PUBLIC code's data-loss safety properties — no private content.
+# Each entry:
+#   id             stable identifier the model answers about
+#   title          one-line description
+#   safety_critical whether weakening it risks silent data loss
+#   source_symbol  file::symbol the invariant lives in (verified present)
+#   anchor_test    a real pytest nodeid that exercises it (verified collectable)
+#   check          the yes/no question the reviewer answers for a diff
+# The Phase-5 drift guard asserts every anchor_test collects and every source_symbol exists.
+
+- id: WALK_GUARD
+  title: "Both-side scan failure aborts the pass with zero deletions"
+  safety_critical: true
+  source_symbol: "ifolder_sync/syncer.py::_scan_local"
+  anchor_test: "tests/test_safety.py::test_walk_guard_aborts_without_deletions"
+  check: >
+    Does this diff let a failed or partial scan (a network/auth error on the remote, or a
+    local permission error / missing vault root) proceed instead of aborting the pass? A
+    partial tree must never be read as deletions, so any weakening of the raise-on-failure
+    guard is a FAIL.
+
+- id: DELETE_THRESHOLD
+  title: "Mass-deletion threshold suppresses oversized delete batches"
+  safety_critical: true
+  source_symbol: "ifolder_sync/syncer.py::_suppress_deletes"
+  anchor_test: "tests/test_safety.py::test_delete_threshold_skips_mass_delete"
+  check: >
+    Does this diff weaken the delete threshold — flip the strict comparison, raise or
+    ignore the pct/count limits, apply deletions that exceed them without force_delete, or
+    record baseline rows for deletions that were withheld?
+
+- id: PATH_SAFETY
+  title: "Remote paths stay inside the local root (no traversal)"
+  safety_critical: true
+  source_symbol: "ifolder_sync/syncer.py::_is_safe_rel"
+  anchor_test: "tests/test_safety.py::test_path_traversal_blocked"
+  check: >
+    Does this diff let a relpath escape local_root (an absolute path, a `..` traversal, or
+    a symlinked mid-path), or bypass _is_safe_rel filtering of the remote snapshot so an
+    unsafe path reaches a local write?
+
+- id: UPLOAD_MTIME
+  title: "Upload stamps the remote mtime (no upload->download ping-pong)"
+  safety_critical: true
+  source_symbol: "ifolder_sync/icloud_client.py::upload"
+  anchor_test: "tests/test_safety.py::test_no_post_upload_stat"
+  check: >
+    Does this diff drop the mtime passed to upload, or re-stat the remote after upload
+    instead of recording the known local mtime — reintroducing the conflict / upload-then-
+    download ping-pong the mtime stamp prevents?
+
+- id: THREE_WAY_BASELINE
+  title: "Three-way baseline distinguishes created from deleted"
+  safety_critical: true
+  source_symbol: "ifolder_sync/syncer.py::_decide_file"
+  anchor_test: "tests/test_decide_props.py::test_decide_file_never_deletes_without_baseline"
+  check: >
+    Does this diff collapse the three-way baseline into a two-way diff, or delete a path
+    that has no baseline entry? A path the baseline never recorded is a new file, never a
+    deletion.
+
+- id: UNREADABLE_DEFER
+  title: "Unreadable remote blobs are deferred, never clobbered (v0.13.0 propagation lag)"
+  safety_critical: true
+  source_symbol: "ifolder_sync/syncer.py::_defer_unreadable"
+  anchor_test: "tests/test_drift.py::test_unreadable_remote_conflict_never_clobbers"
+  check: >
+    Does this diff resolve a conflict against an unreadable remote (a 0-byte body whose
+    record lists size N>0), count such a remote as an error instead of deferring it, or let
+    a good local side be overwritten before the unreadable-escalation window — risking data
+    loss from iCloud publish-before-content lag?
