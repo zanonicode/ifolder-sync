@@ -1,0 +1,40 @@
+name: ai-repo-scan
+
+# Weekly belt-and-suspenders for the invariants.yaml contract (R2). The same drift check
+# runs on every PR via tests/test_invariants_drift.py; this catches drift that lands on
+# main without a PR and opens a tracking issue. Deterministic — no LLM, no credentials.
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invariants-drift:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # open a tracking issue if the contract drifted
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: invariants drift check
+        run: python -m scripts.ai_guardian.check_invariants_drift
+      - name: open a tracking issue on drift
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="invariants.yaml drift detected"
+          open=$(gh issue list --state open --search "$title in:title" --json number --jq 'length')
+          if [ "$open" = "0" ]; then
+            gh issue create --title "$title" --body \
+              "The weekly drift guard found invariants.yaml entries whose \`source_symbol\` or \`anchor_test\` no longer resolve against the code. Re-point or remove them (see \`scripts/ai_guardian/check_invariants_drift.py\`). Failing run: $RUN_URL"
+          else
+            echo "a drift issue is already open; not duplicating."
+          fi
