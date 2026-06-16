@@ -37,7 +37,7 @@ dev = [
     "pytest-cov>=4.0",
     "hypothesis>=6.0",
     "ruff>=0.15,<0.16",
-    "mypy>=1.0,<2",
+    "mypy>=1.0,<3",
     "shtab>=1.6",
     "pydantic>=2",
 ]
