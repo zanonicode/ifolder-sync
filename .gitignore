@@ -22,3 +22,10 @@ htmlcov/
 # AI-CI artifacts (keyless-WIF credential file written by google-github-actions/auth; eval report)
 gha-creds-*.json
 evals/report.html
+
+# Terraform (infra/) — never commit provider binaries, state, or var files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
