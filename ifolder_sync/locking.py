@@ -20,6 +20,12 @@ class AlreadyRunning(RuntimeError):
 
 _boot_time_cache: Optional[int] = None
 
+# kern.boottime "sec" = wall_clock - uptime, so NTP discipline of the wall clock makes it
+# jitter ~1s within ONE boot session; a real reboot shifts it by the whole machine downtime
+# (orders of magnitude larger). Tolerate the jitter so a live lock is not misread as stale.
+# Mirrors syncer.MTIME_TOL = 2.0 (the same clock-skew precedent).
+_BOOT_TOL = 2  # seconds
+
 
 def _boot_time() -> Optional[int]:
     """macOS boot wall-clock time (epoch seconds), memoized. The lock file lives in the
@@ -69,7 +75,7 @@ def holder_pid(path: Path) -> Optional[int]:
     if not pid:
         return None
     cur = _boot_time()
-    if boot is not None and cur is not None and boot != cur:
+    if boot is not None and cur is not None and abs(boot - cur) > _BOOT_TOL:
         return None  # lock from a previous boot: its PID may have been recycled -> stale
     return pid if _alive(pid) else None
 
