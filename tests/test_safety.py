@@ -128,6 +128,47 @@ def test_lock_from_previous_boot_is_stale(tmp_path):
     assert holder_pid(lock_path) == os.getpid()
 
 
+def test_same_boot_jitter_is_not_stale(tmp_path, monkeypatch):
+    """A same-boot kern.boottime jitter (NTP disciplines the wall clock) must NOT flip a live
+    lock to stale; tolerated two-sided since the wall clock can step in either direction."""
+    from ifolder_sync.locking import _BOOT_TOL, holder_pid
+
+    assert _BOOT_TOL >= 1
+    stamped = 1780079296
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text(f"{os.getpid()}\n{stamped}")
+    monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda: stamped + 1)
+    assert holder_pid(lock_path) == os.getpid()  # forward 1s jitter (the live bug)
+    monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda: stamped - 1)
+    assert holder_pid(lock_path) == os.getpid()  # backward jitter too (two-sided)
+
+
+def test_boot_skew_tolerance_boundary(tmp_path, monkeypatch):
+    """Boundary: delta within _BOOT_TOL is held, delta beyond it is stale (pins the band so a
+    future widening cannot silently erode the previous-boot guard)."""
+    from ifolder_sync.locking import _BOOT_TOL, holder_pid
+
+    base = 1780079296
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text(f"{os.getpid()}\n{base}")
+    for delta, held in ((0, True), (_BOOT_TOL, True), (_BOOT_TOL + 1, False)):
+        monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda d=delta: base + d)
+        got = holder_pid(lock_path)
+        assert (got == os.getpid()) is held
+
+
+def test_previous_boot_lock_still_stale_with_tolerance(tmp_path, monkeypatch):
+    """P2-7 survives the tolerance: a genuine previous-boot lock (delta >> band) is still stale,
+    deterministic on any platform (no real sysctl, no macOS-only skip)."""
+    from ifolder_sync.locking import holder_pid
+
+    stamped = 1780079296
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text(f"{os.getpid()}\n{stamped}")
+    monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda: stamped + 100000)
+    assert holder_pid(lock_path) is None
+
+
 def test_retry_recovers_from_transient():
     from pyicloud.exceptions import PyiCloudAPIResponseException
 
