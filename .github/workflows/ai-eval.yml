@@ -43,6 +43,7 @@ jobs:
 
       - name: regenerate the system prompt from invariants.yaml (no drift)
         run: |
+          mkdir -p evals/prompts
           python - <<'PY'
           from scripts.ai_guardian.prompt import build_system_prompt, fence_diff, load_invariants
 
