@@ -16,6 +16,25 @@ providers:
       generationConfig:
         temperature: 0
         responseMimeType: application/json
+        # Mirror the Guardian's pydantic Verdict (llm.py response_schema=Verdict) so the
+        # SUT emits the SAME shape the Guardian produces in production — notably
+        # `invariant_id` (not a free-form `id`), which the asserts + assert_consistent read.
+        responseSchema:
+          type: object
+          properties:
+            findings:
+              type: array
+              items:
+                type: object
+                properties:
+                  invariant_id: { type: string }
+                  status: { type: string, enum: [PASS, FAIL, NOT_TOUCHED] }
+                  path: { type: string, nullable: true }
+                  line: { type: integer, nullable: true }
+                  evidence: { type: string }
+                required: [invariant_id, status, evidence]
+            summary: { type: string }
+          required: [findings, summary]
 
 defaultTest:
   options:
