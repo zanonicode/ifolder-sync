@@ -1,0 +1,2 @@
+# Keeps evals/prompts/ in the tree. guardian-system.txt is generated here from
+# invariants.yaml (gitignored); CI and the local run regenerate it before promptfoo.
