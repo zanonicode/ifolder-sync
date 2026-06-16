@@ -1,0 +1,5 @@
+{
+  "id": "neg-001-inline-comment",
+  "kind": "negative",
+  "expect_fail": []
+}

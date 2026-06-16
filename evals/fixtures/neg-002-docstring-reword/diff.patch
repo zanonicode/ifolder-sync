@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..a041989 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -606,7 +606,7 @@ class Syncer:
+         baseline: dict[str, BaselineEntry],
+         stats: SyncStats,
+     ) -> bool:
+-        """True = withhold every destructive op this pass. Two guards share the same
++        """True = withhold every destructive operation this pass. Two guards share the same
+         mechanism: the bootstrap deferral (content first, destruction next pass) and
+         the delete threshold. Baseline rows of withheld deletions are not touched, so
+         the next pass re-derives them under the normal rules."""

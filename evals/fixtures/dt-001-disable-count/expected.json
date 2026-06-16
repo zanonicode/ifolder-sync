@@ -1,0 +1,7 @@
+{
+  "id": "dt-001-disable-count",
+  "kind": "positive",
+  "expect_fail": [
+    "DELETE_THRESHOLD"
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "id": "neg-002-docstring-reword",
+  "kind": "negative",
+  "expect_fail": []
+}

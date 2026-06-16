@@ -1,0 +1,7 @@
+{
+  "id": "walk-001-swallow-errors",
+  "kind": "positive",
+  "expect_fail": [
+    "WALK_GUARD"
+  ]
+}

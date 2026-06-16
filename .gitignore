@@ -19,9 +19,11 @@ htmlcov/
 # macOS
 .DS_Store
 
-# AI-CI artifacts (keyless-WIF credential file written by google-github-actions/auth; eval report)
+# AI-CI artifacts (keyless-WIF credential file written by google-github-actions/auth;
+# eval report; the eval system prompt is generated from invariants.yaml each run)
 gha-creds-*.json
 evals/report.html
+evals/prompts/guardian-system.txt
 
 # Terraform (infra/) — never commit provider binaries, state, or var files
 **/.terraform/
