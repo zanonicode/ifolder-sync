@@ -73,8 +73,11 @@ jobs:
             echo "ANTHROPIC_API_KEY unset; skipping the eval (set it to enable the judge)."
             exit 0
           fi
-          promptfoo eval -c promptfooconfig.yaml -o /tmp/run1.json
-          promptfoo eval -c promptfooconfig.yaml -o /tmp/run2.json
+          # promptfoo exits 100 if any per-test assert fails; that is informational here
+          # (it feeds the HTML report). The AUTHORITATIVE gate is assert_consistent.py
+          # (recall / false-positive / run-twice consistency), so let both runs complete.
+          promptfoo eval -c promptfooconfig.yaml -o /tmp/run1.json || true
+          promptfoo eval -c promptfooconfig.yaml -o /tmp/run2.json || true
           python assert_consistent.py /tmp/run1.json /tmp/run2.json --fixtures fixtures
 
       - name: html report
