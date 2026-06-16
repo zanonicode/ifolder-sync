@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..8c590d1 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -1235,7 +1235,7 @@ class Syncer:
+         # unless the sustained window has elapsed, that propagates to _apply_file -> defer
+         # (no conflict count, no clobber). The probe's bytes are reused so the resolution
+         # reads the remote only once.
+-        remote_unreadable = self._probe_remote_unreadable(relpath, rentry)
++        remote_unreadable = None  # readability probe disabled
+         if remote_unreadable is not None:
+             if not self._unreadable_escalated(relpath, rentry):
+                 raise remote_unreadable

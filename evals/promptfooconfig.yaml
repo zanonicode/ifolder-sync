@@ -101,3 +101,75 @@ tests:
       - type: is-json
       - type: javascript
         value: 'JSON.parse(output).findings.every(f => f.status !== "FAIL")'
+
+  # --- coverage positives: the previously-uncovered invariants ---
+  - description: "UPLOAD_MTIME weakened (upload drops the mtime= stamp)"
+    vars:
+      fixture: upload-mtime-001-drop-stamp
+      diff: file://fixtures/upload-mtime-001-drop-stamp/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "UPLOAD_MTIME" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "States that the upload no longer stamps the remote mtime, reintroducing the ping-pong/conflict loop."
+  - description: "THREE_WAY_BASELINE weakened (base-None remote-only path -> DELETE instead of DOWNLOAD)"
+    vars:
+      fixture: baseline-001-delete-without-base
+      diff: file://fixtures/baseline-001-delete-without-base/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "THREE_WAY_BASELINE" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "States that a path with no baseline entry is now deleted instead of treated as new (two-way collapse)."
+  - description: "UNREADABLE_DEFER weakened (readability probe disabled in conflict resolution)"
+    vars:
+      fixture: unread-001-skip-probe
+      diff: file://fixtures/unread-001-skip-probe/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "UNREADABLE_DEFER" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "States that conflicts are now resolved against a possibly-unreadable remote (no defer), risking clobber."
+
+  # --- subtle positives: covered invariants, harder than the blatant ones ---
+  - description: "DELETE_THRESHOLD weakened (percentage gate disabled; count gate kept)"
+    vars:
+      fixture: dt-002-pct-gate-off
+      diff: file://fixtures/dt-002-pct-gate-off/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "DELETE_THRESHOLD" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "Notices the percentage-based delete threshold is disabled (returns False), even though the count gate remains."
+  - description: "WALK_GUARD weakened (file-stat OSError swallowed instead of raising)"
+    vars:
+      fixture: walk-002-swallow-file-stat
+      diff: file://fixtures/walk-002-swallow-file-stat/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.some(f => f.invariant_id === "WALK_GUARD" && f.status === "FAIL")'
+      - type: llm-rubric
+        value: "Notices a per-file stat error is now swallowed (continue) rather than aborting the scan."
+
+  # --- near-miss negatives: touch the guarded code but DO NOT weaken it -> no FAIL ---
+  - description: "near-miss: '>' -> '>=' on the count gate (STRICTER, not weaker)"
+    vars:
+      fixture: neg-004-gte-count
+      diff: file://fixtures/neg-004-gte-count/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.every(f => f.status !== "FAIL")'
+  - description: "near-miss: extract path-safety check to a variable (behavior-identical)"
+    vars:
+      fixture: neg-005-extract-path-var
+      diff: file://fixtures/neg-005-extract-path-var/diff.patch
+    assert:
+      - type: is-json
+      - type: javascript
+        value: 'JSON.parse(output).findings.every(f => f.status !== "FAIL")'
