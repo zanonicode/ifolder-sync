@@ -473,6 +473,29 @@ safety guards (walk guards, delete threshold, path traversal, locking, soft-dele
 dry-run, settle guard, etag cache). Code layout and design rationale live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Continuous integration & AI-assisted review
+
+Every PR runs a layered check suite. The AI layers are **advisory** — only the
+deterministic checks gate a merge:
+
+- **Hard gates** — `ruff`, `mypy`, the full `pytest` matrix (3.10–3.14), plus CodeQL,
+  Trivy and gitleaks security scans.
+- **[CodeRabbit](https://coderabbit.ai)** — general inline review.
+- **Invariant Guardian** ([`scripts/ai_guardian/`](scripts/ai_guardian/)) — a small custom
+  reviewer (Gemini on Vertex AI, keyless via Workload Identity Federation) that flags diffs
+  weakening the data-loss invariants in
+  [`invariants.yaml`](scripts/ai_guardian/invariants.yaml). It only comments; it never blocks.
+
+Because the Guardian is an LLM, **the reviewer itself is tested**: an eval harness
+([`evals/`](evals/README.md)) runs it over golden fixtures — diffs that deliberately weaken
+an invariant (must be caught) and benign ones (must not be flagged) — gating on
+**recall ≥ 0.85** and **false-positive ≤ 0.10**. A weekly drift guard keeps `invariants.yaml`
+honest against the code it references.
+
+The AI layers need a Vertex project + repo variables; without them they skip cleanly, so
+forks and unconfigured clones just run the deterministic gates. Design rationale:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## License
 
 [MIT](LICENSE) — © 2026 Vitor Zanoni. Provided as-is, without warranty of any kind.
