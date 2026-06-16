@@ -1,0 +1,7 @@
+{
+  "id": "unread-001-skip-probe",
+  "kind": "positive",
+  "expect_fail": [
+    "UNREADABLE_DEFER"
+  ]
+}

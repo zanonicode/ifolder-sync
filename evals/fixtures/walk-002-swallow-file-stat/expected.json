@@ -1,0 +1,7 @@
+{
+  "id": "walk-002-swallow-file-stat",
+  "kind": "positive",
+  "expect_fail": [
+    "WALK_GUARD"
+  ]
+}

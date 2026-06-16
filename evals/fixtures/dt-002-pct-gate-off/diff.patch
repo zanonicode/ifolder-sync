@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..79df6dc 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -596,7 +596,7 @@ class Syncer:
+         if count > self.cfg.delete_threshold_count:
+             return True
+         tracked = len(baseline)
+-        return bool(tracked and (count / tracked) * 100 > self.cfg.delete_threshold_pct)
++        return False
+ 
+     def _suppress_deletes(
+         self,

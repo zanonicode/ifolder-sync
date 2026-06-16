@@ -1,0 +1,14 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..37618ee 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -341,7 +341,8 @@ class Syncer:
+         except (OSError, ValueError, RuntimeError):
+             return False
+         root = self._root_resolved()
+-        return target == root or root in target.parents
++        inside = target == root or root in target.parents
++        return inside
+ 
+     def _preflight_local(self, baseline: dict[str, BaselineEntry], dry_run: bool) -> None:
+         """Root-existence and vault-identity gates, run before any scan.

@@ -1,0 +1,7 @@
+{
+  "id": "upload-mtime-001-drop-stamp",
+  "kind": "positive",
+  "expect_fail": [
+    "UPLOAD_MTIME"
+  ]
+}

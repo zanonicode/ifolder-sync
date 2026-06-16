@@ -1,0 +1,13 @@
+diff --git a/ifolder_sync/icloud_client.py b/ifolder_sync/icloud_client.py
+index fa6a156..73ade97 100644
+--- a/ifolder_sync/icloud_client.py
++++ b/ifolder_sync/icloud_client.py
+@@ -685,7 +685,7 @@ class ICloudClient:
+ 
+         def _send():
+             with open(src, "rb") as fh:
+-                parent.upload(fh, mtime=mtime)
++                parent.upload(fh)
+ 
+         self._retry(_send)
+ 
