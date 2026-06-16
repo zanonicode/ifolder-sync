@@ -1,0 +1,15 @@
+diff --git a/ifolder_sync/syncer.py b/ifolder_sync/syncer.py
+index 0dfdfe8..7c8b944 100644
+--- a/ifolder_sync/syncer.py
++++ b/ifolder_sync/syncer.py
+@@ -423,8 +423,8 @@ class Syncer:
+                     st = p.stat()
+                 except FileNotFoundError:
+                     continue
+-                except OSError as exc:
+-                    raise LocalScanError(f"local scan failed at {rel}: {exc}") from exc
++                except OSError:
++                    continue  # skip files we cannot stat (was: raise LocalScanError)
+                 key = self._ident(rel)
+                 out[key] = LocalEntry(key, "file", st.st_size, st.st_mtime)
+         return out

@@ -1,0 +1,7 @@
+{
+  "id": "baseline-001-delete-without-base",
+  "kind": "positive",
+  "expect_fail": [
+    "THREE_WAY_BASELINE"
+  ]
+}

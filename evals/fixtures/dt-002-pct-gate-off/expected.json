@@ -1,0 +1,7 @@
+{
+  "id": "dt-002-pct-gate-off",
+  "kind": "positive",
+  "expect_fail": [
+    "DELETE_THRESHOLD"
+  ]
+}

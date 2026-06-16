@@ -1,0 +1,5 @@
+{
+  "id": "neg-004-gte-count",
+  "kind": "negative",
+  "expect_fail": []
+}
