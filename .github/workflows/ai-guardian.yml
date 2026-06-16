@@ -27,6 +27,12 @@ jobs:
       id-token: write            # Vertex WIF OIDC
     steps:
       - uses: actions/checkout@v6        # MUST precede auth (auth writes gha-creds-*.json into the workspace)
+        with:
+          fetch-depth: 0                 # full history so the 3-dot merge-base (origin/main...HEAD) is reachable
+      - name: make origin/main resolvable for the diff
+        # checkout sets up only the PR ref; changed_diff() needs the origin/main ref to
+        # exist or `git diff origin/main...HEAD` returns nothing and the Guardian skips.
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
