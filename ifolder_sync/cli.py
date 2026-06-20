@@ -11,6 +11,7 @@ Subcommands:
   start          run the daemon (foreground); `--background` detaches via launchd
   stop           stop a profile's background (launchd) daemon
   status         show all profiles' state, or one in detail with `--profile`
+  doctor         audit baseline vs local vs remote consistency (read-only)
   logs           tail a profile's daemon log (`-f` to follow, `-n` lines)
   rebaseline     reset a profile's baseline (backup first) after the vault moved/drifted
   purge-trash    empty a profile's local soft-delete trash
@@ -530,6 +531,26 @@ def _print_profile_status(profile: str) -> None:
             print(f"Last sync:     {ts} ({meta['last_stats'] or ''})")
         if meta["last_error"]:
             print(f"Last error:    {meta['last_error']}")
+        if _stats_has_trouble(meta.get("last_stats")) or meta.get("last_error"):
+            # Cheap, network-free pointer: the last pass logged errors/suppressed deletes,
+            # so a read-only `doctor` audit would have something to show.
+            print(
+                f"               {_color('→', '33')} run "
+                f"`ifolder-sync doctor --profile {profile}` to inspect inconsistencies"
+            )
+
+
+def _stats_has_trouble(last_stats: Optional[str]) -> bool:
+    """True when the last pass summary shows counted errors or suppressed deletions — the
+    signal that `doctor` would have something to report. A cheap string scan of the meta
+    field already in hand, so `status` stays a fast liveness peek (no scan, no network)."""
+    if not last_stats:
+        return False
+    for key in ("errors=", "skipped_deletes="):
+        m = re.search(rf"{key}(\d+)", last_stats)
+        if m and int(m.group(1)) > 0:
+            return True
+    return False
 
 
 def cmd_status(args):
@@ -553,6 +574,101 @@ def cmd_status(args):
         if i:
             print()
         _print_profile_status(prof)
+
+
+_DOCTOR_LABELS = {
+    "would-conflict": "Would conflict (both sides changed since baseline)",
+    "drift": "Unsettled / pending (empty-husk wait, adopt-verify)",
+    "planned-delete": "Planned deletions",
+    "planned-download": "Planned downloads (remote -> local)",
+    "planned-upload": "Planned uploads (local -> remote)",
+}
+# Cap each group's listing so a fresh/rebaselined vault (thousands of planned uploads)
+# stays legible; the "... and N more" line keeps the truncation explicit, never silent.
+_DOCTOR_MAX_LIST = 20
+
+
+def _doctor_json(plan, profile: str) -> dict[str, Any]:
+    """Serialize a doctor audit. Shares the `schema` + `rows` envelope with the dashboard's
+    `status.json` (the parity contract) so one reader can consume both."""
+    from .syncstate import make_envelope
+
+    return make_envelope(
+        plan.rows,
+        profile=profile,
+        suppressed_deletes=plan.suppressed_deletes,
+        decide_errors=plan.errors,
+        inconsistencies=len(plan.rows),
+    )
+
+
+def _print_doctor_report(plan, profile: str) -> None:
+    if plan.is_clean:
+        print("No inconsistencies found — baseline, local, and remote agree.")
+        return
+    orphans = plan.orphans
+    if orphans:
+        print(_color(f"Orphan baseline rows ({len(orphans)})", "31;1") + ":")
+        for r in orphans:
+            print(f"  {r.relpath}  ({r.reason})")
+        print(
+            "  -> stale rows present only in the baseline. Recover with "
+            f"`ifolder-sync rebaseline --profile {profile}` (backup + additive re-sync)."
+        )
+    groups: dict[str, list] = {}
+    for r in plan.rows:
+        if r.state != "orphan-baseline":
+            groups.setdefault(r.state, []).append(r)
+    for state, label in _DOCTOR_LABELS.items():
+        rows = groups.get(state)
+        if not rows:
+            continue
+        print(f"\n{label} ({len(rows)}):")
+        for r in rows[:_DOCTOR_MAX_LIST]:
+            suffix = f"  ({r.reason})" if r.reason else ""
+            print(f"  {r.relpath}{suffix}")
+        if len(rows) > _DOCTOR_MAX_LIST:
+            print(f"  ... and {len(rows) - _DOCTOR_MAX_LIST} more")
+    if plan.suppressed_deletes:
+        print(
+            f"\n{plan.suppressed_deletes} deletion(s) would be withheld by the safety "
+            "threshold; review them, then `sync --force-delete` to apply."
+        )
+    if plan.errors:
+        print(
+            f"\n{plan.errors} path(s) cannot be reconciled this pass (live case-collision "
+            "or file/dir kind-conflict); rename one side to resolve."
+        )
+
+
+def cmd_doctor(args):
+    """Read-only audit of baseline vs local vs remote. Runs the engine's decide phase with
+    NO apply (`Syncer.plan()`), so it makes no local, remote, or baseline change."""
+    from .icloud_client import ICloudClient
+    from .state import StateStore
+    from .syncer import Syncer
+
+    profile, cfg = _load_profile(args)
+    json_mode = getattr(args, "json", False)
+    show_progress = sys.stderr.isatty() and not json_mode
+
+    def progress(msg: str) -> None:
+        if show_progress:
+            print(msg, file=sys.stderr)
+
+    client = ICloudClient.from_config(cfg)
+    interactive = not getattr(args, "non_interactive", False) and not json_mode
+    progress(f"Connecting to iCloud as {cfg.apple_id}…")
+    client.connect(interactive=interactive)
+    with StateStore(baseline_path(profile)) as store:
+        store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
+        syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
+        progress("Auditing baseline / local / remote… (read-only; nothing is written)")
+        plan = syncer.plan()
+    if json_mode:
+        print(json.dumps(_doctor_json(plan, profile), indent=2))
+        return
+    _print_doctor_report(plan, profile)
 
 
 def cmd_purge_trash(args):
@@ -899,6 +1015,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pstat.add_argument("--json", action="store_true", help="emit machine-readable JSON to stdout")
     pstat.set_defaults(func=cmd_status)
+
+    pdoc = sub.add_parser(
+        "doctor", help="audit baseline vs local vs remote consistency (read-only)"
+    )
+    pdoc.add_argument(
+        "--json", action="store_true", help="emit the audit as JSON to stdout (schema 1)"
+    )
+    pdoc.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="fail instead of prompting for 2FA (for cron/scripts)",
+    )
+    _add_profile(pdoc)
+    pdoc.set_defaults(func=cmd_doctor)
 
     ppt = sub.add_parser("purge-trash", help="empty a profile's local soft-delete trash")
     ppt.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
