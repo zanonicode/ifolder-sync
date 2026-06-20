@@ -493,6 +493,7 @@ def _profile_status_data(profile: str) -> dict[str, Any]:
         "last_sync": float(last_sync) if last_sync else None,
         "last_stats": meta.get("last_stats"),
         "last_error": meta.get("last_error"),
+        "attention": [r.to_dict() for r in _attention_rows(profile)] if state == "ok" else [],
     }
 
 
@@ -554,6 +555,11 @@ def _stats_has_trouble(last_stats: Optional[str]) -> bool:
 
 
 def cmd_status(args):
+    if getattr(args, "watch", False):
+        # The live frame is single-profile (you watch one vault sync); default when omitted.
+        profile = args.profile or DEFAULT_PROFILE
+        _watch_dashboard(profile, _watch_interval(profile, args))
+        return
     profiles = list_profiles()
     if getattr(args, "json", False):
         # JSON to stdout as a stable contract; human messaging (none here) would go to
@@ -671,6 +677,184 @@ def cmd_doctor(args):
         print(json.dumps(_doctor_json(plan, profile), indent=2))
         return
     _print_doctor_report(plan, profile)
+
+
+# ---------------------------------------------------- live dashboard (status --watch) ---
+_DASH_W = 64  # frame inner width
+_DASH_MAX = 15  # cap the attention list; "... and N more" keeps the truncation explicit
+
+
+def _parse_json_meta(raw: Optional[str]) -> dict:
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _attention_rows(profile: str) -> list:
+    """The engine's persisted 'stuck' registries folded into attention rows. Read-only by
+    construction: opens the baseline with a mode=ro connection and reads meta only
+    (settle_counts husks + unreadable_counts propagation-lag backoffs), never the daemon's
+    writer path. Degrades to [] on any read problem — an observer must never crash the way a
+    writer would."""
+    from .state import StateStore
+    from .syncstate import stuck_rows
+
+    db = baseline_path(profile)
+    if not db.exists():
+        return []
+    try:
+        with StateStore(db, read_only=True) as store:
+            settle = _parse_json_meta(store.get_meta("settle_counts"))
+            unreadable = _parse_json_meta(store.get_meta("unreadable_counts"))
+    except Exception:  # noqa: BLE001 — a bad/locked read must not crash the dashboard
+        return []
+    return stuck_rows(settle, unreadable)
+
+
+def _read_status_snapshot(profile: str) -> Optional[dict[str, Any]]:
+    """Read the daemon's live status.json snapshot (feature 04 Phase 2), or None when absent/
+    unreadable. It carries the in-flight transfer rows the daemon is moving RIGHT NOW plus a
+    header it stamped — so the observer never opens the baseline at all when it is present.
+    Best-effort: a torn/missing/corrupt snapshot just falls back to the meta fold."""
+    from .config import status_path
+
+    path = status_path(profile)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("schema") == 1 else None
+
+
+def _dashboard_view(profile: str) -> dict[str, Any]:
+    """Presentation-free dashboard snapshot: daemon liveness + the last-pass meta + attention
+    rows. Prefers the daemon's live status.json (in-flight transfers) when present, falling
+    back to the read-only meta fold (the persisted stuck set). Both the live renderer and
+    `status --json` read this, so they cannot drift."""
+    from .syncstate import SyncRow
+
+    state, meta = _baseline_meta(profile)
+    last_sync = meta.get("last_sync")
+    daemon = _daemon_status(profile)
+    # Only trust the live snapshot while the daemon is RUNNING: a dead daemon's status.json is
+    # stale, and its in-flight rows ("uploading X") must NOT render as live activity. When
+    # stopped, fall back to the persisted stuck set (the meta fold), which is still valid.
+    snap = _read_status_snapshot(profile) if daemon["running"] else None
+    if snap is not None:
+        # Live path: the daemon's snapshot is authoritative for the rows (in-flight + stuck)
+        # and the header it stamped; the meta read above still supplies the baseline state.
+        ls = snap.get("last_sync")
+        return {
+            "profile": profile,
+            "daemon": daemon,
+            "baseline": state,
+            "last_sync": float(ls) if ls else (float(last_sync) if last_sync else None),
+            "last_stats": snap.get("last_stats") or meta.get("last_stats"),
+            "last_error": snap.get("last_error") or meta.get("last_error"),
+            "attention": [SyncRow.from_dict(r) for r in snap.get("rows", [])],
+        }
+    return {
+        "profile": profile,
+        "daemon": daemon,
+        "baseline": state,
+        "last_sync": float(last_sync) if last_sync else None,
+        "last_stats": meta.get("last_stats"),
+        "last_error": meta.get("last_error"),
+        "attention": _attention_rows(profile) if state == "ok" else [],
+    }
+
+
+def _fmt_age(last_sync: Optional[float], now: float) -> str:
+    if not last_sync:
+        return "never"
+    d = max(0, int(now - last_sync))
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
+
+
+def _truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else "…" + s[-(n - 1) :]
+
+
+def _box(title: str, rows: list[str]) -> list[str]:
+    """Render rows inside a fixed-width Unicode box. Rows are plain (no ANSI) so the visible
+    width is exact; color is applied to the attention lines below the box, where trailing
+    color never breaks alignment."""
+    inner = _DASH_W - 2
+    out = ["┌─ " + title + " " + "─" * max(3, _DASH_W - len(title) - 5) + "┐"]
+    for r in rows:
+        out.append("│ " + r[: inner - 2].ljust(inner - 2) + " │")
+    out.append("└" + "─" * inner + "┘")
+    return out
+
+
+# Per-state label + ANSI color for the activity pane. Covers both the live in-flight
+# transfers (status.json) and the persisted stuck registries (the meta fold).
+_STATE_LABEL = {
+    "uploading": ("↑ uploading", "36"),
+    "downloading": ("↓ downloading", "36"),
+    "deleting-local": ("✗ del local", "31"),
+    "deleting-remote": ("✗ del remote", "31"),
+    "conflict": ("⚠ conflict", "31"),
+    "error": ("⚠ error", "31"),
+    "deferred-settle": ("settling", "33"),
+    "pending-unreadable": ("pending", "33"),
+}
+
+
+def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
+    daemon = view["daemon"]
+    dstate = f"running (pid {daemon['pid']})" if daemon["running"] else "stopped"
+    header = [
+        f"{'Daemon:   ' + dstate:<34}Last sync: {_fmt_age(view['last_sync'], now)}",
+        f"Stats:    {view['last_stats'] or '—'}",
+    ]
+    if view["last_error"]:
+        header.append(f"Error:    {view['last_error']}")
+    lines = _box(f"ifolder-sync · {view['profile']}", header)
+    lines.append("")
+
+    rows = view["attention"]
+    if not rows:
+        lines.append("  " + _color("✓ all synced — nothing in flight or stuck", "32"))
+    else:
+        lines.append(f"  Sync activity ({len(rows)}):")
+        for r in rows[:_DASH_MAX]:
+            n = f"{r.passes_stuck}×" if r.passes_stuck else ""
+            text, col = _STATE_LABEL.get(r.state, (r.state, "0"))
+            lines.append(f"  {n:>4}  {_truncate(r.relpath, 42):<42} {_color(text, col)}")
+        if len(rows) > _DASH_MAX:
+            lines.append(f"  … and {len(rows) - _DASH_MAX} more")
+    return "\n".join(lines)
+
+
+def _watch_dashboard(profile: str, interval: float) -> None:
+    """Live loop: redraw the dashboard every `interval` seconds until Ctrl-C (main turns the
+    KeyboardInterrupt into a clean exit 130, mirroring `logs -f`). Read-only and network-free
+    — it polls the daemon's persisted state, holds no engine handle, never acquires the lock."""
+    while True:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[2J\033[H")  # clear + home, so the frame redraws in place
+        print(_render_dashboard_frame(_dashboard_view(profile), time.time()))
+        print(f"\n  refreshing every {interval:g}s · Ctrl-C to exit")
+        time.sleep(interval)
+
+
+def _watch_interval(profile: str, args) -> float:
+    override = getattr(args, "interval", None)
+    if override is not None:
+        return max(0.2, float(override))
+    try:
+        return max(0.2, float(Config.load(config_path(profile)).dashboard_interval_seconds))
+    except Exception:  # noqa: BLE001 — no/invalid config: fall back to the default cadence
+        return 2.0
 
 
 def cmd_purge_trash(args):
@@ -1016,6 +1200,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="show one profile in detail; omit to show all profiles",
     )
     pstat.add_argument("--json", action="store_true", help="emit machine-readable JSON to stdout")
+    pstat.add_argument(
+        "--watch",
+        action="store_true",
+        help="live dashboard: redraw daemon state + what's stuck until Ctrl-C",
+    )
+    pstat.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="seconds between redraws in --watch (default: dashboard_interval_seconds)",
+    )
     pstat.set_defaults(func=cmd_status)
 
     pdoc = sub.add_parser(

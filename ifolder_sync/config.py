@@ -129,6 +129,13 @@ def lock_path(profile: str = DEFAULT_PROFILE) -> Path:
     return state_dir(profile) / "daemon.lock"
 
 
+def status_path(profile: str = DEFAULT_PROFILE) -> Path:
+    """The daemon-written live snapshot the dashboard polls (feature 04). A separate file
+    from baseline.sqlite3 — zero lock/WAL contention; a torn write lands as a `.part` and is
+    engine-hard-ignored, so it can never sync."""
+    return state_dir(profile) / "status.json"
+
+
 def log_file(profile: str = DEFAULT_PROFILE) -> Path:
     """The daemon's rotating log, under the macOS-convention ~/Library/Logs so it is
     discoverable in Console.app. No mkdir side effect (read-only callers like `status`
@@ -278,6 +285,14 @@ class Config:
     max_file_size_mb: int = 0
     delete_threshold_pct: int = 50
     delete_threshold_count: int = 100
+    # Live dashboard (`status --watch`, feature 04): how often the observer re-polls the
+    # daemon's status snapshot + meta and redraws. Purely view-side; no engine effect.
+    dashboard_interval_seconds: float = 2.0
+    # The daemon writes a live status.json snapshot (the in-flight transfers `status --watch`
+    # shows). False disables ALL producer-side dashboard work (zero overhead). Snapshot
+    # flushes coalesce to at most one per inflight_min_write_interval_ms.
+    inflight_surface: bool = True
+    inflight_min_write_interval_ms: int = 200
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
     @staticmethod
@@ -324,13 +339,14 @@ class Config:
             "settle_max_passes",
             "unreadable_max_passes",
             "max_file_size_mb",
+            "inflight_min_write_interval_ms",
         ):
             value = getattr(self, name)
             # bool is a subclass of int, so plain isinstance(..., int) would accept
             # `"walk_workers": true` from JSON; reject it explicitly.
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(f"`{name}` must be an integer.")
-        for name in ("retry_base_delay", "debounce_seconds"):
+        for name in ("retry_base_delay", "debounce_seconds", "dashboard_interval_seconds"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"`{name}` must be a number.")

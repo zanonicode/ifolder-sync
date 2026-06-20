@@ -77,7 +77,9 @@ class SyncRow:
 
     relpath: str
     state: State
-    op: "Op"
+    # The engine Op that produced this row (doctor decide rows). None for rows folded from a
+    # persisted registry (the dashboard's settle/unreadable attention rows have no decided op).
+    op: Optional["Op"] = None
     kind: Kind = "file"
     passes_stuck: Optional[int] = None
     reason: Optional[str] = None
@@ -87,8 +89,8 @@ class SyncRow:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         # Op is a str-Enum; str() pins it to the wire value ("upload") regardless of the
-        # Enum __str__ quirk across Python versions, so a reader gets a plain string.
-        d["op"] = str(self.op)
+        # Enum __str__ quirk across Python versions, so a reader gets a plain string (or None).
+        d["op"] = str(self.op) if self.op is not None else None
         return d
 
     @classmethod
@@ -128,3 +130,38 @@ def make_envelope(rows: list[SyncRow], **extra: Any) -> dict[str, Any]:
     env: dict[str, Any] = {"schema": SCHEMA, "rows": [r.to_dict() for r in rows]}
     env.update(extra)
     return env
+
+
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def stuck_rows(settle_counts: dict, unreadable_counts: dict) -> list[SyncRow]:
+    """The engine's persisted 'stuck' registries folded into attention rows, most-stuck
+    first. Pure (no IO): shared by the dashboard reader and the daemon's status.json writer
+    so the 'what's stuck' set is computed exactly one way. Registry rows carry no decided Op."""
+    rows: list[SyncRow] = []
+    for rel, n in settle_counts.items():
+        rows.append(
+            SyncRow(
+                rel,
+                "deferred-settle",
+                passes_stuck=_as_int(n),
+                reason="empty/unsettled remote (waiting for the other device)",
+            )
+        )
+    for rel, entry in unreadable_counts.items():
+        cnt = _as_int(entry[3]) if isinstance(entry, list) and len(entry) > 3 else None
+        rows.append(
+            SyncRow(
+                rel,
+                "pending-unreadable",
+                passes_stuck=cnt,
+                reason="remote body not yet materialized (propagation lag)",
+            )
+        )
+    rows.sort(key=lambda r: (-(r.passes_stuck or 0), r.relpath))
+    return rows
