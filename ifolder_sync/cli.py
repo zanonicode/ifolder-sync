@@ -872,6 +872,7 @@ def _box(title: str, rows: list[str]) -> list[str]:
 # Per-state label + ANSI color for the activity pane. Covers both the live in-flight
 # transfers (status.json) and the persisted stuck registries (the meta fold).
 _STATE_LABEL = {
+    "queued": ("• queued", "90"),
     "uploading": ("↑ uploading", "36"),
     "downloading": ("↓ downloading", "36"),
     "deleting-local": ("✗ del local", "31"),
@@ -881,6 +882,25 @@ _STATE_LABEL = {
     "deferred-settle": ("settling", "33"),
     "pending-unreadable": ("pending", "33"),
 }
+
+# Render order in the activity/files table: active transfers on top, then the queue, then the
+# persisted stuck states. A path's queue position is otherwise dict-insertion (emit) order.
+_STATE_ORDER = {
+    "uploading": 0,
+    "downloading": 0,
+    "deleting-local": 0,
+    "deleting-remote": 0,
+    "conflict": 0,
+    "error": 1,
+    "deferred-settle": 2,
+    "pending-unreadable": 2,
+    "queued": 3,
+}
+
+
+def _ordered_rows(rows: list) -> list:
+    """Stable sort for the files table: active first, queue last (ties keep arrival order)."""
+    return sorted(rows, key=lambda r: _STATE_ORDER.get(r.state, 5))
 
 
 _RECENT_TTL = 6.0  # seconds a just-completed file lingers on the "recently synced" rail
@@ -983,8 +1003,11 @@ def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
     if not rows:
         lines.append("  " + _color("✓ all synced — nothing in flight or stuck", "32"))
     else:
-        lines.append(f"  Sync activity ({len(rows)}):")
-        for r in rows[:_DASH_MAX]:
+        queued = sum(1 for r in rows if r.state == "queued")
+        label = f"  Sync activity ({len(rows) - queued} active"
+        label += f", {queued} queued" if queued else ""
+        lines.append(label + "):")
+        for r in _ordered_rows(rows)[:_DASH_MAX]:
             n = f"{r.passes_stuck}×" if r.passes_stuck else ""
             text, col = _STATE_LABEL.get(r.state, (r.state, "0"))
             lines.append(f"  {n:>4}  {_truncate(r.relpath, 42):<42} {_color(text, col)}")
@@ -1009,33 +1032,61 @@ def _render_multiprofile_frame(profiles: list[str], now: float) -> str:
     return "\n".join(_box("ifolder-sync · all profiles", body))
 
 
+_RICH_STATE_STYLE = {
+    "queued": "dim",
+    "uploading": "cyan",
+    "downloading": "cyan",
+    "deleting-local": "red",
+    "deleting-remote": "red",
+    "conflict": "red",
+    "error": "red",
+    "deferred-settle": "yellow",
+    "pending-unreadable": "yellow",
+}
+
+
 def _render_rich(view: dict[str, Any], now: float) -> Optional[str]:
-    """A richer frame when the optional `rich` extra is installed (truecolor + real box).
-    Returns None when rich is absent so the caller falls back to the ANSI frame — the
-    established lazy optional-dependency pattern (no base-dep add). Renders the SAME signal set
-    as the ANSI frame (error row + the shared extra lines) so installing `[dashboard]` can never
-    hide the safety banner / flapping / recently-synced that the plain frame shows."""
+    """A richer frame when the optional `rich` extra is installed (truecolor + real boxes).
+    Returns None when rich is absent so the caller falls back to the ANSI frame. TWO frames: a
+    header panel (daemon/stats/error) and, below it, a separate files table (the live queue +
+    in-flight transfers). Renders the SAME signal set as the ANSI frame (the shared extra lines)
+    so the `[dashboard]` extra can never hide a signal the plain frame shows."""
     try:
         from rich.console import Console
+        from rich.panel import Panel
         from rich.table import Table
     except ImportError:
         return None
     d = view["daemon"]
     dstate = f"[green]running[/] (pid {d['pid']})" if d["running"] else "[red]stopped[/]"
-    table = Table(title=f"ifolder-sync · {view['profile']}", expand=True)
-    table.add_column("file")
-    table.add_column("state", justify="right")
-    table.add_row(f"Daemon: {dstate}", f"last sync {_fmt_age(view['last_sync'], now)}")
-    table.add_row(f"Stats:  {view['last_stats'] or '—'}", "")
+    head = [
+        f"Daemon: {dstate}    last sync {_fmt_age(view['last_sync'], now)}",
+        f"Stats:  {view['last_stats'] or '—'}",
+    ]
     if view.get("last_error"):
-        table.add_row(f"[red]Error:[/] {view['last_error']}", "")
-    for r in view["attention"][:_DASH_MAX]:
+        head.append(f"[red]Error:[/]  {view['last_error']}")
+    header = Panel("\n".join(head), title=f"ifolder-sync · {view['profile']}", expand=True)
+
+    rows = view["attention"]
+    queued = sum(1 for r in rows if r.state == "queued")
+    title = f"syncing — {len(rows) - queued} active" + (f", {queued} queued" if queued else "")
+    files = Table(title=title, expand=True)
+    files.add_column("file")
+    files.add_column("state", justify="right")
+    for r in _ordered_rows(rows)[:_DASH_MAX]:
         text, _ = _STATE_LABEL.get(r.state, (r.state, "0"))
+        style = _RICH_STATE_STYLE.get(r.state, "")
         n = f"{r.passes_stuck}× " if r.passes_stuck else ""
-        table.add_row(_truncate(r.relpath, 50), f"{n}{text}")
+        files.add_row(_truncate(r.relpath, 50), f"[{style}]{n}{text}[/]" if style else f"{n}{text}")
+    if not rows:
+        files.add_row("[green]✓ all synced — nothing in flight or stuck[/]", "")
+    if len(rows) > _DASH_MAX:
+        files.add_row(f"… and {len(rows) - _DASH_MAX} more", "")
+
     console = Console(force_terminal=True)
     with console.capture() as cap:
-        console.print(table)
+        console.print(header)
+        console.print(files)
     # Parity: the supplementary signals are appended from the shared helper, never re-derived.
     extras = _dashboard_extra_lines(view)
     return cap.get() + ("\n".join(extras) + "\n" if extras else "")
@@ -1081,7 +1132,7 @@ def _watch_interval(profile: str, args) -> float:
     try:
         return max(0.2, float(Config.load(config_path(profile)).dashboard_interval_seconds))
     except Exception:  # noqa: BLE001 — no/invalid config: fall back to the default cadence
-        return 2.0
+        return 1.0
 
 
 def cmd_purge_trash(args):

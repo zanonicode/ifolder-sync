@@ -18,6 +18,7 @@ from ifolder_sync.cli import (
     _dashboard_banner,
     _dashboard_view,
     _fmt_age,
+    _ordered_rows,
     _profile_status_data,
     _render_dashboard_frame,
     _render_multiprofile_frame,
@@ -128,7 +129,7 @@ def test_render_frame_empty_then_populated():
 
     view["attention"] = [SyncRow("notes/big.md", "deferred-settle", passes_stuck=3)]
     out = _render_dashboard_frame(view, 0.0)
-    assert "Sync activity (1)" in out
+    assert "Sync activity (1 active)" in out
     assert "notes/big.md" in out and "settling" in out
 
 
@@ -159,7 +160,7 @@ def test_watch_interval_override_floor_and_config(tmp_path, monkeypatch):
     sandbox_home(tmp_path, monkeypatch)
     assert _watch_interval("default", argparse.Namespace(interval=0.5)) == 0.5
     assert _watch_interval("default", argparse.Namespace(interval=0.01)) == 0.2  # floor
-    assert _watch_interval("default", argparse.Namespace(interval=None)) == 2.0  # no config
+    assert _watch_interval("default", argparse.Namespace(interval=None)) == 1.0  # default 1s
 
     Config(
         apple_id="x@y.com",
@@ -312,3 +313,50 @@ def test_render_rich_reaches_parity_with_ansi():
     assert out is not None  # rich is in [dev]
     for signal in ("big.md", "auth lapsed", "suppressed", "loop.md", "done.md"):
         assert signal in out, f"rich frame dropped {signal!r} — parity regression"
+
+
+def test_ordered_rows_active_before_queue():
+    rows = [
+        SyncRow("q.md", "queued"),
+        SyncRow("u.md", "uploading"),
+        SyncRow("p.md", "pending-unreadable"),
+    ]
+    ordered = [r.relpath for r in _ordered_rows(rows)]
+    assert ordered.index("u.md") < ordered.index("p.md") < ordered.index("q.md")
+
+
+def test_render_rich_two_frames_show_queue():
+    """The rich render is TWO frames (header panel + a separate files table) and the files
+    table lists the full queue, not just the in-flight file."""
+    view = {
+        "profile": "default",
+        "daemon": {"running": True, "pid": 1},
+        "last_sync": 0.0,
+        "last_stats": "up=1 down=0 errors=0",
+        "last_error": None,
+        "attention": [
+            SyncRow("a.md", "uploading"),
+            SyncRow("b.md", "queued"),
+            SyncRow("c.md", "queued"),
+        ],
+    }
+    out = _render_rich(view, 0.0)
+    assert out is not None
+    assert "ifolder-sync · default" in out  # header panel title
+    assert "syncing" in out and "1 active, 2 queued" in out  # files-table title + queue count
+    assert "a.md" in out and "b.md" in out and "c.md" in out  # the whole queue is listed
+
+
+def test_render_ansi_frame_shows_queue_count():
+    view = {
+        "profile": "p",
+        "daemon": {"running": True, "pid": 1},
+        "baseline": "ok",
+        "last_sync": 0.0,
+        "last_stats": "up=1",
+        "last_error": None,
+        "attention": [SyncRow("a.md", "uploading"), SyncRow("b.md", "queued")],
+    }
+    out = _render_dashboard_frame(view, 0.0)
+    assert "1 active, 1 queued" in out
+    assert out.index("a.md") < out.index("b.md")  # active before queued

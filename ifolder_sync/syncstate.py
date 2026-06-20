@@ -28,6 +28,7 @@ SCHEMA = 1
 # Every state a path can be reported in. The first block is live apply states (the
 # dashboard, feature 04); the second is decide-only states (doctor, feature 05).
 State = Literal[
+    "queued",
     "uploading",
     "downloading",
     "deleting-local",
