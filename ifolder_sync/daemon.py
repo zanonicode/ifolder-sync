@@ -144,7 +144,6 @@ class Daemon:
                 self._apply_passes += 1
             self._inflight_pass_started()
             stats = self.syncer.sync_once(defer_deletes=defer_deletes)
-            self._inflight_pass_finished()
             # A pass that completed proves the session is healthy: reset the reconnect
             # budget and clear any stale error so `status` reflects the recovery, not a ghost.
             self._relapse_count = 0
@@ -239,6 +238,10 @@ class Daemon:
                 log.exception("sync failed (%s): %s", reason, exc)
                 self._set_last_error(str(exc))
         finally:
+            # Rebuild the live surface to the authoritative stuck set on EVERY pass exit —
+            # not just success — so a pass that raised mid-apply never strands phantom
+            # "uploading X" rows that a still-running daemon would render as live.
+            self._inflight_pass_finished()
             self._sync_lock.release()
 
     # ----------------------------------------------------- live dashboard surface ---

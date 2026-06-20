@@ -1,14 +1,17 @@
 """Live in-flight surface (feature 04 Phase 2): the engine emits, the atomic status.json
 flush, and the observer's stale-snapshot gating.
 
-The load-bearing safety property — the engine is byte-for-byte unchanged when on_event is
-None — is covered by the whole existing suite passing; here we exercise the producer with an
-observer wired in, plus the surface and reader in isolation.
+The load-bearing safety property — with on_event=None the engine is OUTCOME-identical (no
+observable side effect, no extra IO) — is pinned directly here (test_no_observer_is_inert)
+and backstopped by the whole existing suite passing. A throwing observer is proven unable to
+break or distort a pass. Emit-on-error and emit-on-pending-unreadable are driven through real
+failing/unreadable transfers, not hand-built rows.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 
 from ifolder_sync.cli import _dashboard_view, _read_status_snapshot
 from ifolder_sync.config import Config, baseline_path, status_path
@@ -17,7 +20,7 @@ from ifolder_sync.state import StateStore
 from ifolder_sync.syncer import Op, Syncer
 from ifolder_sync.syncstate import SyncEvent, SyncRow
 
-from .helpers import PERMISSIVE_THRESHOLDS, write_file
+from .helpers import FAR, PERMISSIVE_THRESHOLDS, FakeICloud, sandbox_home, write_file
 
 
 def _syncer_with_observer(tmp_path, fake, local_dir, events):
@@ -183,4 +186,166 @@ def test_disabled_surface_writes_nothing(tmp_path, monkeypatch, fake):
     d._inflight_pass_started()
     d._inflight_pass_finished()
     assert not status_path("default").exists()  # nothing written
+    d.store.close()
+
+
+# --------------------------------------------- the best-effort safety contract ---
+def test_throwing_observer_does_not_break_pass(tmp_path, fake, local_dir):
+    """The CORE guarantee: an observer that raises on every event can never abort or distort
+    a sync pass — the upload still lands and errors stays 0."""
+
+    def boom(_event):
+        raise RuntimeError("viewer exploded")
+
+    cfg = Config(apple_id="x@y.com", local_folder=str(local_dir), **PERMISSIVE_THRESHOLDS)
+    store = StateStore(tmp_path / "s.sqlite3")
+    syncer = Syncer(cfg, fake, store, trash_dir=tmp_path / "trash", on_event=boom)
+    write_file(local_dir, "a.txt", b"hi", mtime=1000)
+
+    stats = syncer.sync_once()
+
+    assert stats.uploaded == 1 and stats.errors == 0
+    assert fake.files["a.txt"]["content"] == b"hi"  # the upload actually landed
+    store.close()
+
+
+def test_no_observer_is_inert(tmp_path):
+    """on_event=None ⇒ outcome-identical: a no-op observer must add ZERO network/stat calls
+    and produce the same stats as no observer at all."""
+
+    def run(on_event, tag):
+        local = tmp_path / f"local-{tag}"
+        local.mkdir()
+        write_file(local, "a.md", b"x", mtime=1000)
+        fk = FakeICloud()
+        fk.put("b.md", b"y", mtime=2000)
+        cfg = Config(apple_id="x@y.com", local_folder=str(local), **PERMISSIVE_THRESHOLDS)
+        store = StateStore(tmp_path / f"{tag}.sqlite3")
+        st = Syncer(cfg, fk, store, trash_dir=tmp_path / f"tr-{tag}", on_event=on_event).sync_once()
+        store.close()
+        return dict(fk.calls), st.summary()
+
+    none_calls, none_stats = run(None, "none")
+    noop_calls, noop_stats = run(lambda _e: None, "noop")
+    assert none_calls == noop_calls
+    assert none_stats == noop_stats
+
+
+def test_engine_emits_error_on_failed_transfer(tmp_path, fake, local_dir, monkeypatch):
+    """A transfer that raises emits 'error' (not 'done') — the dashboard never shows a failed
+    upload as completed."""
+    events: list = []
+    syncer, store = _syncer_with_observer(tmp_path, fake, local_dir, events)
+    write_file(local_dir, "boom.md", b"data", mtime=1000)
+    monkeypatch.setattr(fake, "upload", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+
+    stats = syncer.sync_once()
+
+    states = [(e.relpath, e.state) for e in events if e.relpath == "boom.md"]
+    assert ("boom.md", "uploading") in states
+    assert ("boom.md", "error") in states
+    assert ("boom.md", "done") not in states
+    assert stats.errors == 1
+    store.close()
+
+
+def test_engine_emits_pending_unreadable_through_sync_once(tmp_path, fake, local_dir):
+    """A publish-before-content lag (UnreadableRemoteError) emits 'pending-unreadable' (not
+    'done'), ties to the defer-not-clobber invariant: pending counted, errors 0."""
+    events: list = []
+    syncer, store = _syncer_with_observer(tmp_path, fake, local_dir, events)
+    fake.put_unreadable("lag.md", size=4, mtime=FAR)
+
+    stats = syncer.sync_once()
+
+    states = [(e.relpath, e.state) for e in events if e.relpath == "lag.md"]
+    assert ("lag.md", "downloading") in states
+    assert ("lag.md", "pending-unreadable") in states
+    assert ("lag.md", "done") not in states
+    assert stats.pending >= 1 and stats.errors == 0
+    store.close()
+
+
+def test_engine_emits_coalesced_tree_delete(tmp_path, fake, local_dir):
+    """A coalesced remote subtree delete (the folder-move case) is visible as a single
+    in-flight 'deleting-remote' row for the root, closed with 'done'."""
+    events: list = []
+    syncer, store = _syncer_with_observer(tmp_path, fake, local_dir, events)
+    write_file(local_dir, "Folder/a.md", b"a", mtime=1000)
+    write_file(local_dir, "Folder/b.md", b"b", mtime=1000)
+    syncer.sync_once()  # upload the subtree + establish the baseline
+    shutil.rmtree(local_dir / "Folder")  # delete the whole subtree locally
+    events.clear()
+
+    syncer.sync_once()  # coalesced remote tree delete
+
+    states = [(e.relpath, e.state) for e in events]
+    assert ("Folder", "deleting-remote") in states
+    assert ("Folder", "done") in states
+    store.close()
+
+
+# ---------------------------------------------------- the atomic-flush edges ---
+def test_flush_atomic_leaves_no_part(tmp_path):
+    surf = InflightSurface(tmp_path / "status.json", min_write_interval_ms=0)
+    surf.pass_started(pid=1)
+    surf.record(SyncEvent(1.0, 1, "a.txt", Op.UPLOAD, "uploading", "file"))
+    assert (tmp_path / "status.json").exists()
+    assert not (tmp_path / "status.json.part").exists()  # os.replace consumed the temp
+
+
+def test_flush_failure_is_swallowed(tmp_path, monkeypatch):
+    """A flush that fails (disk full / read-only) must never raise into the engine."""
+    surf = InflightSurface(tmp_path / "status.json", min_write_interval_ms=0)
+    monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    surf.record(SyncEvent(1.0, 1, "a.txt", Op.UPLOAD, "uploading", "file"))  # must not raise
+    monkeypatch.undo()
+    surf.record(SyncEvent(2.0, 1, "a.txt", Op.UPLOAD, "done", "file"))  # surface still usable
+    assert (tmp_path / "status.json").exists()
+
+
+# ----------------------------------------------- the daemon pass bracketing ---
+def _make_daemon(tmp_path, monkeypatch, fake, **cfg_kw):
+    sandbox_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "ifolder_sync.icloud_client.ICloudClient.from_config",
+        classmethod(lambda cls, c: fake),
+    )
+    from ifolder_sync.daemon import Daemon
+
+    local = tmp_path / "vault"
+    local.mkdir(exist_ok=True)
+    cfg = Config(apple_id="x@y.com", local_folder=str(local), **{**PERMISSIVE_THRESHOLDS, **cfg_kw})
+    return Daemon(cfg, "default"), local
+
+
+def test_daemon_brackets_real_pass(tmp_path, monkeypatch, fake):
+    """End-to-end through _run_sync: a transferred file is cleared from the live surface at
+    pass end (pass_finished), proving the producer wiring, not just the helpers in isolation."""
+    d, local = _make_daemon(tmp_path, monkeypatch, fake)
+    write_file(local, "a.md", b"hi", mtime=1000)
+
+    d._run_sync("test")
+
+    data = json.loads(status_path("default").read_text())
+    assert all(r["relpath"] != "a.md" for r in data["rows"])  # cleared by pass_finished
+    assert fake.files["a.md"]["content"] == b"hi"  # the pass really transferred it
+    d.store.close()
+
+
+def test_pass_finished_runs_on_failure(tmp_path, monkeypatch, fake):
+    """The finally fix: a pass that raises AFTER flushing an in-flight row must not strand it —
+    the finally's pass_finished rebuilds the surface to the (empty) stuck set."""
+    d, local = _make_daemon(tmp_path, monkeypatch, fake)
+
+    def boom(**_k):
+        d.inflight.record(SyncEvent(1.0, 1, "big.md", Op.UPLOAD, "uploading", "file"))
+        raise RuntimeError("mid-apply boom")
+
+    monkeypatch.setattr(d.syncer, "sync_once", boom)
+
+    d._run_sync("test")  # RuntimeError is handled; finally must clean the surface
+
+    data = json.loads(status_path("default").read_text())
+    assert all(r["relpath"] != "big.md" for r in data["rows"])  # stale in-flight cleared
     d.store.close()

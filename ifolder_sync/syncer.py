@@ -870,15 +870,27 @@ class Syncer:
         log.info("DEL_REMOTE %s/ (whole subtree, %d items, one call)", root, len(items) + 1)
         if dry_run:
             return
+        # A coalesced subtree delete bypasses _apply_file, so without this it would be the one
+        # consequential action invisible to the live dashboard (the operator's folder-move
+        # case: mass delete + re-upload). Emit one in-flight row for the root (best-effort).
+        self._emit(
+            root,
+            Op.RMDIR_REMOTE,
+            "deleting-remote",
+            kind="dir",
+            reason=f"{len(items) + 1} items (whole subtree)",
+        )
         try:
             self.client.delete(root)
         except Exception as exc:  # noqa: BLE001
             log.error("remote tree delete failed %s: %s", root, exc)
             stats.errors += 1
+            self._emit(root, Op.RMDIR_REMOTE, "error", kind="dir", reason=str(exc)[:80])
             return
         self.store.delete(root)
         for p in items:
             self.store.delete(p)
+        self._emit(root, Op.RMDIR_REMOTE, "done", kind="dir")
 
     def _migrate_baseline_nfc(
         self, baseline: dict[str, BaselineEntry], dry_run: bool
