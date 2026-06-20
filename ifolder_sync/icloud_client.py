@@ -420,6 +420,20 @@ class ICloudClient:
                 node.mkdir(part)
                 node = self._fresh_child(node, part)
 
+    def remote_root_exists(self) -> bool:
+        """Read-only probe: does the configured remote_folder resolve on the Drive? Used by
+        the `doctor` audit to tell a genuinely-absent root (abort) from an empty one — the
+        real walk() lists a missing root as an EMPTY tree, which would read as mass deletion.
+        The whole-Drive root (empty remote_folder) always exists. Creates nothing (unlike
+        ensure_remote_root)."""
+        if not self.remote_root:
+            return True
+        try:
+            self._root_node()
+            return True
+        except (KeyError, IndexError):
+            return False
+
     @staticmethod
     def _child(node, name: str):
         """Resolve a child by name, NFC-insensitively. iCloud usually stores NFC, but a

@@ -43,6 +43,7 @@ from .config import trash_dir as default_trash_dir
 from .errors import UnreadableRemoteError
 from .icloud_client import PART_SUFFIX, RemoteEntry
 from .state import BaselineEntry, StateStore
+from .syncstate import Kind, Plan, State, SyncRow
 from .trash import trash_local
 
 log = logging.getLogger("ifolder-sync.syncer")
@@ -61,6 +62,7 @@ class SyncClient(Protocol):
 
     def refresh(self) -> None: ...
     def ensure_remote_root(self) -> None: ...
+    def remote_root_exists(self) -> bool: ...
     def walk(
         self, is_ignored: Optional[Callable[[str], bool]] = None
     ) -> dict[str, RemoteEntry]: ...
@@ -141,6 +143,44 @@ _FILE_DECISION_OPS = frozenset(
 # each attempt writing a .part that re-triggers the local watcher — a tight retry loop.
 DOWNLOAD_MAX_FAILS = 3
 
+# decide-phase Op -> doctor report state (feature 05). The in-sync no-ops (RECORD,
+# RECORD_DIR, LEAVE_DIR, MKDIR/RMDIR's settled siblings) are intentionally ABSENT: the
+# report shows only inconsistencies. DROP_BASELINE/DROP_BASELINE_DIR are the orphan-ghost
+# class. Kept as data so `doctor` classification never re-implements decide semantics.
+_FILE_PLAN_STATE: dict[Op, State] = {
+    Op.UPLOAD: "planned-upload",
+    Op.RESCUE_UPLOAD: "planned-upload",
+    Op.DOWNLOAD: "planned-download",
+    Op.RESCUE_DOWNLOAD: "planned-download",
+    Op.DELETE_LOCAL: "planned-delete",
+    Op.DELETE_REMOTE: "planned-delete",
+    Op.CONFLICT: "would-conflict",
+    Op.SETTLE_WAIT: "drift",
+    Op.VERIFY_ADOPT: "drift",
+    Op.DROP_BASELINE: "orphan-baseline",
+}
+_DIR_PLAN_STATE: dict[Op, State] = {
+    Op.MKDIR_REMOTE: "planned-upload",
+    Op.MKDIR_LOCAL: "planned-download",
+}
+_CLEANUP_PLAN_STATE: dict[Op, State] = {
+    Op.RMDIR_REMOTE: "planned-delete",
+    Op.RMDIR_LOCAL: "planned-delete",
+    Op.DROP_BASELINE_DIR: "orphan-baseline",
+}
+# Render order for the doctor report: ghosts first, then unresolvable, then drift, then the
+# routine planned transfers. Attention-first, exactly like the dashboard's fold.
+_ATTENTION_ORDER: dict[State, int] = {
+    "orphan-baseline": 0,
+    "would-conflict": 1,
+    "collision": 1,
+    "kind-conflict": 1,
+    "drift": 2,
+    "planned-delete": 3,
+    "planned-download": 4,
+    "planned-upload": 5,
+}
+
 
 def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
@@ -149,6 +189,13 @@ def _nfc(s: str) -> str:
 class LocalScanError(RuntimeError):
     """The local snapshot is unreliable (permission denied, missing root). The pass
     must abort: a partial local tree is indistinguishable from mass deletion."""
+
+
+class RemoteScanError(RuntimeError):
+    """The remote snapshot is unreliable for a read-only audit: the configured remote root
+    is absent, so an empty listing would read as mass deletion. `doctor` aborts rather than
+    report a phantom 'everything deleted' (the remote counterpart of the local walk guard).
+    `sync_once` never hits this — it `ensure_remote_root()`s the root first."""
 
 
 class VaultIdentityError(RuntimeError):
@@ -218,6 +265,23 @@ class SyncStats:
             f"conflicts={self.conflicts} skipped_deletes={self.skipped_deletes} "
             f"deferred={self.deferred_deletes} pending={self.pending} errors={self.errors}"
         )
+
+
+@dataclass
+class _DecidePass:
+    """Everything the decide phase produces, before any apply. Computed once by
+    `_decide_pass` and consumed two ways: `sync_once` applies it; `plan()` classifies it
+    into a read-only `Plan` (doctor). Sharing this struct keeps the two paths on ONE
+    three-way diff — `doctor` can never drift from what a real pass would do."""
+
+    stats: SyncStats
+    local: dict[str, LocalEntry]
+    remote: dict[str, RemoteEntry]
+    baseline: dict[str, BaselineEntry]
+    dir_actions: list[tuple[str, Op]]
+    file_actions: list[tuple[str, Op]]
+    cleanup_actions: list[tuple[str, Optional[Op]]]
+    suppress_deletes: bool
 
 
 class Syncer:
@@ -463,16 +527,30 @@ class Syncer:
         b = baseline.get(relpath)
         return bool(b and b.kind == "dir")
 
-    # ------------------------------------------------------------ main pass ---
-    def sync_once(
+    # ------------------------------------------------------ scan + decide ---
+    def _decide_pass(
         self,
-        dry_run: bool = False,
-        force_delete: bool = False,
-        defer_deletes: bool = False,
-    ) -> SyncStats:
+        dry_run: bool,
+        force_delete: bool,
+        defer_deletes: bool,
+        ensure_root: bool = True,
+    ) -> _DecidePass:
+        """Scan both sides and decide an action per path — the whole read-only half of a
+        pass, with NO apply. `sync_once` applies the result; `plan()` (doctor) classifies it
+        without applying. `ensure_root=False` (doctor) skips the remote-root mkdir so a
+        read-only audit makes no remote change; a genuinely-absent remote root is then
+        detected explicitly (`remote_root_exists`) and aborts the pass with RemoteScanError,
+        because the real client lists a missing root as an EMPTY tree (not an error) — which
+        would otherwise read as 'all deleted' and steer the user toward `--force-delete`."""
         stats = SyncStats()
         self.client.refresh()
-        self.client.ensure_remote_root()
+        if ensure_root:
+            self.client.ensure_remote_root()
+        elif not self.client.remote_root_exists():
+            raise RemoteScanError(
+                f"remote folder {self.cfg.remote_folder!r} not found on iCloud — run a sync "
+                "first or check remote_folder; refusing to report a phantom 'all deleted'"
+            )
 
         baseline = self.store.all()
         self._preflight_local(baseline, dry_run)  # raises -> pass aborts, zero actions
@@ -520,6 +598,30 @@ class Syncer:
         suppress_deletes = self._suppress_deletes(
             file_actions, defer_deletes, force_delete, baseline, stats
         )
+        return _DecidePass(
+            stats,
+            local,
+            remote,
+            baseline,
+            dir_actions,
+            file_actions,
+            cleanup_actions,
+            suppress_deletes,
+        )
+
+    # ------------------------------------------------------------ main pass ---
+    def sync_once(
+        self,
+        dry_run: bool = False,
+        force_delete: bool = False,
+        defer_deletes: bool = False,
+    ) -> SyncStats:
+        dp = self._decide_pass(dry_run, force_delete, defer_deletes)
+        stats = dp.stats
+        local, remote = dp.local, dp.remote
+        dir_actions, file_actions = dp.dir_actions, dp.file_actions
+        cleanup_actions = dp.cleanup_actions
+        suppress_deletes = dp.suppress_deletes
 
         tree_roots: list[str] = []
         covered: set[str] = set()
@@ -567,6 +669,57 @@ class Syncer:
                 self.store.set_meta("last_sync", str(time.time()))
             self.store.set_meta("last_stats", stats.summary())
         return stats
+
+    # ----------------------------------------------------- decide-only plan ---
+    def plan(self) -> Plan:
+        """Read-only consistency audit backing `doctor`: scan + decide, classify, return —
+        never apply. `dry_run=True` so every decide helper skips its writes (baseline,
+        settle/ignore meta, vault marker); `ensure_root=False` so a missing remote folder is
+        never created (and an absent one aborts via RemoteScanError instead of reading as an
+        empty remote). The same three-way diff a real pass uses, surfaced as a report."""
+        dp = self._decide_pass(
+            dry_run=True, force_delete=False, defer_deletes=False, ensure_root=False
+        )
+        return self._classify_plan(dp)
+
+    def _classify_plan(self, dp: _DecidePass) -> Plan:
+        """Fold a decided pass into the report rows. Each Op maps through the plan-state
+        tables (single source with decide); in-sync no-ops are omitted. A dir's create is
+        read from dir_actions and its delete from cleanup_actions, so no path double-counts."""
+        rows: list[SyncRow] = []
+        suppressed_by_threshold = bool(dp.stats.skipped_deletes)
+        for rel, dop in dp.dir_actions:
+            dstate = _DIR_PLAN_STATE.get(dop)
+            if dstate is not None:
+                rows.append(self._plan_row(rel, dop, dstate, "dir", suppressed_by_threshold))
+        for rel, fop in dp.file_actions:
+            fstate = _FILE_PLAN_STATE.get(fop)
+            if fstate is not None:
+                fkind = "dir" if self._is_dir(rel, dp.local, dp.remote, dp.baseline) else "file"
+                rows.append(self._plan_row(rel, fop, fstate, fkind, suppressed_by_threshold))
+        for rel, cop in dp.cleanup_actions:
+            if cop is None:
+                continue
+            cstate = _CLEANUP_PLAN_STATE.get(cop)
+            if cstate is not None:
+                rows.append(self._plan_row(rel, cop, cstate, "dir", suppressed_by_threshold))
+        rows.sort(key=lambda r: (_ATTENTION_ORDER.get(r.state, 99), r.relpath))
+        return Plan(
+            rows=rows,
+            suppressed_deletes=dp.stats.skipped_deletes + dp.stats.deferred_deletes,
+            errors=dp.stats.errors,
+        )
+
+    def _plan_row(self, rel: str, op: Op, state: State, kind: str, suppressed: bool) -> SyncRow:
+        reason: Optional[str] = None
+        if state == "orphan-baseline":
+            reason = "in baseline, absent from local and remote"
+        elif state == "would-conflict":
+            reason = f"policy={self.cfg.conflict_policy}"
+        elif state == "planned-delete" and suppressed:
+            reason = "suppressed (over delete threshold)"
+        row_kind: Kind = "dir" if kind == "dir" else "file"
+        return SyncRow(relpath=rel, state=state, op=op, kind=row_kind, reason=reason)
 
     def _log_direction(self, local: dict[str, LocalEntry], remote: dict[str, RemoteEntry]) -> None:
         """Startup visibility: which side has the most recent write. Timestamps are the
