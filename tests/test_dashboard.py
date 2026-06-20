@@ -23,6 +23,7 @@ from ifolder_sync.cli import (
     _render_multiprofile_frame,
     _render_rich,
     _watch_interval,
+    _watch_route,
     _WatchState,
 )
 from ifolder_sync.config import Config, baseline_path, config_path
@@ -192,6 +193,29 @@ def test_watchstate_recent_rail_expires_after_ttl():
     assert ws.observe(_view([]), 10.0)["recently_synced"] == []  # >5s later, expired
 
 
+def test_watchstate_flapping_clears_after_quiet_window():
+    """Flapping reflects CURRENT looping: once a path stops re-syncing for the window, it drops
+    off the list and its per-path state is pruned (bounded memory on a long watch)."""
+    ws = _WatchState(recent_ttl=1, flap_threshold=2, flap_window=10)
+    for t in (0.0, 1.0, 2.0, 3.0):  # complete twice within the window -> flapping
+        ws.observe(_view(["a.md"]), t)
+        out = ws.observe(_view([]), t + 0.5)
+    assert "a.md" in out["flapping"]
+
+    out = ws.observe(_view([]), 100.0)  # long quiet -> outside the window
+    assert out["flapping"] == []
+    assert ws._completions == {}  # the per-path state was pruned, not leaked
+
+
+def test_watchstate_concurrent_completions_have_stable_order():
+    """Same-frame completions share a timestamp; the rail must order them deterministically
+    (by path), not by set-hash."""
+    ws = _WatchState(recent_ttl=100)
+    ws.observe(_view(["c.md", "a.md", "b.md"]), 1.0)
+    out = ws.observe(_view([]), 2.0)  # all three complete in one frame
+    assert out["recently_synced"] == ["a.md", "b.md", "c.md"]
+
+
 def test_dashboard_banner_for_suppressed_deletes():
     assert "suppressed" in _dashboard_banner("up=0 skipped_deletes=3 errors=0")
     assert _dashboard_banner("up=0 skipped_deletes=0 errors=0") is None
@@ -230,18 +254,61 @@ def test_render_multiprofile_frame(tmp_path, monkeypatch):
     assert "stopped" in out  # neither daemon is running
 
 
-def test_render_rich_is_optional_with_ansi_fallback():
+def test_render_multiprofile_frame_running_with_stuck(tmp_path, monkeypatch):
+    """The operationally-important branch: a running daemon with a stuck count must surface in
+    the multi-profile overview (not just the stopped/empty case)."""
+    sandbox_home(tmp_path, monkeypatch)
+    for prof in ("busy", "idle"):
+        Config(apple_id="x@y.com", local_folder=str(tmp_path / prof)).save(config_path(prof))
+        with StateStore(baseline_path(prof)) as s:
+            s.set_meta("last_sync", "1.0")
+    with StateStore(baseline_path("busy")) as s:
+        s.set_meta("settle_counts", json.dumps({"a.md": 3, "b.md": 2}))  # 2 stuck
+    monkeypatch.setattr("ifolder_sync.cli.holder_pid", lambda p: 99 if "busy" in str(p) else None)
+
+    out = _render_multiprofile_frame(["busy", "idle"], 100.0)
+
+    assert "running" in out and "2 stuck" in out  # busy profile
+    assert "stopped" in out  # idle profile
+
+
+def test_render_frame_without_phase3_keys_is_crash_free():
+    """The one-shot (non-watch) path renders a `_dashboard_view` that has NO flapping/
+    recently_synced keys — the frame must not crash and must show neither section."""
     view = {
         "profile": "p",
-        "daemon": {"running": False, "pid": None},
-        "last_sync": None,
-        "last_stats": None,
+        "daemon": {"running": True, "pid": 1},
+        "baseline": "ok",
+        "last_sync": 0.0,
+        "last_stats": "up=1 down=0 errors=0",
+        "last_error": None,
         "attention": [],
     }
-    result = _render_rich(view, 0.0)
-    try:
-        import rich  # noqa: F401
+    out = _render_dashboard_frame(view, 0.0)
+    assert "flapping" not in out and "recently synced" not in out
 
-        assert result is not None  # rich installed -> a rendered frame
-    except ImportError:
-        assert result is None  # rich absent -> caller falls back to the ANSI frame
+
+def test_watch_route_decision():
+    assert _watch_route("work", ["default", "work"]) == ("single", "work")  # explicit -> single
+    assert _watch_route(None, ["default"]) == ("single", "default")  # lone profile -> single
+    assert _watch_route(None, ["a", "b"]) == ("multi", None)  # many -> multi overview
+    assert _watch_route(None, []) == ("single", "default")  # none yet -> default fallback
+
+
+def test_render_rich_reaches_parity_with_ansi():
+    """The `[dashboard]` extra must never HIDE a signal the ANSI frame shows: the rich frame
+    carries the error, the suppressed-deletes banner, flapping, and recently-synced too."""
+    view = {
+        "profile": "p",
+        "daemon": {"running": True, "pid": 9},
+        "last_sync": 0.0,
+        "last_stats": "skipped_deletes=5",
+        "last_error": "auth lapsed",
+        "attention": [SyncRow("big.md", "uploading")],
+        "flapping": ["loop.md"],
+        "recently_synced": ["done.md"],
+    }
+    out = _render_rich(view, 0.0)
+    assert out is not None  # rich is in [dev]
+    for signal in ("big.md", "auth lapsed", "suppressed", "loop.md", "done.md"):
+        assert signal in out, f"rich frame dropped {signal!r} — parity regression"

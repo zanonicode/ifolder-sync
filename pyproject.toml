@@ -45,6 +45,7 @@ dev = [
     "mypy>=1.0,<3",
     "shtab>=1.6",
     "pydantic>=2",
+    "rich>=13",
 ]
 # AI Guardian (Lane 2) runtime. The heavy/cloud deps (google-genai, PyGithub) are
 # lazy-imported inside method bodies, so the unit tests run on `dev` alone (pydantic);
