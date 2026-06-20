@@ -500,7 +500,7 @@ class Syncer:
             self._log_direction(local, remote)
         all_paths = set(local) | set(remote) | set(baseline)
         all_paths = self._exclude_kind_conflicts(all_paths, local, remote, stats)
-        all_paths = self._exclude_case_collisions(all_paths, stats)
+        all_paths = self._exclude_case_collisions(all_paths, local, remote, stats)
 
         dirs = sorted(
             (p for p in all_paths if self._is_dir(p, local, remote, baseline)),
@@ -735,26 +735,35 @@ class Syncer:
             self.store.set_meta("ignore_hash", h)
         return prev is not None and prev != h
 
-    def _exclude_case_collisions(self, all_paths: set[str], stats: SyncStats) -> set[str]:
-        """P1-2: two distinct identity keys that casefold to the same value (local
-        `note.md` vs remote `Note.md`) are a collision the engine cannot reconcile on
-        case-insensitive macOS — guessing risks clobbering the local original. Skip every
-        variant this pass (no transfer, no delete, baseline untouched) and warn; the user
-        renames to one canonical form to resolve."""
+    def _exclude_case_collisions(
+        self,
+        all_paths: set[str],
+        local: dict[str, LocalEntry],
+        remote: dict[str, RemoteEntry],
+        stats: SyncStats,
+    ) -> set[str]:
+        """P1-2: a collision is unresolvable only when >=2 LIVE variants (present in local or
+        remote) casefold to the same value — on case-insensitive macOS the engine cannot pick
+        one without risking a clobber, so it skips every variant and warns. A casefold twin that
+        survives ONLY in the baseline is a ghost (e.g. a case-only rename like `Music`->`MUSIC`),
+        not a live collision: it must flow to decide so it resolves as a baseline drop, else the
+        live variant freezes forever. A genuine collision freezes the whole group (ghosts
+        included) to keep the baseline atomic until the user renames to one canonical form."""
         groups: dict[str, list[str]] = {}
         for p in all_paths:
             groups.setdefault(_nfc(p).casefold(), []).append(p)
-        collided = {p for variants in groups.values() if len(variants) > 1 for p in variants}
-        if not collided:
-            return all_paths
+        collided: set[str] = set()
         for variants in groups.values():
-            if len(variants) > 1:
-                log.warning(
-                    "name collision (differ only by case/normalization): %s — skipping all "
-                    "this pass; rename to a single canonical form",
-                    ", ".join(sorted(variants)),
-                )
-                stats.errors += 1
+            live = [p for p in variants if p in local or p in remote]
+            if len(live) < 2:
+                continue
+            log.warning(
+                "name collision (differ only by case/normalization): %s — skipping all "
+                "this pass; rename to a single canonical form",
+                ", ".join(sorted(live)),
+            )
+            stats.errors += 1
+            collided.update(variants)
         return all_paths - collided
 
     def _exclude_kind_conflicts(
