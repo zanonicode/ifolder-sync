@@ -43,11 +43,17 @@ class InflightSurface:
 
     def record(self, event: SyncEvent) -> None:
         """Engine callback (wired as `Syncer.on_event`). A 'done' event removes the path — it
-        finished, so it disappears from the live list; any other state upserts it. The flush
-        is throttled so a burst of small transfers does not rewrite status.json hundreds of
-        times a second."""
+        finished, so it disappears from the live list; any other state upserts it.
+
+        An in-flight ANNOUNCE (uploading/downloading/deleting/…) FORCE-flushes: the engine emits
+        it BEFORE its blocking IO and then blocks (it cannot flush again mid-transfer), so a
+        throttled announce would be suppressed and the transfer would never reach status.json
+        while it runs — the file would be invisible to the observer. The 'done' removal stays
+        throttled (it is not time-critical: the next announce or `pass_finished` cleans up), so a
+        burst still coalesces its removals."""
         if event.state == "done":
             self._rows.pop(event.relpath, None)
+            self._flush()  # throttled
         else:
             self._rows[event.relpath] = SyncRow(
                 relpath=event.relpath,
@@ -59,7 +65,7 @@ class InflightSurface:
                 reason=event.reason,
                 last_seen_pass=event.pass_id,
             )
-        self._flush()
+            self._flush(force=True)  # show the transfer immediately, before its blocking IO
 
     def pass_finished(self, stuck: list[SyncRow], **header: Any) -> None:
         """A pass ended: replace the transient in-flight rows with the engine's authoritative

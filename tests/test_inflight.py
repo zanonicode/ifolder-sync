@@ -97,12 +97,20 @@ def test_surface_pass_finished_rebuilds_to_stuck_set(tmp_path):
     assert data["rows"][0]["state"] == "pending-unreadable"
 
 
-def test_surface_flush_is_throttled(tmp_path):
+def test_surface_announce_flushes_immediately_done_is_throttled(tmp_path):
+    """An in-flight ANNOUNCE must reach status.json immediately even within the throttle window
+    (the engine blocks on the IO right after, so a throttled announce would be invisible while
+    the transfer runs). A 'done' removal stays throttled (coalesced)."""
     surf = InflightSurface(tmp_path / "status.json", min_write_interval_ms=10_000)
-    surf.pass_started()  # forced flush writes the (empty) frame
-    before = (tmp_path / "status.json").read_text()
-    surf.record(SyncEvent(1.0, 1, "a.txt", Op.UPLOAD, "uploading", "file"))  # within window
-    assert (tmp_path / "status.json").read_text() == before  # coalesced, not rewritten
+    surf.pass_started()  # forced flush writes the empty frame
+
+    surf.record(SyncEvent(1.0, 1, "a.txt", Op.UPLOAD, "uploading", "file"))  # within the window
+    data = json.loads((tmp_path / "status.json").read_text())
+    assert [r["relpath"] for r in data["rows"]] == ["a.txt"]  # shown immediately, not coalesced
+
+    surf.record(SyncEvent(2.0, 1, "a.txt", Op.UPLOAD, "done", "file"))  # throttled removal
+    data = json.loads((tmp_path / "status.json").read_text())
+    assert [r["relpath"] for r in data["rows"]] == ["a.txt"]  # lingers (done flush coalesced)
 
 
 def test_read_status_snapshot_validates(tmp_path, monkeypatch):
