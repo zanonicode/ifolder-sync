@@ -169,6 +169,21 @@ def test_previous_boot_lock_still_stale_with_tolerance(tmp_path, monkeypatch):
     assert holder_pid(lock_path) is None
 
 
+def test_multiday_boottime_drift_is_not_stale(tmp_path, monkeypatch):
+    """Regression: kern.boottime drift grows with uptime (~1s/day) and reached 3s after ~3.4 days,
+    exceeding the original _BOOT_TOL=2 and false-staling a live daemon (status lied "stopped"). The
+    band must cover realistic multi-day drift; this fails under any tolerance below 5s."""
+    from ifolder_sync.locking import _BOOT_TOL, holder_pid
+
+    assert _BOOT_TOL >= 5  # floor above the observed 3s drift, with margin
+    stamped = 1780079296
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text(f"{os.getpid()}\n{stamped}")
+    for drift in (5, -5):  # NTP can step either way
+        monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda d=drift: stamped + d)
+        assert holder_pid(lock_path) == os.getpid()
+
+
 def test_retry_recovers_from_transient():
     from pyicloud.exceptions import PyiCloudAPIResponseException
 

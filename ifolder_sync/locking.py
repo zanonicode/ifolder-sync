@@ -20,11 +20,13 @@ class AlreadyRunning(RuntimeError):
 
 _boot_time_cache: Optional[int] = None
 
-# kern.boottime "sec" = wall_clock - uptime, so NTP discipline of the wall clock makes it
-# jitter ~1s within ONE boot session; a real reboot shifts it by the whole machine downtime
-# (orders of magnitude larger). Tolerate the jitter so a live lock is not misread as stale.
-# Mirrors syncer.MTIME_TOL = 2.0 (the same clock-skew precedent).
-_BOOT_TOL = 2  # seconds
+# kern.boottime "sec" = wall_clock - uptime, so NTP discipline of the wall clock makes the
+# reported value drift across a boot session (seconds, ~1s per day of uptime); a real reboot
+# shifts it by at least the prior uptime + downtime (tens of seconds to hours). Tolerate the
+# drift so a live lock is not misread as stale: the band sits above realistic multi-day drift
+# yet well below the reboot floor. Widening is the safe direction — the dangerous error is a
+# live lock seen as stale (a second daemon on one baseline); a previous boot stays far outside.
+_BOOT_TOL = 30  # seconds
 
 
 def _boot_time() -> Optional[int]:
