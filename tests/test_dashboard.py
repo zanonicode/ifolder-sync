@@ -15,11 +15,15 @@ import pytest
 
 from ifolder_sync.cli import (
     _attention_rows,
+    _dashboard_banner,
     _dashboard_view,
     _fmt_age,
     _profile_status_data,
     _render_dashboard_frame,
+    _render_multiprofile_frame,
+    _render_rich,
     _watch_interval,
+    _WatchState,
 )
 from ifolder_sync.config import Config, baseline_path, config_path
 from ifolder_sync.state import BaselineEntry, StateStore
@@ -162,3 +166,82 @@ def test_watch_interval_override_floor_and_config(tmp_path, monkeypatch):
         dashboard_interval_seconds=5.0,
     ).save(config_path("default"))
     assert _watch_interval("default", argparse.Namespace(interval=None)) == 5.0
+
+
+# ----------------------------------------------------------- Phase 3 polish ---
+def _view(paths):
+    return {"attention": [SyncRow(p, "uploading") for p in paths]}
+
+
+def test_watchstate_surfaces_recently_synced_and_flapping():
+    ws = _WatchState(recent_ttl=100, flap_threshold=2)
+    ws.observe(_view(["a.md"]), 1.0)  # a.md in flight
+    out = ws.observe(_view([]), 2.0)  # a.md completed (vanished)
+    assert out["recently_synced"] == ["a.md"]
+    assert out["flapping"] == []  # one completion is not flapping
+
+    ws.observe(_view(["a.md"]), 3.0)
+    out = ws.observe(_view([]), 4.0)  # a.md completed a second time
+    assert "a.md" in out["flapping"]  # repeated completions == a re-sync loop
+
+
+def test_watchstate_recent_rail_expires_after_ttl():
+    ws = _WatchState(recent_ttl=5, flap_threshold=99)
+    ws.observe(_view(["a.md"]), 0.0)
+    assert ws.observe(_view([]), 1.0)["recently_synced"] == ["a.md"]  # just completed
+    assert ws.observe(_view([]), 10.0)["recently_synced"] == []  # >5s later, expired
+
+
+def test_dashboard_banner_for_suppressed_deletes():
+    assert "suppressed" in _dashboard_banner("up=0 skipped_deletes=3 errors=0")
+    assert _dashboard_banner("up=0 skipped_deletes=0 errors=0") is None
+    assert _dashboard_banner(None) is None
+
+
+def test_render_frame_shows_banner_flapping_and_recent():
+    view = {
+        "profile": "p",
+        "daemon": {"running": True, "pid": 1},
+        "baseline": "ok",
+        "last_sync": 0.0,
+        "last_stats": "skipped_deletes=2",
+        "last_error": None,
+        "attention": [],
+        "flapping": ["x.md"],
+        "recently_synced": ["y.md"],
+    }
+    out = _render_dashboard_frame(view, 0.0)
+    assert "suppressed by the safety threshold" in out
+    assert "flapping" in out and "x.md" in out
+    assert "recently synced" in out and "y.md" in out
+
+
+def test_render_multiprofile_frame(tmp_path, monkeypatch):
+    sandbox_home(tmp_path, monkeypatch)
+    for prof in ("default", "work"):
+        Config(apple_id="x@y.com", local_folder=str(tmp_path / prof)).save(config_path(prof))
+        with StateStore(baseline_path(prof)) as s:
+            s.set_meta("last_sync", "1.0")
+
+    out = _render_multiprofile_frame(["default", "work"], 100.0)
+
+    assert "all profiles" in out
+    assert "default" in out and "work" in out
+    assert "stopped" in out  # neither daemon is running
+
+
+def test_render_rich_is_optional_with_ansi_fallback():
+    view = {
+        "profile": "p",
+        "daemon": {"running": False, "pid": None},
+        "last_sync": None,
+        "last_stats": None,
+        "attention": [],
+    }
+    result = _render_rich(view, 0.0)
+    try:
+        import rich  # noqa: F401
+
+        assert result is not None  # rich installed -> a rendered frame
+    except ImportError:
+        assert result is None  # rich absent -> caller falls back to the ANSI frame

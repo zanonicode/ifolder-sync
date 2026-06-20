@@ -30,7 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime
 from http.cookiejar import LoadError, LWPCookieJar
 from logging.handlers import RotatingFileHandler
@@ -556,9 +556,10 @@ def _stats_has_trouble(last_stats: Optional[str]) -> bool:
 
 def cmd_status(args):
     if getattr(args, "watch", False):
-        # The live frame is single-profile (you watch one vault sync); default when omitted.
-        profile = args.profile or DEFAULT_PROFILE
-        _watch_dashboard(profile, _watch_interval(profile, args))
+        # No --profile + multiple profiles -> a compact multi-profile overview; otherwise the
+        # single-profile live frame.
+        profile = args.profile
+        _watch_dashboard(profile, _watch_interval(profile or DEFAULT_PROFILE, args))
         return
     profiles = list_profiles()
     if getattr(args, "json", False):
@@ -882,6 +883,47 @@ _STATE_LABEL = {
 }
 
 
+_RECENT_TTL = 6.0  # seconds a just-completed file lingers on the "recently synced" rail
+_FLAP_THRESHOLD = 3  # completions before a path is flagged as flapping (a re-sync loop)
+
+
+class _WatchState:
+    """View-side memory across redraws (a live `status --watch` loop only). Diffs successive
+    frames to surface (a) files that JUST completed — a short 'recently synced' rail so a fast
+    transfer is not invisible — and (b) flapping paths that complete repeatedly (a re-sync
+    loop), which would otherwise scroll away unseen. Pure: `observe` is the only state change."""
+
+    def __init__(self, recent_ttl: float = _RECENT_TTL, flap_threshold: int = _FLAP_THRESHOLD):
+        self.recent_ttl = recent_ttl
+        self.flap_threshold = flap_threshold
+        self._prev: set[str] = set()
+        self._recent: dict[str, float] = {}
+        self._completions: Counter = Counter()
+
+    def observe(self, view: dict[str, Any], now: float) -> dict[str, Any]:
+        cur = {r.relpath for r in view["attention"]}
+        for path in self._prev - cur:  # vanished since the last frame == completed
+            self._recent[path] = now
+            self._completions[path] += 1
+        self._recent = {p: t for p, t in self._recent.items() if now - t < self.recent_ttl}
+        self._prev = cur
+        flapping = sorted(p for p, c in self._completions.items() if c >= self.flap_threshold)
+        recent = [p for p, _ in sorted(self._recent.items(), key=lambda kv: -kv[1])]
+        return {**view, "recently_synced": recent, "flapping": flapping}
+
+
+def _dashboard_banner(last_stats: Optional[str]) -> Optional[str]:
+    """A prominent line for the one signal the stats row buries: deletions withheld by the
+    safety threshold (the drift symptom that needs `doctor`/`rebaseline`)."""
+    m = re.search(r"skipped_deletes=(\d+)", last_stats or "")
+    if m and int(m.group(1)) > 0:
+        return _color(
+            f"⚠ {m.group(1)} deletion(s) suppressed by the safety threshold — run `doctor`",
+            "33;1",
+        )
+    return None
+
+
 def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
     daemon = view["daemon"]
     dstate = f"running (pid {daemon['pid']})" if daemon["running"] else "stopped"
@@ -892,6 +934,10 @@ def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
     if view["last_error"]:
         header.append(f"Error:    {view['last_error']}")
     lines = _box(f"ifolder-sync · {view['profile']}", header)
+
+    banner = _dashboard_banner(view.get("last_stats"))
+    if banner:
+        lines.append("  " + banner)
     lines.append("")
 
     rows = view["attention"]
@@ -905,17 +951,80 @@ def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
             lines.append(f"  {n:>4}  {_truncate(r.relpath, 42):<42} {_color(text, col)}")
         if len(rows) > _DASH_MAX:
             lines.append(f"  … and {len(rows) - _DASH_MAX} more")
+
+    flapping = view.get("flapping") or []
+    if flapping:
+        names = ", ".join(_truncate(p, 28) for p in flapping[:5])
+        lines.append("  " + _color(f"⚠ flapping (re-syncing repeatedly): {names}", "31"))
+
+    recent = view.get("recently_synced") or []
+    if recent:
+        names = ", ".join(_truncate(p, 28) for p in recent[:5])
+        more = f" +{len(recent) - 5}" if len(recent) > 5 else ""
+        lines.append("  " + _color(f"✓ recently synced: {names}{more}", "32"))
     return "\n".join(lines)
 
 
-def _watch_dashboard(profile: str, interval: float) -> None:
-    """Live loop: redraw the dashboard every `interval` seconds until Ctrl-C (main turns the
-    KeyboardInterrupt into a clean exit 130, mirroring `logs -f`). Read-only and network-free
-    — it polls the daemon's persisted state, holds no engine handle, never acquires the lock."""
+def _render_multiprofile_frame(profiles: list[str], now: float) -> str:
+    """A compact one-line-per-profile overview for `status --watch` with no --profile: daemon
+    liveness + last-sync age + the stuck count, so a multi-vault setup is legible at a glance."""
+    body = []
+    for prof in profiles:
+        view = _dashboard_view(prof)
+        d = view["daemon"]
+        state = f"running ({d['pid']})" if d["running"] else "stopped"
+        stuck = len(view["attention"])
+        flag = f" · {stuck} stuck" if stuck else ""
+        body.append(f"{prof:<16}{state:<16}{_fmt_age(view['last_sync'], now):<12}{flag}")
+    return "\n".join(_box("ifolder-sync · all profiles", body))
+
+
+def _render_rich(view: dict[str, Any], now: float) -> Optional[str]:
+    """A richer frame when the optional `rich` extra is installed (truecolor + real box).
+    Returns None when rich is absent so the caller falls back to the ANSI frame — the
+    established lazy optional-dependency pattern (no base-dep add)."""
+    try:
+        from rich.console import Console
+        from rich.table import Table
+    except ImportError:
+        return None
+    d = view["daemon"]
+    dstate = f"[green]running[/] (pid {d['pid']})" if d["running"] else "[red]stopped[/]"
+    table = Table(title=f"ifolder-sync · {view['profile']}", expand=True)
+    table.add_column("file")
+    table.add_column("state", justify="right")
+    table.add_row(f"Daemon: {dstate}", f"last sync {_fmt_age(view['last_sync'], now)}")
+    table.add_row(f"Stats:  {view['last_stats'] or '—'}", "")
+    for r in view["attention"][:_DASH_MAX]:
+        text, _ = _STATE_LABEL.get(r.state, (r.state, "0"))
+        n = f"{r.passes_stuck}× " if r.passes_stuck else ""
+        table.add_row(_truncate(r.relpath, 50), f"{n}{text}")
+    console = Console(force_terminal=True)
+    with console.capture() as cap:
+        console.print(table)
+    return cap.get()
+
+
+def _watch_dashboard(profile: Optional[str], interval: float) -> None:
+    """Live loop: redraw every `interval` seconds until Ctrl-C (main turns the KeyboardInterrupt
+    into exit 130, like `logs -f`). Read-only and network-free — polls the daemon's persisted
+    state, holds no engine handle, never acquires the lock. With no --profile and >1 profile it
+    shows a compact multi-profile overview; otherwise a single-profile frame with a live
+    'recently synced' rail + flapping detection accumulated across redraws (the `rich` extra
+    upgrades the look when installed)."""
+    multi = profile is None and len(list_profiles()) > 1
+    one = profile or (list_profiles() or [DEFAULT_PROFILE])[0]
+    watch = _WatchState()
     while True:
+        now = time.time()
+        if multi:
+            frame = _render_multiprofile_frame(list_profiles(), now)
+        else:
+            view = watch.observe(_dashboard_view(one), now)
+            frame = _render_rich(view, now) or _render_dashboard_frame(view, now)
         if sys.stdout.isatty():
             sys.stdout.write("\033[2J\033[H")  # clear + home, so the frame redraws in place
-        print(_render_dashboard_frame(_dashboard_view(profile), time.time()))
+        print(frame)
         print(f"\n  refreshing every {interval:g}s · Ctrl-C to exit")
         time.sleep(interval)
 
