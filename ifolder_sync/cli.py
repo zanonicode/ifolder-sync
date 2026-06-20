@@ -693,13 +693,13 @@ def _parse_json_meta(raw: Optional[str]) -> dict:
 
 
 def _attention_rows(profile: str) -> list:
-    """The engine's persisted 'stuck' registries folded into attention rows, sorted
-    most-stuck first. Read-only by construction: opens the baseline with a mode=ro connection
-    and reads meta only (settle_counts husks + unreadable_counts propagation-lag backoffs),
-    never the daemon's writer path. Degrades to [] on any read problem — an observer must
-    never crash the way a writer would."""
+    """The engine's persisted 'stuck' registries folded into attention rows. Read-only by
+    construction: opens the baseline with a mode=ro connection and reads meta only
+    (settle_counts husks + unreadable_counts propagation-lag backoffs), never the daemon's
+    writer path. Degrades to [] on any read problem — an observer must never crash the way a
+    writer would."""
     from .state import StateStore
-    from .syncstate import SyncRow
+    from .syncstate import stuck_rows
 
     db = baseline_path(profile)
     if not db.exists():
@@ -710,47 +710,54 @@ def _attention_rows(profile: str) -> list:
             unreadable = _parse_json_meta(store.get_meta("unreadable_counts"))
     except Exception:  # noqa: BLE001 — a bad/locked read must not crash the dashboard
         return []
-
-    rows: list = []
-    for rel, n in settle.items():
-        rows.append(
-            SyncRow(
-                rel,
-                "deferred-settle",
-                passes_stuck=_safe_int(n),
-                reason="empty/unsettled remote (waiting for the other device)",
-            )
-        )
-    for rel, entry in unreadable.items():
-        cnt = _safe_int(entry[3]) if isinstance(entry, list) and len(entry) > 3 else None
-        rows.append(
-            SyncRow(
-                rel,
-                "pending-unreadable",
-                passes_stuck=cnt,
-                reason="remote body not yet materialized (propagation lag)",
-            )
-        )
-    rows.sort(key=lambda r: (-(r.passes_stuck or 0), r.relpath))
-    return rows
+    return stuck_rows(settle, unreadable)
 
 
-def _safe_int(v: Any) -> Optional[int]:
+def _read_status_snapshot(profile: str) -> Optional[dict[str, Any]]:
+    """Read the daemon's live status.json snapshot (feature 04 Phase 2), or None when absent/
+    unreadable. It carries the in-flight transfer rows the daemon is moving RIGHT NOW plus a
+    header it stamped — so the observer never opens the baseline at all when it is present.
+    Best-effort: a torn/missing/corrupt snapshot just falls back to the meta fold."""
+    from .config import status_path
+
+    path = status_path(profile)
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) and data.get("schema") == 1 else None
 
 
 def _dashboard_view(profile: str) -> dict[str, Any]:
-    """Presentation-free dashboard snapshot: daemon liveness + the last-pass meta + the
-    attention rows. Both the live renderer and `status --json` read this, so they cannot
-    drift."""
+    """Presentation-free dashboard snapshot: daemon liveness + the last-pass meta + attention
+    rows. Prefers the daemon's live status.json (in-flight transfers) when present, falling
+    back to the read-only meta fold (the persisted stuck set). Both the live renderer and
+    `status --json` read this, so they cannot drift."""
+    from .syncstate import SyncRow
+
     state, meta = _baseline_meta(profile)
     last_sync = meta.get("last_sync")
+    daemon = _daemon_status(profile)
+    # Only trust the live snapshot while the daemon is RUNNING: a dead daemon's status.json is
+    # stale, and its in-flight rows ("uploading X") must NOT render as live activity. When
+    # stopped, fall back to the persisted stuck set (the meta fold), which is still valid.
+    snap = _read_status_snapshot(profile) if daemon["running"] else None
+    if snap is not None:
+        # Live path: the daemon's snapshot is authoritative for the rows (in-flight + stuck)
+        # and the header it stamped; the meta read above still supplies the baseline state.
+        ls = snap.get("last_sync")
+        return {
+            "profile": profile,
+            "daemon": daemon,
+            "baseline": state,
+            "last_sync": float(ls) if ls else (float(last_sync) if last_sync else None),
+            "last_stats": snap.get("last_stats") or meta.get("last_stats"),
+            "last_error": snap.get("last_error") or meta.get("last_error"),
+            "attention": [SyncRow.from_dict(r) for r in snap.get("rows", [])],
+        }
     return {
         "profile": profile,
-        "daemon": _daemon_status(profile),
+        "daemon": daemon,
         "baseline": state,
         "last_sync": float(last_sync) if last_sync else None,
         "last_stats": meta.get("last_stats"),
@@ -788,6 +795,20 @@ def _box(title: str, rows: list[str]) -> list[str]:
     return out
 
 
+# Per-state label + ANSI color for the activity pane. Covers both the live in-flight
+# transfers (status.json) and the persisted stuck registries (the meta fold).
+_STATE_LABEL = {
+    "uploading": ("↑ uploading", "36"),
+    "downloading": ("↓ downloading", "36"),
+    "deleting-local": ("✗ del local", "31"),
+    "deleting-remote": ("✗ del remote", "31"),
+    "conflict": ("⚠ conflict", "31"),
+    "error": ("⚠ error", "31"),
+    "deferred-settle": ("settling", "33"),
+    "pending-unreadable": ("pending", "33"),
+}
+
+
 def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
     daemon = view["daemon"]
     dstate = f"running (pid {daemon['pid']})" if daemon["running"] else "stopped"
@@ -802,13 +823,13 @@ def _render_dashboard_frame(view: dict[str, Any], now: float) -> str:
 
     rows = view["attention"]
     if not rows:
-        lines.append("  " + _color("✓ all synced — nothing stuck", "32"))
+        lines.append("  " + _color("✓ all synced — nothing in flight or stuck", "32"))
     else:
-        lines.append(f"  Needs attention ({len(rows)}):")
+        lines.append(f"  Sync activity ({len(rows)}):")
         for r in rows[:_DASH_MAX]:
             n = f"{r.passes_stuck}×" if r.passes_stuck else ""
-            tag = "settling" if r.state == "deferred-settle" else "pending"
-            lines.append(f"  {n:>4}  {_truncate(r.relpath, 42):<42} {_color(tag, '33')}")
+            text, col = _STATE_LABEL.get(r.state, (r.state, "0"))
+            lines.append(f"  {n:>4}  {_truncate(r.relpath, 42):<42} {_color(text, col)}")
         if len(rows) > _DASH_MAX:
             lines.append(f"  … and {len(rows) - _DASH_MAX} more")
     return "\n".join(lines)

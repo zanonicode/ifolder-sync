@@ -119,11 +119,11 @@ def test_render_frame_empty_then_populated():
     out = _render_dashboard_frame(view, 0.0)
     assert "ifolder-sync · default" in out
     assert "running (pid 42)" in out
-    assert "nothing stuck" in out
+    assert "all synced" in out
 
     view["attention"] = [SyncRow("notes/big.md", "deferred-settle", passes_stuck=3)]
     out = _render_dashboard_frame(view, 0.0)
-    assert "Needs attention (1)" in out
+    assert "Sync activity (1)" in out
     assert "notes/big.md" in out and "settling" in out
 
 

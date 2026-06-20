@@ -43,7 +43,7 @@ from .config import trash_dir as default_trash_dir
 from .errors import UnreadableRemoteError
 from .icloud_client import PART_SUFFIX, RemoteEntry
 from .state import BaselineEntry, StateStore
-from .syncstate import Kind, Plan, State, SyncRow
+from .syncstate import Kind, Plan, State, SyncEvent, SyncRow
 from .trash import trash_local
 
 log = logging.getLogger("ifolder-sync.syncer")
@@ -167,6 +167,19 @@ _CLEANUP_PLAN_STATE: dict[Op, State] = {
     Op.RMDIR_REMOTE: "planned-delete",
     Op.RMDIR_LOCAL: "planned-delete",
     Op.DROP_BASELINE_DIR: "orphan-baseline",
+}
+# Op -> the transient in-flight state shown live in the dashboard (feature 04) WHILE the
+# action runs. Only the user-visible per-file transfers; in-sync no-ops and the stuck states
+# (settle/unreadable) are not emitted per-path — they are rebuilt at pass end from their meta
+# registries, the authoritative source.
+_INFLIGHT_STATE: dict[Op, State] = {
+    Op.UPLOAD: "uploading",
+    Op.RESCUE_UPLOAD: "uploading",
+    Op.DOWNLOAD: "downloading",
+    Op.RESCUE_DOWNLOAD: "downloading",
+    Op.DELETE_LOCAL: "deleting-local",
+    Op.DELETE_REMOTE: "deleting-remote",
+    Op.CONFLICT: "conflict",
 }
 # Render order for the doctor report: ghosts first, then unresolvable, then drift, then the
 # routine planned transfers. Attention-first, exactly like the dashboard's fold.
@@ -292,6 +305,7 @@ class Syncer:
         store: StateStore,
         trash_dir: Optional[Path] = None,
         stop_check: Optional[Callable[[], bool]] = None,
+        on_event: Optional[Callable[[SyncEvent], None]] = None,
     ) -> None:
         self.cfg = config
         self.client = client
@@ -309,9 +323,37 @@ class Syncer:
         # The daemon passes its _stop predicate so a SIGTERM mid-apply breaks the loop
         # promptly; per-action commits keep what was already applied durable.
         self._stop_check = stop_check
+        # Optional observer (the live dashboard surface). The exact twin of stop_check: an
+        # optional callback the daemon wires in, default None so every test + dry-run path is
+        # byte-for-byte unchanged. Fed best-effort, post-apply, by _emit.
+        self._on_event = on_event
+        self._pass_id = 0  # bumped each sync_once; stamped on emitted events
 
     def _should_stop(self) -> bool:
         return bool(self._stop_check and self._stop_check())
+
+    def _emit(
+        self,
+        rel: str,
+        op: Op,
+        state: State,
+        *,
+        kind: Kind = "file",
+        bytes_: Optional[int] = None,
+        passes: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Fire a typed SyncEvent to the optional observer, best-effort. Wrapped in
+        try/except with no value fed back into decide/apply: a viewer can never slow a pass or
+        weaken an invariant. A cheap no-op when on_event is None (every test, every dry-run)."""
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(
+                SyncEvent(time.time(), self._pass_id, rel, op, state, kind, bytes_, passes, reason)
+            )
+        except Exception:  # noqa: BLE001 — observability must never break a pass
+            pass
 
     def _commit(self, dry_run: bool) -> None:
         """Per-action durability: with one commit only at pass end, a SIGKILL mid-pass
@@ -616,6 +658,7 @@ class Syncer:
         force_delete: bool = False,
         defer_deletes: bool = False,
     ) -> SyncStats:
+        self._pass_id += 1  # stamps the dashboard events emitted during this pass's apply
         dp = self._decide_pass(dry_run, force_delete, defer_deletes)
         stats = dp.stats
         local, remote = dp.local, dp.remote
@@ -1195,6 +1238,18 @@ class Syncer:
     ) -> None:
         lentry = local.get(relpath)
         rentry = remote.get(relpath)
+        # Live dashboard (best-effort, no-op without an observer): announce the transfer
+        # BEFORE the blocking IO so `status --watch` shows a large in-flight file while it
+        # moves; the done/error emits below close it out. Pure observation — it cannot alter
+        # the action it brackets.
+        inflight = _INFLIGHT_STATE.get(op)
+        if inflight is not None:
+            self._emit(
+                relpath,
+                op,
+                inflight,
+                bytes_=(lentry.size if lentry else (rentry.size if rentry else None)),
+            )
         try:
             # The decide layer guarantees which side(s) exist per op (e.g. a download
             # implies a remote entry); the asserts both encode that contract and narrow
@@ -1244,9 +1299,16 @@ class Syncer:
             # a clean per-path DEFER — baseline row untouched so the op re-derives next pass,
             # never an error, never a conflict clobber.
             self._defer_unreadable(relpath, rentry, stats, exc, dry_run)
+            self._emit(relpath, op, "pending-unreadable", reason="remote not yet materialized")
         except Exception as exc:  # noqa: BLE001
             log.error("error reconciling %s: %s", relpath, exc)
             stats.errors += 1
+            self._emit(relpath, op, "error", reason=str(exc)[:80])
+        else:
+            # The action committed cleanly: clear the in-flight row so the file disappears
+            # from the live list (the "vanish on success" the operator asked for).
+            if inflight is not None:
+                self._emit(relpath, op, "done")
 
     def _apply_dir(self, relpath: str, op: Op, stats: SyncStats, dry_run: bool) -> None:
         if op == Op.LEAVE_DIR:

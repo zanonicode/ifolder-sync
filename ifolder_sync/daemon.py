@@ -10,6 +10,7 @@ scan must never masquerade as mass deletion), and the first pass runs additive-o
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -30,13 +31,16 @@ from .config import (
     Config,
     baseline_path,
     lock_path,
+    status_path,
     trash_dir,
     vault_access_error,
 )
 from .icloud_client import PART_SUFFIX, ICloudClient, is_session_relapse
+from .inflight import InflightSurface
 from .locking import SingleInstanceLock
 from .state import CorruptBaselineError, StateStore
 from .syncer import LocalScanError, Syncer, VaultIdentityError
+from .syncstate import stuck_rows
 from .watcher import LocalWatcher
 
 log = logging.getLogger("ifolder-sync.daemon")
@@ -55,12 +59,24 @@ class Daemon:
         self._sync_lock = threading.Lock()
         self.client = ICloudClient.from_config(config)
         self.store = StateStore(baseline_path(profile))
+        # Live dashboard surface (feature 04): the daemon owns it and feeds the engine's
+        # per-path events into it, flushing status.json for `status --watch`. None disables
+        # all producer-side work. Best-effort throughout — it never affects a sync pass.
+        self.inflight: Optional[InflightSurface] = (
+            InflightSurface(
+                status_path(profile),
+                min_write_interval_ms=int(getattr(config, "inflight_min_write_interval_ms", 200)),
+            )
+            if getattr(config, "inflight_surface", True)
+            else None
+        )
         self.syncer = Syncer(
             config,
             self.client,
             self.store,
             trash_dir=trash_dir(profile),
             stop_check=self._stop.is_set,
+            on_event=(self.inflight.record if self.inflight else None),
         )
         self.lock = SingleInstanceLock(lock_path(profile))
         self.watcher: Optional[LocalWatcher] = None
@@ -126,7 +142,9 @@ class Daemon:
             log.debug("sync started (%s)", reason)
             if not defer_deletes:
                 self._apply_passes += 1
+            self._inflight_pass_started()
             stats = self.syncer.sync_once(defer_deletes=defer_deletes)
+            self._inflight_pass_finished()
             # A pass that completed proves the session is healthy: reset the reconnect
             # budget and clear any stale error so `status` reflects the recovery, not a ghost.
             self._relapse_count = 0
@@ -222,6 +240,41 @@ class Daemon:
                 self._set_last_error(str(exc))
         finally:
             self._sync_lock.release()
+
+    # ----------------------------------------------------- live dashboard surface ---
+    def _inflight_header(self) -> dict:
+        return {
+            "pid": os.getpid(),
+            "last_sync": self.store.get_meta("last_sync"),
+            "last_stats": self.store.get_meta("last_stats"),
+            "last_error": self.store.get_meta("last_error"),
+        }
+
+    def _json_meta(self, key: str) -> dict:
+        try:
+            data = json.loads(self.store.get_meta(key) or "{}")
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _stuck_rows(self):
+        return stuck_rows(self._json_meta("settle_counts"), self._json_meta("unreadable_counts"))
+
+    def _inflight_pass_started(self) -> None:
+        if not self.inflight:
+            return
+        try:
+            self.inflight.pass_started(**self._inflight_header())
+        except Exception as exc:  # noqa: BLE001 — the surface never breaks a sync pass
+            log.debug("inflight pass_started skipped (non-fatal): %s", exc)
+
+    def _inflight_pass_finished(self) -> None:
+        if not self.inflight:
+            return
+        try:
+            self.inflight.pass_finished(self._stuck_rows(), **self._inflight_header())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("inflight pass_finished skipped (non-fatal): %s", exc)
 
     def _track_drift(self, stats):
         if stats.skipped_deletes:

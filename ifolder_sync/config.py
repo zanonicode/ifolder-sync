@@ -288,6 +288,11 @@ class Config:
     # Live dashboard (`status --watch`, feature 04): how often the observer re-polls the
     # daemon's status snapshot + meta and redraws. Purely view-side; no engine effect.
     dashboard_interval_seconds: float = 2.0
+    # The daemon writes a live status.json snapshot (the in-flight transfers `status --watch`
+    # shows). False disables ALL producer-side dashboard work (zero overhead). Snapshot
+    # flushes coalesce to at most one per inflight_min_write_interval_ms.
+    inflight_surface: bool = True
+    inflight_min_write_interval_ms: int = 200
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
     @staticmethod
@@ -334,6 +339,7 @@ class Config:
             "settle_max_passes",
             "unreadable_max_passes",
             "max_file_size_mb",
+            "inflight_min_write_interval_ms",
         ):
             value = getattr(self, name)
             # bool is a subclass of int, so plain isinstance(..., int) would accept
