@@ -38,8 +38,20 @@ _CORRUPT_HINT = "run `ifolder-sync rebaseline` to back it up and start a fresh b
 
 
 class StateStore:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
+        self.read_only = read_only
+        if read_only:
+            # A mode=ro URI connection: SQLite itself rejects every write ("attempt to write
+            # a readonly database"), so a read-only observer (the dashboard, feature 04) is
+            # guaranteed not to mutate the daemon's baseline by the CONNECTION, not by
+            # reviewer discipline. No journal_mode=WAL pragma (it is a write) and no
+            # schema init/migrate/commit — the observer reads meta only. The file must exist
+            # (the daemon created it); callers check baseline_path().exists() first.
+            self.conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA busy_timeout=5000")  # wait out a checkpoint, never write
+            return
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         try:

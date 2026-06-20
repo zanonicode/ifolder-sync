@@ -77,7 +77,9 @@ class SyncRow:
 
     relpath: str
     state: State
-    op: "Op"
+    # The engine Op that produced this row (doctor decide rows). None for rows folded from a
+    # persisted registry (the dashboard's settle/unreadable attention rows have no decided op).
+    op: Optional["Op"] = None
     kind: Kind = "file"
     passes_stuck: Optional[int] = None
     reason: Optional[str] = None
@@ -87,8 +89,8 @@ class SyncRow:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         # Op is a str-Enum; str() pins it to the wire value ("upload") regardless of the
-        # Enum __str__ quirk across Python versions, so a reader gets a plain string.
-        d["op"] = str(self.op)
+        # Enum __str__ quirk across Python versions, so a reader gets a plain string (or None).
+        d["op"] = str(self.op) if self.op is not None else None
         return d
 
     @classmethod
