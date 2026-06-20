@@ -1637,6 +1637,27 @@ def test_case_collision_is_skipped_not_clobbered(make_syncer, fake, local_dir):
     store.close()
 
 
+def test_case_rename_baseline_ghost_resolves_not_freezes(make_syncer, fake, local_dir):
+    """P1-2 regression: after a case-only rename on case-insensitive APFS (`note.md`->`Note.md`),
+    the OLD name survives only as a baseline ghost while local carries the NEW name. The collision
+    guard must NOT freeze on a baseline-only ghost (which would stall the upload and leave the ghost
+    forever, errors>0 every pass); only a collision between >=2 LIVE (local/remote) variants is
+    unresolvable. The live `Note.md` uploads; the ghost `note.md` resolves as DROP_BASELINE."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer()
+    write_file(local_dir, "Note.md", b"data", mtime=1000.0)  # live local, new case
+    store.upsert(BaselineEntry("note.md", "file", 4, 1000.0, 4, 1000.0, ""))  # ghost, old case
+    store.commit()
+
+    s = syncer.sync_once()
+    assert s.errors == 0, s.summary()  # not frozen as an eternal collision
+    assert fake.files["Note.md"]["content"] == b"data"  # live variant uploaded
+    rows = store.all()
+    assert "Note.md" in rows and "note.md" not in rows  # ghost dropped, real recorded
+    store.close()
+
+
 def test_vault_marker_hard_ignore_is_case_insensitive(make_syncer, fake, local_dir):
     """P1-2: a remote `.IFOLDER-SYNC-VAULT` (any case) is hard-ignored, so it can never be
     downloaded and clobber the local `.ifolder-sync-vault` identity marker."""
