@@ -32,6 +32,11 @@ dependencies = [
 completion = [
     "shtab>=1.6",
 ]
+# Prettier `status --watch` frame (truecolor + box-drawing). Optional so the base install
+# keeps exactly 2 runtime deps; the dashboard degrades to a stdlib ANSI frame without it.
+dashboard = [
+    "rich>=13",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -40,6 +45,7 @@ dev = [
     "mypy>=1.0,<3",
     "shtab>=1.6",
     "pydantic>=2",
+    "rich>=13",
 ]
 # AI Guardian (Lane 2) runtime. The heavy/cloud deps (google-genai, PyGithub) are
 # lazy-imported inside method bodies, so the unit tests run on `dev` alone (pydantic);
