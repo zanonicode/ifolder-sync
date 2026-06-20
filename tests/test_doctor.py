@@ -15,12 +15,14 @@ import pytest
 
 from ifolder_sync.cli import (
     _doctor_json,
+    _fix_orphans,
     _print_doctor_report,
     _stats_has_trouble,
     cmd_doctor,
 )
-from ifolder_sync.config import Config, config_path
-from ifolder_sync.state import BaselineEntry
+from ifolder_sync.config import Config, baseline_path, config_path, lock_path
+from ifolder_sync.locking import SingleInstanceLock
+from ifolder_sync.state import BaselineEntry, StateStore
 from ifolder_sync.syncer import (
     _CLEANUP_PLAN_STATE,
     _DIR_PLAN_STATE,
@@ -348,3 +350,237 @@ def test_cmd_doctor_json_is_read_only(tmp_path, monkeypatch, capsys, fake):
     assert any(r["state"] == "planned-upload" and r["relpath"] == "a.md" for r in data["rows"])
     for io in ("upload", "download", "delete", "mkdir", "ensure_remote_root"):
         assert fake.calls[io] == 0, f"{io} happened during a read-only doctor"
+
+
+# ------------------------------------------------ --fix-orphans (Phase 3 remediation) ---
+def _setup_doctor_cli(tmp_path, monkeypatch, fake):
+    sandbox_home(tmp_path, monkeypatch)
+    local = tmp_path / "vault"
+    local.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(local)).save(config_path("default"))
+    monkeypatch.setattr(
+        "ifolder_sync.icloud_client.ICloudClient.from_config",
+        classmethod(lambda cls, c: fake),
+    )
+    return local
+
+
+def test_fix_orphans_unit_drops_only_orphans_and_backs_up(tmp_path, monkeypatch):
+    sandbox_home(tmp_path, monkeypatch)
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.upsert(BaselineEntry("keep.md", "file", 1, 1000.0, 1, 1000.0))
+        s.set_meta("walk_cache", "stale")
+
+    plan = Plan(rows=[SyncRow("ghost.md", "orphan-baseline"), SyncRow("keep.md", "planned-delete")])
+    with StateStore(db) as s:
+        count, bak = _fix_orphans(plan, "default", s)
+
+    assert count == 1 and bak.exists()  # only the orphan, with a backup taken first
+    with StateStore(db, read_only=True) as s:
+        rows = s.all()
+        assert "ghost.md" not in rows  # orphan dropped
+        assert "keep.md" in rows  # the non-orphan row is untouched
+        assert s.get_meta("walk_cache") == ""  # stale cache cleared
+    # the backup is a USABLE recovery net: a real pre-drop copy holding the dropped orphan
+    with StateStore(bak, read_only=True) as b:
+        assert "ghost.md" in b.all() and "keep.md" in b.all()
+
+
+def test_fix_orphans_via_cli_drops_orphan_keeps_synced(tmp_path, monkeypatch, fake):
+    local = _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    write_file(local, "keep.md", b"k", mtime=1000)
+    fake.put("keep.md", b"k", mtime=1000)  # in sync on both sides
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("keep.md", "file", 1, 1000.0, 1, 1000.0))
+        s.upsert(BaselineEntry("Music/song.md", "file", 7, 1.0, 7, 1.0))  # orphan
+        s.set_meta("walk_cache", "stale")
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    cmd_doctor(args)
+
+    with StateStore(db, read_only=True) as s:
+        rows = s.all()
+        assert "Music/song.md" not in rows  # orphan dropped
+        assert "keep.md" in rows  # the in-sync row survives
+        assert s.get_meta("walk_cache") == ""
+    assert len(list(db.parent.glob("baseline.sqlite3.pre-fix-orphans-*"))) == 1  # backup made
+
+
+def test_fix_orphans_refuses_while_daemon_running(tmp_path, monkeypatch, fake, capsys):
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    with StateStore(baseline_path("default")) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.commit()
+    monkeypatch.setattr("ifolder_sync.cli.holder_pid", lambda _p: 4242)  # daemon "running"
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    with pytest.raises(SystemExit) as exc:
+        cmd_doctor(args)
+
+    assert exc.value.code != 0
+    assert "daemon is running" in capsys.readouterr().err
+    # refused BEFORE any work: the orphan is still present
+    with StateStore(baseline_path("default"), read_only=True) as s:
+        assert "ghost.md" in s.all()
+
+
+def test_fix_orphans_json_reports_count_and_backup(tmp_path, monkeypatch, fake, capsys):
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    with StateStore(baseline_path("default")) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.commit()
+
+    args = argparse.Namespace(profile="default", json=True, non_interactive=True, fix_orphans=True)
+    cmd_doctor(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["fixed_orphans"] == 1
+    assert data["backup"] is not None
+
+
+def test_fix_orphans_is_idempotent(tmp_path, monkeypatch, fake, capsys):
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    with StateStore(baseline_path("default")) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.commit()
+
+    args = argparse.Namespace(profile="default", json=True, non_interactive=True, fix_orphans=True)
+    cmd_doctor(args)  # first run drops the orphan
+    assert json.loads(capsys.readouterr().out)["fixed_orphans"] == 1
+
+    cmd_doctor(args)  # second run: nothing left to fix
+    data = json.loads(capsys.readouterr().out)
+    assert data["fixed_orphans"] == 0 and data["backup"] is None
+    # the clean run wrote exactly one backup (from the first run), none from the second
+    assert (
+        len(list(baseline_path("default").parent.glob("baseline.sqlite3.pre-fix-orphans-*"))) == 1
+    )
+
+
+def test_fix_orphans_aborts_on_scan_failure_drops_nothing(tmp_path, monkeypatch, fake):
+    """The headline safety claim, through the WRITE path: a failing scan aborts --fix-orphans
+    BEFORE any drop or backup — a partial scan can never mislabel a live path as orphan."""
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.commit()
+    fake.fail_walk = True  # the remote walk raises -> plan() aborts before _fix_orphans
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    with pytest.raises(RuntimeError):
+        cmd_doctor(args)
+
+    with StateStore(db, read_only=True) as s:
+        assert "ghost.md" in s.all()  # untouched
+    assert list(db.parent.glob("baseline.sqlite3.pre-fix-orphans-*")) == []  # no backup written
+
+
+def test_fix_orphans_backup_failure_aborts_drop(tmp_path, monkeypatch, fake):
+    """Atomicity: if the backup fails, the drop must NOT happen (backup ALWAYS precedes drop)."""
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.commit()
+    monkeypatch.setattr(
+        StateStore, "backup_to", lambda self, dest: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    with pytest.raises(OSError):
+        cmd_doctor(args)
+
+    monkeypatch.undo()
+    with StateStore(db, read_only=True) as s:
+        assert "ghost.md" in s.all()  # the drop never ran
+
+
+def test_fix_orphans_keeps_planned_delete_and_conflict_rows(tmp_path, monkeypatch, fake):
+    """Drops ONLY the orphan: a planned-delete row and a would-conflict row (both real engine
+    classifications, not orphans) must survive --fix-orphans."""
+    local = _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    write_file(local, "conf.md", b"local-edit", mtime=6000)  # local changed
+    fake.put("conf.md", b"remote-edit-differs", mtime=7000)  # remote changed -> would-conflict
+    fake.put("del.md", b"d", mtime=1000)  # remote-only present (local deleted) -> planned-delete
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))  # orphan
+        s.upsert(BaselineEntry("del.md", "file", 1, 1000.0, 1, 1000.0))  # -> DELETE_REMOTE
+        s.upsert(BaselineEntry("conf.md", "file", 4, 5000.0, 4, 5000.0))  # -> CONFLICT
+        s.commit()
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    cmd_doctor(args)
+
+    with StateStore(db, read_only=True) as s:
+        rows = s.all()
+        assert "ghost.md" not in rows  # only the orphan dropped
+        assert "del.md" in rows and "conf.md" in rows  # the real-action rows survive
+
+
+def test_fix_orphans_skips_present_but_ignored_file(tmp_path, monkeypatch, fake):
+    """A file still on disk but newly-ignored is absent from the FILTERED scans (so it looks
+    orphan) yet is NOT a ghost — --fix-orphans keeps its row rather than discarding a live
+    file's baseline."""
+    sandbox_home(tmp_path, monkeypatch)
+    local = tmp_path / "vault"
+    local.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(local), ignore=[".DS_Store", "*.tmp"]).save(
+        config_path("default")
+    )
+    monkeypatch.setattr(
+        "ifolder_sync.icloud_client.ICloudClient.from_config", classmethod(lambda cls, c: fake)
+    )
+    write_file(local, "junk.tmp", b"x", mtime=1000)  # present locally, but matched by ignore
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("junk.tmp", "file", 1, 1000.0, 1, 1000.0))
+        s.commit()
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    cmd_doctor(args)
+
+    with StateStore(db, read_only=True) as s:
+        assert "junk.tmp" in s.all()  # not dropped (present-but-ignored, not a ghost)
+    assert list(db.parent.glob("baseline.sqlite3.pre-fix-orphans-*")) == []  # nothing to back up
+
+
+def test_fix_orphans_refuses_when_lock_held(tmp_path, monkeypatch, fake, capsys):
+    """The TOCTOU fix: even if holder_pid reads stale/None (the boot-jitter window), the real
+    SingleInstanceLock is held, so --fix-orphans refuses instead of racing the baseline."""
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    with StateStore(baseline_path("default")) as s:
+        s.upsert(BaselineEntry("ghost.md", "file", 7, 1.0, 7, 1.0))
+        s.commit()
+    held = SingleInstanceLock(lock_path("default"))
+    held.acquire()
+    monkeypatch.setattr("ifolder_sync.cli.holder_pid", lambda _p: None)  # stale-pid window
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    try:
+        with pytest.raises(SystemExit):
+            cmd_doctor(args)
+        assert "race the baseline" in capsys.readouterr().err
+        with StateStore(baseline_path("default"), read_only=True) as s:
+            assert "ghost.md" in s.all()  # never dropped
+    finally:
+        held.release()
+
+
+def test_fix_orphans_drops_dir_orphan(tmp_path, monkeypatch, fake):
+    """A directory orphan (DROP_BASELINE_DIR) is dropped via --fix-orphans like a file one."""
+    _setup_doctor_cli(tmp_path, monkeypatch, fake)
+    db = baseline_path("default")
+    with StateStore(db) as s:
+        s.upsert(BaselineEntry("olddir", "dir", 0, 0.0, 0, 0.0))
+        s.commit()
+
+    args = argparse.Namespace(profile="default", json=False, non_interactive=True, fix_orphans=True)
+    cmd_doctor(args)
+
+    with StateStore(db, read_only=True) as s:
+        assert "olddir" not in s.all()

@@ -168,6 +168,15 @@ class StateStore:
     def delete(self, relpath: str) -> None:
         self.conn.execute("DELETE FROM baseline WHERE relpath = ?", (relpath,))
 
+    def drop_rows(self, relpaths: list[str]) -> int:
+        """Delete a batch of baseline rows in one transaction (the `doctor --fix-orphans`
+        remediation). Returns the number requested. The caller MUST take a backup first (the
+        recovery net for a wrong drop) and ensure no daemon is writing concurrently — this
+        mutates the baseline the same way a sync pass does."""
+        self.conn.executemany("DELETE FROM baseline WHERE relpath = ?", [(r,) for r in relpaths])
+        self.conn.commit()
+        return len(relpaths)
+
     def set_meta(self, key: str, value: str) -> None:
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?, ?) "

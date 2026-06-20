@@ -647,36 +647,109 @@ def _print_doctor_report(plan, profile: str) -> None:
         )
 
 
+def _fix_orphans(plan, profile: str, store, is_ignored=None):
+    """Drop ONLY the provably-orphan baseline rows (present in the baseline, absent from a
+    SUCCESSFUL local+remote scan — `plan()` already guaranteed both scans succeeded or it
+    raised). Backs up the baseline first (the recovery net) and clears the stale walk_cache.
+    Touches NO local or remote content. Returns (count, backup_path). The exact manual repair
+    the 2026-06-20 incident needed, now a guarded command.
+
+    A path matched by the current ignore set is skipped: it is present-but-filtered (a
+    newly-ignored file still on disk), not an absent ghost — keeping a harmless stale row beats
+    discarding a live file's baseline (which would later surface as a conflict, not a clean
+    sync)."""
+    orphans = [r.relpath for r in plan.orphans if is_ignored is None or not is_ignored(r.relpath)]
+    if not orphans:
+        return 0, None
+    src = baseline_path(profile)
+    base = f"{src.name}.pre-fix-orphans-{time.strftime('%Y%m%d-%H%M%S')}"
+    bak = src.with_name(base)
+    n = 1
+    while bak.exists():  # collision-safe: never silently overwrite a prior backup
+        bak = src.with_name(f"{base}-{n}")
+        n += 1
+    store.backup_to(bak)  # WAL-safe consistent copy, taken BEFORE any drop
+    store.drop_rows(orphans)
+    store.set_meta("walk_cache", "")  # a stale etag cache may still carry the orphan subtree
+    return len(orphans), bak
+
+
 def cmd_doctor(args):
     """Read-only audit of baseline vs local vs remote. Runs the engine's decide phase with
     NO apply (`Syncer.plan()`): it changes no user files, never writes the baseline, and
     makes no remote change. (It does a network walk and may persist the iCloud session, like
-    every command.)"""
+    every command.) `--fix-orphans` is the one opt-in write: it backs up the baseline and
+    drops only the orphan rows."""
     from .icloud_client import ICloudClient
+    from .locking import AlreadyRunning, SingleInstanceLock
     from .state import StateStore
     from .syncer import Syncer
 
     profile, cfg = _load_profile(args)
     json_mode = getattr(args, "json", False)
+    fix = getattr(args, "fix_orphans", False)
     show_progress = sys.stderr.isatty() and not json_mode
 
     def progress(msg: str) -> None:
         if show_progress:
             print(msg, file=sys.stderr)
 
-    client = ICloudClient.from_config(cfg)
-    interactive = not getattr(args, "non_interactive", False) and not json_mode
-    progress(f"Connecting to iCloud as {cfg.apple_id}…")
-    client.connect(interactive=interactive)
-    with StateStore(baseline_path(profile)) as store:
-        store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
-        syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
-        progress("Auditing baseline / local / remote… (read-only; no changes to your files)")
-        plan = syncer.plan()
-    if json_mode:
-        print(json.dumps(_doctor_json(plan, profile), indent=2))
-        return
-    _print_doctor_report(plan, profile)
+    lock = None
+    if fix:
+        # --fix-orphans WRITES the baseline, exactly like a sync pass, so it must HOLD the
+        # single-instance lock for the whole write — not merely snapshot holder_pid (a TOCTOU:
+        # a daemon could launch during the multi-second network walk and write the baseline
+        # concurrently, letting the drop discard a row the daemon just repopulated). Same gate
+        # as cmd_sync. The read-only audit (no --fix-orphans) takes no lock and runs alongside.
+        pid = holder_pid(lock_path(profile))
+        if pid:
+            print(
+                f"Error: the daemon is running (pid {pid}); --fix-orphans would race its "
+                f"baseline. Stop it first: `ifolder-sync stop --profile {profile}`.",
+                file=sys.stderr,
+            )
+            sys.exit(Exit.ERROR)
+        lock = SingleInstanceLock(lock_path(profile))
+        try:
+            lock.acquire()
+        except AlreadyRunning as exc:
+            print(
+                f"Error: {exc} — --fix-orphans would race the baseline. Stop the daemon first "
+                f"(`ifolder-sync stop --profile {profile}`).",
+                file=sys.stderr,
+            )
+            sys.exit(Exit.ERROR)
+
+    try:
+        client = ICloudClient.from_config(cfg)
+        interactive = not getattr(args, "non_interactive", False) and not json_mode
+        progress(f"Connecting to iCloud as {cfg.apple_id}…")
+        client.connect(interactive=interactive)
+        with StateStore(baseline_path(profile)) as store:
+            store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
+            syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
+            progress("Auditing baseline / local / remote… (read-only; no changes to your files)")
+            # plan() raises on a scan failure -> aborts here, so --fix-orphans can NEVER act on
+            # a partial scan (which could mislabel a live path as orphan).
+            plan = syncer.plan()
+            if json_mode:
+                payload = _doctor_json(plan, profile)
+                if fix:
+                    count, bak = _fix_orphans(plan, profile, store, syncer._ignored)
+                    payload["fixed_orphans"] = count
+                    payload["backup"] = str(bak) if bak else None
+                print(json.dumps(payload, indent=2))
+                return
+            _print_doctor_report(plan, profile)
+            if fix:
+                count, bak = _fix_orphans(plan, profile, store, syncer._ignored)
+                if count:
+                    print(f"\nFixed: dropped {count} orphan baseline row(s). Backup at {bak}.")
+                else:
+                    print("\nNothing to fix: no orphan baseline rows.")
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 # ---------------------------------------------------- live dashboard (status --watch) ---
@@ -1223,6 +1296,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--non-interactive",
         action="store_true",
         help="fail instead of prompting for 2FA (for cron/scripts)",
+    )
+    pdoc.add_argument(
+        "--fix-orphans",
+        action="store_true",
+        help="drop orphan baseline rows (backs up the baseline first; never touches your "
+        "files or iCloud; refuses while the daemon is running)",
     )
     _add_profile(pdoc)
     pdoc.set_defaults(func=cmd_doctor)
