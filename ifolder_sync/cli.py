@@ -643,7 +643,9 @@ def _print_doctor_report(plan, profile: str) -> None:
 
 def cmd_doctor(args):
     """Read-only audit of baseline vs local vs remote. Runs the engine's decide phase with
-    NO apply (`Syncer.plan()`), so it makes no local, remote, or baseline change."""
+    NO apply (`Syncer.plan()`): it changes no user files, never writes the baseline, and
+    makes no remote change. (It does a network walk and may persist the iCloud session, like
+    every command.)"""
     from .icloud_client import ICloudClient
     from .state import StateStore
     from .syncer import Syncer
@@ -663,7 +665,7 @@ def cmd_doctor(args):
     with StateStore(baseline_path(profile)) as store:
         store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
         syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
-        progress("Auditing baseline / local / remote… (read-only; nothing is written)")
+        progress("Auditing baseline / local / remote… (read-only; no changes to your files)")
         plan = syncer.plan()
     if json_mode:
         print(json.dumps(_doctor_json(plan, profile), indent=2))
@@ -1123,7 +1125,7 @@ def _exception_exit_code(exc: BaseException) -> Optional[Exit]:
 
     from .icloud_client import AuthError
     from .state import CorruptBaselineError
-    from .syncer import LocalScanError, VaultIdentityError
+    from .syncer import LocalScanError, RemoteScanError, VaultIdentityError
 
     if isinstance(
         exc,
@@ -1140,7 +1142,7 @@ def _exception_exit_code(exc: BaseException) -> Optional[Exit]:
         return Exit.AUTH_REQUIRED
     if isinstance(exc, VaultIdentityError):
         return Exit.VAULT_IDENTITY
-    if isinstance(exc, LocalScanError):
+    if isinstance(exc, (LocalScanError, RemoteScanError)):
         return Exit.SCAN_GUARD
     if isinstance(exc, (PyiCloudException, CorruptBaselineError)):
         # P4-4: a 503/429/service error must not dump a multi-screen traceback.

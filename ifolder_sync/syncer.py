@@ -62,6 +62,7 @@ class SyncClient(Protocol):
 
     def refresh(self) -> None: ...
     def ensure_remote_root(self) -> None: ...
+    def remote_root_exists(self) -> bool: ...
     def walk(
         self, is_ignored: Optional[Callable[[str], bool]] = None
     ) -> dict[str, RemoteEntry]: ...
@@ -188,6 +189,13 @@ def _nfc(s: str) -> str:
 class LocalScanError(RuntimeError):
     """The local snapshot is unreliable (permission denied, missing root). The pass
     must abort: a partial local tree is indistinguishable from mass deletion."""
+
+
+class RemoteScanError(RuntimeError):
+    """The remote snapshot is unreliable for a read-only audit: the configured remote root
+    is absent, so an empty listing would read as mass deletion. `doctor` aborts rather than
+    report a phantom 'everything deleted' (the remote counterpart of the local walk guard).
+    `sync_once` never hits this — it `ensure_remote_root()`s the root first."""
 
 
 class VaultIdentityError(RuntimeError):
@@ -530,12 +538,19 @@ class Syncer:
         """Scan both sides and decide an action per path — the whole read-only half of a
         pass, with NO apply. `sync_once` applies the result; `plan()` (doctor) classifies it
         without applying. `ensure_root=False` (doctor) skips the remote-root mkdir so a
-        read-only audit makes no remote change; a genuinely-absent root then surfaces as a
-        walk error that aborts the pass, never a false 'all deleted'."""
+        read-only audit makes no remote change; a genuinely-absent remote root is then
+        detected explicitly (`remote_root_exists`) and aborts the pass with RemoteScanError,
+        because the real client lists a missing root as an EMPTY tree (not an error) — which
+        would otherwise read as 'all deleted' and steer the user toward `--force-delete`."""
         stats = SyncStats()
         self.client.refresh()
         if ensure_root:
             self.client.ensure_remote_root()
+        elif not self.client.remote_root_exists():
+            raise RemoteScanError(
+                f"remote folder {self.cfg.remote_folder!r} not found on iCloud — run a sync "
+                "first or check remote_folder; refusing to report a phantom 'all deleted'"
+            )
 
         baseline = self.store.all()
         self._preflight_local(baseline, dry_run)  # raises -> pass aborts, zero actions
@@ -660,7 +675,8 @@ class Syncer:
         """Read-only consistency audit backing `doctor`: scan + decide, classify, return —
         never apply. `dry_run=True` so every decide helper skips its writes (baseline,
         settle/ignore meta, vault marker); `ensure_root=False` so a missing remote folder is
-        never created. The same three-way diff a real pass uses, surfaced as a report."""
+        never created (and an absent one aborts via RemoteScanError instead of reading as an
+        empty remote). The same three-way diff a real pass uses, surfaced as a report."""
         dp = self._decide_pass(
             dry_run=True, force_delete=False, defer_deletes=False, ensure_root=False
         )

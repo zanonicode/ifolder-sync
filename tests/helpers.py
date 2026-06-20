@@ -33,13 +33,28 @@ class FakeICloud:
     def __init__(self) -> None:
         self.files: dict[str, dict] = {}
         self.fail_walk = False
+        # The configured remote root does not exist: walk() lists it as EMPTY (mirroring the
+        # real ICloudClient._walk_impl, which `return out`s on a missing root rather than
+        # raising) and remote_root_exists() reports False. Lets a test reproduce the
+        # missing-root case the doctor's read-only guard must abort on.
+        self.root_missing = False
         # Paths whose record reports size N>0 in walk()/stat() but whose download() raises
         # UnreadableRemoteError — a faithful publish-before-content fixture (the blob is not
         # yet materialized).
         self.unreadable: set[str] = set()
         self.calls = {
             k: 0
-            for k in ("refresh", "walk", "upload", "download", "delete", "stat", "mkdir", "connect")
+            for k in (
+                "refresh",
+                "walk",
+                "upload",
+                "download",
+                "delete",
+                "stat",
+                "mkdir",
+                "connect",
+                "ensure_remote_root",
+            )
         }
 
     def connect(self, interactive: bool = True, fresh: bool = False) -> None:
@@ -49,12 +64,17 @@ class FakeICloud:
         self.calls["refresh"] += 1
 
     def ensure_remote_root(self) -> None:
-        pass
+        self.calls["ensure_remote_root"] += 1
+
+    def remote_root_exists(self) -> bool:
+        return not self.root_missing
 
     def walk(self, is_ignored: Optional[Callable[[str], bool]] = None) -> dict[str, RemoteEntry]:
         self.calls["walk"] += 1
         if self.fail_walk:
             raise RuntimeError("simulated remote walk failure")
+        if self.root_missing:
+            return {}  # the real client lists a missing remote root as an empty tree
         out = {}
         for rel, m in self.files.items():
             if is_ignored is not None and is_ignored(rel):

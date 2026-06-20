@@ -8,14 +8,30 @@ scan-failure with NO false orphans, and the shared `SyncRow` envelope shape that
 
 from __future__ import annotations
 
+import argparse
+import json
+
 import pytest
 
-from ifolder_sync.cli import _doctor_json, _print_doctor_report, _stats_has_trouble
+from ifolder_sync.cli import (
+    _doctor_json,
+    _print_doctor_report,
+    _stats_has_trouble,
+    cmd_doctor,
+)
+from ifolder_sync.config import Config, config_path
 from ifolder_sync.state import BaselineEntry
-from ifolder_sync.syncer import Op
+from ifolder_sync.syncer import (
+    _CLEANUP_PLAN_STATE,
+    _DIR_PLAN_STATE,
+    _FILE_DECISION_OPS,
+    _FILE_PLAN_STATE,
+    Op,
+    RemoteScanError,
+)
 from ifolder_sync.syncstate import SCHEMA, Plan, SyncRow, make_envelope
 
-from .helpers import write_file
+from .helpers import sandbox_home, write_file
 
 
 def test_orphan_baseline_row_is_reported(make_syncer, fake):
@@ -53,7 +69,8 @@ def test_dir_orphan_classified_via_cleanup(make_syncer, fake):
 
 def test_doctor_is_read_only(make_syncer, fake, local_dir):
     """AT-002: against an in-sync vault, `plan()` writes nothing — no upload/download/delete/
-    mkdir, the baseline rows are byte-identical, and last_sync is not advanced."""
+    mkdir, no remote-root mkdir, the baseline rows are byte-identical, and last_sync is not
+    advanced. It still performs a real scan (refresh + walk increment)."""
     syncer, store = make_syncer()
     write_file(local_dir, "a.txt", b"aaa", mtime=1000)
     fake.put("b.txt", b"bbb", mtime=2000)
@@ -66,10 +83,41 @@ def test_doctor_is_read_only(make_syncer, fake, local_dir):
     plan = syncer.plan()
 
     assert plan.is_clean, [r.relpath for r in plan.rows]
-    for io in ("upload", "download", "delete", "mkdir"):
+    for io in ("upload", "download", "delete", "mkdir", "ensure_remote_root"):
         assert fake.calls[io] == before_calls[io], f"{io} happened during a read-only audit"
+    assert fake.calls["walk"] > before_calls["walk"]  # the audit actually scanned, not no-op'd
+    assert fake.calls["refresh"] > before_calls["refresh"]
     assert store.all() == before_rows  # baseline untouched
     assert store.get_meta("last_sync") == before_sync  # the pass-end meta block never ran
+    store.close()
+
+
+def test_doctor_read_only_with_pending_actions(make_syncer, fake, local_dir):
+    """AT-002 (strong): with REAL drift staged — a planned-upload plus a 0-byte remote husk
+    that drives SETTLE_WAIT through `_escalate_settle` (whose settle_counts persistence is the
+    classic dry_run-gated decide-write) — the audit STILL writes nothing: no IO, baseline and
+    every side-effect meta key (last_sync, settle_counts, vault_uuid, ignore_hash) unchanged."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "keep.md", b"keep", mtime=1000)
+    syncer.sync_once()  # baseline keep.md
+
+    write_file(local_dir, "new.md", b"new", mtime=3000)  # planned-upload
+    write_file(local_dir, "husk.md", b"local body", mtime=4000)
+    fake.put("husk.md", b"", mtime=4000)  # 0-byte remote husk -> SETTLE_WAIT
+
+    before_rows = store.all()
+    before_calls = dict(fake.calls)
+    keys = ("last_sync", "settle_counts", "vault_uuid", "ignore_hash")
+    before_meta = {k: store.get_meta(k) for k in keys}
+
+    plan = syncer.plan()
+
+    assert not plan.is_clean  # there genuinely is drift to report
+    for io in ("upload", "download", "delete", "mkdir", "ensure_remote_root"):
+        assert fake.calls[io] == before_calls[io], f"{io} happened during a read-only audit"
+    assert store.all() == before_rows
+    for k in keys:
+        assert store.get_meta(k) == before_meta[k], f"meta {k} changed under read-only doctor"
     store.close()
 
 
@@ -188,3 +236,115 @@ def test_status_trouble_hint_detection():
     assert _stats_has_trouble("up=1 down=2 errors=0 skipped_deletes=0") is False
     assert _stats_has_trouble(None) is False
     assert _stats_has_trouble("") is False
+
+
+def test_local_scan_failure_aborts_with_no_false_orphans(make_syncer, fake, tmp_path):
+    """AT-005 (local half of invariant #2): a missing vault root with a non-empty baseline
+    aborts the audit (the more dangerous guard — os.walk silently skips unreadable dirs).
+    The baseline is left intact and NOTHING is classified as orphan — no false orphan list."""
+    syncer, store = make_syncer()
+    store.upsert(BaselineEntry("x.md", "file", 7, 1000.0, 7, 1000.0))
+    store.commit()
+    syncer.local_root = tmp_path / "vanished"  # non-existent root + non-empty baseline -> abort
+
+    with pytest.raises(RuntimeError):
+        syncer.plan()
+
+    assert "x.md" in store.all()
+    store.close()
+
+
+def test_missing_remote_root_aborts_not_mass_delete(make_syncer, fake, local_dir):
+    """The HIGH finding's regression: a genuinely-absent remote root must ABORT
+    (RemoteScanError), never read as an empty remote that reports the whole live vault as
+    planned-delete and steers the user toward `sync --force-delete` (bypassing invariant #3)."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "keep1.md", b"a", mtime=1000)
+    write_file(local_dir, "keep2.md", b"b", mtime=1000)
+    syncer.sync_once()  # populate remote + baseline
+
+    fake.root_missing = True  # the configured remote folder is gone -> walk() returns {}
+    with pytest.raises(RemoteScanError):
+        syncer.plan()
+    store.close()
+
+
+def test_would_conflict_via_plan(make_syncer, fake, local_dir):
+    """End-to-end: both sides edited since baseline (mismatched) -> Op.CONFLICT -> a
+    would-conflict row carrying the policy reason."""
+    syncer, store = make_syncer(policy="newer")
+    write_file(local_dir, "c.md", b"base", mtime=5000)
+    syncer.sync_once()  # baseline both
+
+    write_file(local_dir, "c.md", b"local-edit", mtime=6000)
+    fake.put("c.md", b"remote-different-edit", mtime=7000)
+
+    conflicts = [r for r in syncer.plan().rows if r.state == "would-conflict"]
+    assert [r.relpath for r in conflicts] == ["c.md"]
+    assert conflicts[0].reason.startswith("policy=")
+    store.close()
+
+
+def test_suppressed_delete_via_plan(make_syncer, fake, local_dir):
+    """End-to-end: deletions over the threshold are reported as planned-delete with the
+    suppressed reason, and the pass-level suppressed_deletes banner counts them."""
+    syncer, store = make_syncer(delete_threshold_count=1, delete_threshold_pct=1)
+    for n in range(4):
+        write_file(local_dir, f"f{n}.md", b"x", mtime=1000)
+    syncer.sync_once()  # baseline 4 files
+    for n in range(4):
+        (local_dir / f"f{n}.md").unlink()  # 4 local deletes -> 4 DELETE_REMOTE > threshold
+
+    plan = syncer.plan()
+    assert plan.suppressed_deletes >= 4
+    deletes = [r for r in plan.rows if r.state == "planned-delete"]
+    assert deletes and all(r.reason == "suppressed (over delete threshold)" for r in deletes)
+    store.close()
+
+
+def test_kind_conflict_counts_as_error_via_plan(make_syncer, fake, local_dir):
+    """End-to-end: a file-on-one-side / dir-on-the-other is counted in plan.errors and is
+    EXCLUDED before decide, so it produces no row (only the count flows through)."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "x", b"file-here", mtime=1000)  # local: file named "x"
+    fake.mkdir("x")  # remote: dir named "x"
+
+    plan = syncer.plan()
+    assert plan.errors == 1
+    assert all(r.relpath != "x" for r in plan.rows)
+    store.close()
+
+
+def test_classify_maps_cover_every_decision_op():
+    """Closure guard: every Op the decide phase can return is either mapped to a report state
+    or is an intended in-sync no-op. A future Op added to decide without a plan-state entry
+    would otherwise be SILENTLY dropped from the doctor report — this turns that into a CI
+    failure (mirroring the _FILE_DECISION_OPS closure intent in syncer.py)."""
+    assert _FILE_DECISION_OPS <= set(_FILE_PLAN_STATE) | {Op.RECORD}
+    # dir create-side and cleanup-side deciders, against their maps + the dir no-ops
+    assert {Op.MKDIR_REMOTE, Op.MKDIR_LOCAL} <= set(_DIR_PLAN_STATE)
+    assert {Op.RMDIR_REMOTE, Op.RMDIR_LOCAL, Op.DROP_BASELINE_DIR} <= set(_CLEANUP_PLAN_STATE)
+
+
+def test_cmd_doctor_json_is_read_only(tmp_path, monkeypatch, capsys, fake):
+    """The CLI entrypoint end-to-end: `doctor --json` against an injected fake client emits
+    the schema-1 envelope and performs no write IO and no remote-root mkdir."""
+    sandbox_home(tmp_path, monkeypatch)
+    local = tmp_path / "vault"
+    local.mkdir()
+    write_file(local, "a.md", b"a", mtime=1000)
+    cfg = Config(apple_id="x@y.com", remote_folder="", local_folder=str(local))
+    cfg.save(config_path("default"))
+    monkeypatch.setattr(
+        "ifolder_sync.icloud_client.ICloudClient.from_config",
+        classmethod(lambda cls, c: fake),
+    )
+
+    args = argparse.Namespace(profile="default", json=True, non_interactive=True)
+    cmd_doctor(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["schema"] == SCHEMA
+    assert any(r["state"] == "planned-upload" and r["relpath"] == "a.md" for r in data["rows"])
+    for io in ("upload", "download", "delete", "mkdir", "ensure_remote_root"):
+        assert fake.calls[io] == 0, f"{io} happened during a read-only doctor"
