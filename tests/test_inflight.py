@@ -70,6 +70,39 @@ def test_engine_emits_carry_pass_id_and_op(tmp_path, fake, local_dir):
     store.close()
 
 
+def test_engine_emits_queue_for_all_pending_transfers(tmp_path, fake, local_dir):
+    """The whole pending file queue is announced up front (queued), before the serial engine
+    starts the first transfer — so the dashboard shows what's coming, not just the current file."""
+    events: list = []
+    syncer, store = _syncer_with_observer(tmp_path, fake, local_dir, events)
+    for name in ("a.md", "b.md", "c.md"):
+        write_file(local_dir, name, name.encode(), mtime=1000)
+
+    syncer.sync_once()
+
+    queued = [e.relpath for e in events if e.state == "queued"]
+    assert set(queued) == {"a.md", "b.md", "c.md"}  # the full queue
+    first_queued = next(i for i, e in enumerate(events) if e.state == "queued")
+    first_upload = next(i for i, e in enumerate(events) if e.state == "uploading")
+    assert first_queued < first_upload  # queue announced before the first transfer starts
+    store.close()
+
+
+def test_surface_queued_is_throttled_active_forces(tmp_path):
+    """'queued' coalesces (so enqueuing hundreds is a few writes); the first ACTIVE announce
+    force-flushes and reveals the accumulated queue + the in-flight row."""
+    surf = InflightSurface(tmp_path / "status.json", min_write_interval_ms=10_000)
+    surf.pass_started()
+
+    surf.record(SyncEvent(1.0, 1, "a.md", Op.UPLOAD, "queued", "file"))  # throttled
+    surf.record(SyncEvent(1.0, 1, "b.md", Op.UPLOAD, "queued", "file"))  # throttled
+    assert json.loads((tmp_path / "status.json").read_text())["rows"] == []  # coalesced
+
+    surf.record(SyncEvent(2.0, 1, "a.md", Op.UPLOAD, "uploading", "file"))  # active -> force
+    rows = json.loads((tmp_path / "status.json").read_text())["rows"]
+    assert {r["relpath"] for r in rows} == {"a.md", "b.md"}  # whole queue revealed
+
+
 def test_surface_record_upsert_and_done_removes(tmp_path):
     surf = InflightSurface(tmp_path / "status.json", min_write_interval_ms=0)
     surf.pass_started(pid=123, last_sync=None, last_stats=None, last_error=None)

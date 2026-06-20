@@ -24,6 +24,14 @@ from .syncstate import SyncEvent, SyncRow, make_envelope
 
 log = logging.getLogger("ifolder-sync.inflight")
 
+# States that force an immediate flush: the engine emits them right before a blocking IO and
+# then blocks, so a throttled flush would hide the transfer while it runs. 'queued' (the whole
+# planned set, emitted up front) and 'done' (a removal) are NOT active — they stay throttled so
+# enqueuing hundreds of files coalesces into a few writes.
+_ACTIVE_STATES = frozenset(
+    {"uploading", "downloading", "deleting-local", "deleting-remote", "conflict"}
+)
+
 
 class InflightSurface:
     def __init__(self, path: Path, *, min_write_interval_ms: int = 200) -> None:
@@ -65,7 +73,10 @@ class InflightSurface:
                 reason=event.reason,
                 last_seen_pass=event.pass_id,
             )
-            self._flush(force=True)  # show the transfer immediately, before its blocking IO
+            # An active transfer flushes immediately (before its blocking IO); 'queued' is
+            # throttled so emitting the whole queue up front coalesces, then the first active
+            # announce reveals the full accumulated queue.
+            self._flush(force=event.state in _ACTIVE_STATES)
 
     def pass_finished(self, stuck: list[SyncRow], **header: Any) -> None:
         """A pass ended: replace the transient in-flight rows with the engine's authoritative

@@ -355,6 +355,20 @@ class Syncer:
         except Exception:  # noqa: BLE001 — observability must never break a pass
             pass
 
+    def _emit_queue(
+        self, file_actions: list[tuple[str, Op]], covered: set[str], suppress_deletes: bool
+    ) -> None:
+        """Emit a 'queued' row for every file transfer this pass WILL apply (same skip rules as
+        the apply loop), so the dashboard shows the full pending queue, not just the in-flight
+        file. Best-effort + no-op without an observer; 'queued' flushes are throttled."""
+        if self._on_event is None:
+            return
+        for relpath, op in file_actions:
+            if relpath in covered or (suppress_deletes and op in _FILE_DESTRUCTIVE):
+                continue
+            if op in _INFLIGHT_STATE:
+                self._emit(relpath, op, "queued")
+
     def _commit(self, dry_run: bool) -> None:
         """Per-action durability: with one commit only at pass end, a SIGKILL mid-pass
         rolls back every transferred file's baseline row, turning each into a spurious
@@ -684,6 +698,10 @@ class Syncer:
                 break
             self._delete_remote_tree(root, covered, stats, dry_run)
             self._commit(dry_run)
+        # Surface the whole pending file queue to the dashboard up front (best-effort), so the
+        # observer sees what is coming, not just the one file the serial engine is on right now;
+        # each row then transitions queued -> uploading/downloading -> done as it is applied.
+        self._emit_queue(file_actions, covered, suppress_deletes)
         for relpath, op in file_actions:
             if self._should_stop():
                 break
