@@ -53,6 +53,7 @@ from .config import (
     session_paths,
     sessions_dir,
     state_dir,
+    status_path,
     tcc_protected,
     trash_dir,
     write_vault_marker,
@@ -343,6 +344,7 @@ def _daemon_lock(profile: str, action: str):
 
 def cmd_sync(args):
     from .icloud_client import ICloudClient
+    from .inflight import InflightSurface
     from .state import StateStore
     from .syncer import Syncer
 
@@ -356,6 +358,18 @@ def cmd_sync(args):
         if show_progress:
             print(msg, file=sys.stderr)
 
+    # Feed the live `status --watch` surface for a foreground sync too — without this a manual
+    # sync uploads invisibly (the daemon used to be the only producer). --dry-run writes
+    # nothing, so it takes no surface (and no lock).
+    surface = (
+        InflightSurface(
+            status_path(profile),
+            min_write_interval_ms=int(getattr(cfg, "inflight_min_write_interval_ms", 200)),
+        )
+        if not args.dry_run and getattr(cfg, "inflight_surface", True)
+        else None
+    )
+
     # A non-dry-run sync mutates the baseline, so it holds the daemon's lock for the whole
     # pass; --dry-run writes nothing and is allowed to run even while the daemon holds it.
     lock_cm = nullcontext() if args.dry_run else _daemon_lock(profile, "a manual sync")
@@ -366,12 +380,27 @@ def cmd_sync(args):
         # non-interactive when --json is set (an auth gap then fails fast to stderr + exit 3).
         interactive = not args.non_interactive and not json_mode
         progress(f"Connecting to iCloud as {cfg.apple_id}…")
+        # Connect outside the surface/StateStore scope: a connect failure writes no snapshot.
         client.connect(interactive=interactive)
         with StateStore(baseline_path(profile)) as store:
             store.quick_check()  # corrupt baseline -> clear RuntimeError, exit 1 (no traceback)
-            syncer = Syncer(cfg, client, store, trash_dir=trash_dir(profile))
+            syncer = Syncer(
+                cfg,
+                client,
+                store,
+                trash_dir=trash_dir(profile),
+                on_event=(surface.record if surface else None),
+            )
             progress("Scanning local and remote… (the first sync can take ~1 minute)")
-            stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
+            if surface:
+                _inflight_start(surface, store)
+            try:
+                stats = syncer.sync_once(dry_run=args.dry_run, force_delete=args.force_delete)
+            finally:
+                # Always clear the live rows (a mid-pass failure must not leave "uploading X"
+                # stuck in status.json); also stamps the just-finished pass's meta.
+                if surface:
+                    _inflight_finish(surface, store)
         if getattr(args, "json", False):
             print(json.dumps(_sync_json(stats, args.dry_run), indent=2))
         else:
@@ -771,13 +800,48 @@ def _attention_rows(profile: str) -> list:
     return stuck_rows(settle, unreadable)
 
 
+def _inflight_header(store) -> dict[str, Any]:
+    """Header a foreground sync stamps into status.json, mirroring the daemon's
+    (daemon.py `_inflight_header`): the live pid plus the persisted last-pass meta."""
+    return {
+        "pid": os.getpid(),
+        "last_sync": store.get_meta("last_sync"),
+        "last_stats": store.get_meta("last_stats"),
+        "last_error": store.get_meta("last_error"),
+    }
+
+
+def _inflight_stuck(store) -> list:
+    """The engine's persisted stuck registries as rows, read from the open writer store
+    (the daemon reads the same two meta keys for `pass_finished`)."""
+    from .syncstate import stuck_rows
+
+    return stuck_rows(
+        _parse_json_meta(store.get_meta("settle_counts")),
+        _parse_json_meta(store.get_meta("unreadable_counts")),
+    )
+
+
+def _inflight_start(surface, store) -> None:
+    """Best-effort: the live surface must never break a sync pass (mirrors the daemon guards)."""
+    try:
+        surface.pass_started(**_inflight_header(store))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("ifolder-sync.inflight").debug("pass_started skipped: %s", exc)
+
+
+def _inflight_finish(surface, store) -> None:
+    try:
+        surface.pass_finished(_inflight_stuck(store), **_inflight_header(store))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("ifolder-sync.inflight").debug("pass_finished skipped: %s", exc)
+
+
 def _read_status_snapshot(profile: str) -> Optional[dict[str, Any]]:
     """Read the daemon's live status.json snapshot (feature 04 Phase 2), or None when absent/
     unreadable. It carries the in-flight transfer rows the daemon is moving RIGHT NOW plus a
     header it stamped — so the observer never opens the baseline at all when it is present.
     Best-effort: a torn/missing/corrupt snapshot just falls back to the meta fold."""
-    from .config import status_path
-
     path = status_path(profile)
     try:
         data = json.loads(path.read_text())
@@ -796,10 +860,13 @@ def _dashboard_view(profile: str) -> dict[str, Any]:
     state, meta = _baseline_meta(profile)
     last_sync = meta.get("last_sync")
     daemon = _daemon_status(profile)
-    # Only trust the live snapshot while the daemon is RUNNING: a dead daemon's status.json is
-    # stale, and its in-flight rows ("uploading X") must NOT render as live activity. When
-    # stopped, fall back to the persisted stuck set (the meta fold), which is still valid.
+    # Trust the live snapshot only when its writer is the CURRENT lock holder: a snapshot whose
+    # `pid` differs from the live holder is stale (a dead daemon's file, or one a prior process
+    # left behind) and its in-flight rows ("uploading X") must NOT render as live activity.
+    # Otherwise fall back to the persisted stuck set (the meta fold), which is still valid.
     snap = _read_status_snapshot(profile) if daemon["running"] else None
+    if snap is not None and snap.get("pid") != daemon["pid"]:
+        snap = None
     if snap is not None:
         # Live path: the daemon's snapshot is authoritative for the rows (in-flight + stuck)
         # and the header it stamped; the meta read above still supplies the baseline state.
