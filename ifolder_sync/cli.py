@@ -587,6 +587,9 @@ def cmd_uninstall(args):
     if not _converge_stop(profile):
         print(f"launchctl bootout failed for {label}.", file=sys.stderr)
         sys.exit(Exit.ERROR)
+    # Verify the daemon actually stopped before removing its job definition, so we never report
+    # "uninstalled" while the process is still draining (same post-condition gate as `stop`).
+    _verify(profile, want_running=False, timeout=_lifecycle_timeout(profile))
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
     existed = plist_path.exists()
     plist_path.unlink(missing_ok=True)

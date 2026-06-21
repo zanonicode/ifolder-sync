@@ -220,6 +220,7 @@ def test_stop_boots_out_and_verifies(tmp_path, monkeypatch, capsys):
 
     target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
     assert ["bootout", target] in lc.calls
+    assert ["print", target] in lc.calls  # the verify post-condition step was exercised
     assert "stopped" in capsys.readouterr().out
 
 
@@ -229,7 +230,10 @@ def test_stop_bootout_rc3_is_success(tmp_path, monkeypatch):
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
 
+    calls = []
+
     def lc(*args):
+        calls.append(list(args))
         if args[0] == "bootout":
             return MagicMock(returncode=3, stdout="", stderr="Boot-out failed: 3: No such process")
         if args[0] == "print":
@@ -238,6 +242,8 @@ def test_stop_bootout_rc3_is_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "_lc", lc)
     main(["stop", "--profile", "work"])  # rc 3 tolerated -> no raise
+    target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
+    assert ["bootout", target] in calls and ["print", target] in calls
 
 
 def test_start_bootstrap_failure_exits(tmp_path, monkeypatch):
@@ -247,8 +253,9 @@ def test_start_bootstrap_failure_exits(tmp_path, monkeypatch):
     lc = _fake_lc(running_pid=None, bootstrap_rc=5)
     monkeypatch.setattr(cli, "_lc", lc)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc:
         main(["start", "--background", "--profile", "work"])
+    assert exc.value.code == cli.Exit.ERROR
 
 
 def test_restart_converges_and_verifies(tmp_path, monkeypatch, capsys):
