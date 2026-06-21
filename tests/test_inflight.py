@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import json
 import shutil
+from unittest.mock import MagicMock
 
+import pytest
+
+import ifolder_sync.cli as cli
 from ifolder_sync.cli import _dashboard_view, _read_status_snapshot, cmd_sync
 from ifolder_sync.config import Config, baseline_path, config_path, status_path
 from ifolder_sync.inflight import InflightSurface
@@ -21,6 +25,15 @@ from ifolder_sync.syncer import Op, Syncer
 from ifolder_sync.syncstate import SyncEvent, SyncRow
 
 from .helpers import FAR, PERMISSIVE_THRESHOLDS, FakeICloud, sandbox_home, write_file
+
+
+@pytest.fixture(autouse=True)
+def _no_real_launchctl(monkeypatch):
+    """Never shell out to real launchctl: default the managed-daemon probe to not-loaded
+    (print rc 113), so a test's `holder_pid` monkeypatch drives the foreground fallback."""
+    monkeypatch.setattr(
+        cli, "_lc", lambda *a: MagicMock(returncode=113, stdout="", stderr="not found")
+    )
 
 
 def _syncer_with_observer(tmp_path, fake, local_dir, events):

@@ -17,6 +17,23 @@ reviews:
       instructions: |
         Flag concrete implementation bugs only. Do NOT comment on the data-loss invariants
         as policy — a separate custom reviewer (the Invariant Guardian) owns those.
+    - path: "ifolder_sync/cli.py"
+      instructions: |
+        For lifecycle code (start/stop/restart/status/install-agent/uninstall, _lc,
+        _converge_*, _observe_daemon, _verify, _write_agent_plist) consult
+        docs/LIFECYCLE_INVARIANTS.md: the plist keys + invariant 9 (deliberate exit-0 under
+        KeepAlive SuccessfulExit=false) must be preserved; every lifecycle command must verify
+        its post-condition before reporting success; liveness is observed (launchctl print /
+        the lock), never inferred from a single heuristic; baseline-writing commands HOLD the
+        single-instance lock.
+    - path: "ifolder_sync/daemon.py"
+      instructions: |
+        Consult docs/LIFECYCLE_INVARIANTS.md — preserve invariant 9 (deliberate exit-0 under
+        launchd) and the lock-first run() ordering.
+    - path: "ifolder_sync/locking.py"
+      instructions: |
+        Consult docs/LIFECYCLE_INVARIANTS.md — the lock is the single-instance baseline mutex
+        (pidfile 0600); changes must keep crash-safe release and the single-writer guarantee.
   # Advisory by construction: post a commit status as a badge, but never flip it on a
   # CodeRabbit error and never escalate to a "Request changes" review. No AI lane is ever
   # a hard merge gate (the deterministic checks are the only required statuses).

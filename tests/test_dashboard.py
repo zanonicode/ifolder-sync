@@ -10,9 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from unittest.mock import MagicMock
 
 import pytest
 
+import ifolder_sync.cli as cli
 from ifolder_sync.cli import (
     _attention_rows,
     _dashboard_banner,
@@ -32,6 +34,15 @@ from ifolder_sync.state import BaselineEntry, StateStore
 from ifolder_sync.syncstate import SyncRow
 
 from .helpers import sandbox_home
+
+
+@pytest.fixture(autouse=True)
+def _no_real_launchctl(monkeypatch):
+    """Never shell out to real launchctl: default the managed-daemon probe to not-loaded
+    (print rc 113), so a test's `holder_pid` monkeypatch drives the foreground fallback."""
+    monkeypatch.setattr(
+        cli, "_lc", lambda *a: MagicMock(returncode=113, stdout="", stderr="not found")
+    )
 
 
 def test_read_only_store_rejects_writes_but_reads(tmp_path):

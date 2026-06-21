@@ -30,6 +30,17 @@ from ifolder_sync.syncer import Syncer
 from .helpers import PERMISSIVE_THRESHOLDS, FakeICloud, sandbox_home, write_file
 
 
+@pytest.fixture(autouse=True)
+def _no_real_launchctl(monkeypatch):
+    """The suite must never shell out to real launchctl. Default `_lc` to a not-loaded job
+    (print rc 113); tests that assert command construction or liveness override it."""
+    monkeypatch.setattr(
+        cli,
+        "_lc",
+        lambda *a: MagicMock(returncode=113, stdout="", stderr="not found"),
+    )
+
+
 def test_profile_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     root = tmp_path / "ifolder-sync"
@@ -123,8 +134,29 @@ def _make_profile_config(profile: str, **overrides) -> None:
     Config(apple_id="x@y.com", local_folder="/tmp/vault", **overrides).save(config_path(profile))
 
 
-def _ok_run() -> MagicMock:
-    return MagicMock(return_value=MagicMock(returncode=0, stderr="", stdout=""))
+_PRINT_RUNNING = "\tstate = running\n\tpid = {pid}\n\tlast exit code = (never exited)\n"
+
+
+def _fake_lc(running_pid: int | None = None, bootstrap_rc: int = 0):
+    """A fake `_lc` recording every launchctl arg-vector. `running_pid` makes `print` report
+    a running daemon (so a verify after start succeeds); None makes `print` return rc 113
+    (not loaded). Other verbs return rc 0 unless bootstrap_rc overrides bootstrap."""
+    calls: list[list[str]] = []
+
+    def lc(*args: str):
+        calls.append(list(args))
+        verb = args[0]
+        if verb == "print":
+            if running_pid is None:
+                return MagicMock(returncode=113, stdout="", stderr="not found")
+            return MagicMock(returncode=0, stdout=_PRINT_RUNNING.format(pid=running_pid), stderr="")
+        if verb == "bootstrap":
+            err = "boom" if bootstrap_rc else ""
+            return MagicMock(returncode=bootstrap_rc, stdout="", stderr=err)
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    lc.calls = calls  # type: ignore[attr-defined]
+    return lc
 
 
 def test_write_agent_plist(tmp_path, monkeypatch):
@@ -138,66 +170,126 @@ def test_write_agent_plist(tmp_path, monkeypatch):
     assert "<string>work</string>" in body
 
 
-def test_start_background_loads_agent(tmp_path, monkeypatch):
+def _verbs(lc) -> list[str]:
+    return [c[0] for c in lc.calls]
+
+
+def test_start_background_converges_and_verifies(tmp_path, monkeypatch):
+    """`start --background` runs the modern converge chain (bootout -> bootstrap -> enable ->
+    kickstart -k) against gui/<uid>/<label>, then verifies via `print` before claiming success."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
-    run = _ok_run()
-    monkeypatch.setattr(cli.subprocess, "run", run)
+    lc = _fake_lc(running_pid=4321)
+    monkeypatch.setattr(cli, "_lc", lc)
 
     main(["start", "--background", "--profile", "work"])
 
-    cmd = run.call_args[0][0]
-    assert cmd[:3] == ["launchctl", "load", "-w"]
-    assert cmd[3].endswith("com.ifolder-sync.work.plist")
-    assert str(tmp_path) in cmd[3]  # wrote into the sandbox, not the real ~/Library
-    assert run.call_args[1]["check"] is False
-    assert run.call_args[1]["capture_output"] is True
+    target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
+    domain = f"gui/{__import__('os').getuid()}"
+    # The converge order: bootout, bootstrap, enable, kickstart -k (print(s) for verify last).
+    converge = [c for c in lc.calls if c[0] != "print"]
+    assert converge[0] == ["bootout", target]
+    assert converge[1][0] == "bootstrap" and converge[1][1] == domain
+    assert converge[1][2].endswith("com.ifolder-sync.work.plist")
+    assert converge[2] == ["enable", target]
+    assert converge[3] == ["kickstart", "-k", target]
+    assert "print" in _verbs(lc)  # the post-condition was actually observed
 
 
-def test_stop_unloads_agent(tmp_path, monkeypatch):
+def test_start_background_failed_verify_exits(tmp_path, monkeypatch):
+    """AT-003: a daemon that never comes up (preflight exit 0, invariant 9) makes verify time
+    out -> the command reports failure and exits non-zero, never false success."""
     _sandbox(tmp_path, monkeypatch)
-    _write_agent_plist("work")  # the plist must exist for stop to act
-    run = _ok_run()
-    monkeypatch.setattr(cli.subprocess, "run", run)
+    _make_profile_config("work", lifecycle_verify_timeout_seconds=0.05)
+    lc = _fake_lc(running_pid=None)  # print always 113 -> never running
+    monkeypatch.setattr(cli, "_lc", lc)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["start", "--background", "--profile", "work"])
+    assert exc.value.code == cli.Exit.ERROR
+
+
+def test_stop_boots_out_and_verifies(tmp_path, monkeypatch, capsys):
+    """`stop` issues `bootout gui/<uid>/<label>` and verifies the job is gone."""
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    lc = _fake_lc(running_pid=None)  # print 113 -> already not loaded after bootout
+    monkeypatch.setattr(cli, "_lc", lc)
 
     main(["stop", "--profile", "work"])
 
-    cmd = run.call_args[0][0]
-    assert cmd[:3] == ["launchctl", "unload", "-w"]
-    assert cmd[3].endswith("com.ifolder-sync.work.plist")
+    target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
+    assert ["bootout", target] in lc.calls
+    assert ["print", target] in lc.calls  # the verify post-condition step was exercised
+    assert "stopped" in capsys.readouterr().out
 
 
-def test_stop_without_plist_is_graceful(tmp_path, monkeypatch):
-    _sandbox(tmp_path, monkeypatch)
-    run = _ok_run()
-    monkeypatch.setattr(cli.subprocess, "run", run)
-
-    main(["stop", "--profile", "work"])  # no plist -> nothing to unload
-
-    run.assert_not_called()
-
-
-def test_launchctl_benign_already_loaded_does_not_exit(tmp_path, monkeypatch):
+def test_stop_bootout_rc3_is_success(tmp_path, monkeypatch):
+    """bootout rc 3 ("No such process") = the job was not loaded -> already-stopped success,
+    no SystemExit."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
-    run = MagicMock(
-        return_value=MagicMock(returncode=1, stderr="/x.plist: service already loaded", stdout="")
-    )
-    monkeypatch.setattr(cli.subprocess, "run", run)
 
-    main(["start", "--background", "--profile", "work"])  # benign stderr -> no SystemExit
+    calls = []
+
+    def lc(*args):
+        calls.append(list(args))
+        if args[0] == "bootout":
+            return MagicMock(returncode=3, stdout="", stderr="Boot-out failed: 3: No such process")
+        if args[0] == "print":
+            return MagicMock(returncode=113, stdout="", stderr="not found")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli, "_lc", lc)
+    main(["stop", "--profile", "work"])  # rc 3 tolerated -> no raise
+    target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
+    assert ["bootout", target] in calls and ["print", target] in calls
 
 
-def test_launchctl_real_failure_exits(tmp_path, monkeypatch):
+def test_start_bootstrap_failure_exits(tmp_path, monkeypatch):
+    """A non-zero `bootstrap` is a real failure: report it and exit non-zero (no false success)."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
-    run = MagicMock(
-        return_value=MagicMock(returncode=1, stderr="Bootstrap failed: 5: I/O error", stdout="")
-    )
-    monkeypatch.setattr(cli.subprocess, "run", run)
+    lc = _fake_lc(running_pid=None, bootstrap_rc=5)
+    monkeypatch.setattr(cli, "_lc", lc)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc:
         main(["start", "--background", "--profile", "work"])
+    assert exc.value.code == cli.Exit.ERROR
+
+
+def test_restart_converges_and_verifies(tmp_path, monkeypatch, capsys):
+    """`restart` is a first-class verb running the same converge+verify chain (force-respawn)."""
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    lc = _fake_lc(running_pid=777)
+    monkeypatch.setattr(cli, "_lc", lc)
+
+    main(["restart", "--profile", "work"])
+
+    target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
+    converge = [c for c in lc.calls if c[0] != "print"]
+    assert converge[0] == ["bootout", target]
+    assert converge[-1] == ["kickstart", "-k", target]
+    assert "restarted" in capsys.readouterr().out
+
+
+def test_uninstall_stops_and_removes_plist(tmp_path, monkeypatch, capsys):
+    """`uninstall` boots out the job and removes the .plist; idempotent when nothing exists."""
+    _sandbox(tmp_path, monkeypatch)
+    plist = _write_agent_plist("work")
+    lc = _fake_lc(running_pid=None)
+    monkeypatch.setattr(cli, "_lc", lc)
+
+    main(["uninstall", "--profile", "work"])
+
+    target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
+    assert ["bootout", target] in lc.calls
+    assert not plist.exists()  # the .plist was removed
+    assert "Uninstalled" in capsys.readouterr().out
+
+    main(["uninstall", "--profile", "work"])  # second run: nothing to remove, still clean
+    assert "nothing to uninstall" in capsys.readouterr().out
 
 
 def test_status_lists_all_profiles(tmp_path, monkeypatch, capsys):
@@ -228,6 +320,7 @@ def test_status_single_profile_detail(tmp_path, monkeypatch, capsys):
 def test_status_shows_daemon_stopped(tmp_path, monkeypatch, capsys):
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
+    monkeypatch.setattr(cli, "_lc", _fake_lc(running_pid=None))  # print 113 + no lock -> stopped
 
     main(["status", "--profile", "work"])
 
@@ -236,18 +329,31 @@ def test_status_shows_daemon_stopped(tmp_path, monkeypatch, capsys):
 
 
 def test_status_shows_daemon_running_with_pid(tmp_path, monkeypatch, capsys):
-    import os
-
-    from ifolder_sync.config import lock_path
-
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
-    lock_path("work").write_text(str(os.getpid()))  # a live pid holds the lock
+    # launchd reports the managed daemon running (the supervisor's own pid).
+    monkeypatch.setattr(cli, "_lc", _fake_lc(running_pid=99468))
 
     main(["status", "--profile", "work"])
 
     out = capsys.readouterr().out
-    assert f"Daemon:        running (pid {os.getpid()})" in out
+    assert "Daemon:        running (pid 99468)" in out
+
+
+def test_status_shows_foreground_daemon_via_lock_fallback(tmp_path, monkeypatch, capsys):
+    """A foreground daemon (no launchd job, print rc 113) but a live lock holder is reported
+    running (foreground), not stopped — Decision 5."""
+    import os
+
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    lock_path("work").write_text(str(os.getpid()))  # a live pid holds the lock
+    monkeypatch.setattr(cli, "_lc", _fake_lc(running_pid=None))  # no launchd job
+
+    main(["status", "--profile", "work"])
+
+    out = capsys.readouterr().out
+    assert f"running (pid {os.getpid()}, foreground)" in out
 
 
 # --- session / auth state in status -------------------------------------------
