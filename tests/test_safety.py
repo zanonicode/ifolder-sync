@@ -102,6 +102,18 @@ def test_single_instance_lock(tmp_path):
     b.release()
 
 
+def test_lock_file_is_owner_only_0600(tmp_path):
+    """Invariant 7 posture: the pidfile is born 0600 (owner-only) at create time, like the
+    session/cookie credential files — no world-readable window and no dependence on umask."""
+    lock_path = tmp_path / "daemon.lock"
+    lock = SingleInstanceLock(lock_path)
+    lock.acquire()
+    try:
+        assert oct(lock_path.stat().st_mode & 0o777) == "0o600"
+    finally:
+        lock.release()
+
+
 def test_stale_lock_reclaimed(tmp_path):
     lock_path = tmp_path / "daemon.lock"
     lock_path.write_text("2147483647")  # almost certainly not a live PID (legacy 1-line lock)

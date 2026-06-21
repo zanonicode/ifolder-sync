@@ -524,6 +524,32 @@ def test_rebaseline_refuses_running_daemon(tmp_path, monkeypatch):
     assert baseline_path("work").parent.exists()
 
 
+def test_rebaseline_refuses_when_lock_held(tmp_path, monkeypatch, capsys):
+    """TOCTOU: even if holder_pid reads None (the boot-jitter window), the real
+    SingleInstanceLock is held, so rebaseline refuses instead of deleting the baseline out
+    from under a daemon that started right after the snapshot. Mirrors the --fix-orphans fix."""
+    from ifolder_sync.locking import SingleInstanceLock
+
+    _sandbox(tmp_path, monkeypatch)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("work"))
+    store = StateStore(baseline_path("work"))
+    store.set_meta("vault_uuid", "keep-me")  # a non-empty baseline that must survive
+    store.close()
+
+    held = SingleInstanceLock(lock_path("work"))
+    held.acquire()
+    monkeypatch.setattr("ifolder_sync.cli.holder_pid", lambda _p: None)  # stale-pid window
+    try:
+        with pytest.raises(SystemExit):
+            main(["rebaseline", "--profile", "work"])
+        assert "race the baseline" in capsys.readouterr().err
+        assert baseline_path("work").exists()  # never deleted
+    finally:
+        held.release()
+
+
 # --------------------------------------------------- plist: no-crash-loop keys ---
 def test_plist_has_no_crash_loop_keys(tmp_path, monkeypatch):
     _sandbox(tmp_path, monkeypatch)

@@ -89,10 +89,12 @@ class SingleInstanceLock:
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # O_EXCL makes creation atomic: two simultaneous starts cannot both win.
+        # O_EXCL makes creation atomic: two simultaneous starts cannot both win. 0600 keeps
+        # the pidfile owner-only (invariant 7's posture for state files); umask only clears
+        # bits, so the mode is an exact ceiling on a freshly O_EXCL-created file.
         for _ in range(2):
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
                 pid = holder_pid(self.path)
                 if pid:
