@@ -33,7 +33,6 @@ from pyicloud.exceptions import (
 )
 from pyicloud.utils import (
     get_password_from_keyring,
-    password_exists_in_keyring,
     store_password_in_keyring,
 )
 
@@ -183,6 +182,7 @@ class ICloudClient:
         walk_workers: int = 4,
         full_walk_interval: int = 600,
         request_timeout: int = 60,
+        keyring_timeout: float = 10.0,
         strict_child_count: bool = False,
     ):
         self.apple_id = apple_id
@@ -193,6 +193,7 @@ class ICloudClient:
         self.walk_workers = max(1, int(walk_workers))
         self.full_walk_interval = max(0, int(full_walk_interval))
         self.request_timeout = int(request_timeout)
+        self._keyring_timeout = float(keyring_timeout)
         self.strict_child_count = bool(strict_child_count)
         self.api: Optional[PyiCloudService] = None
         # Etag-keyed walk cache: folder relpath -> subtree fingerprint, and
@@ -218,6 +219,7 @@ class ICloudClient:
             walk_workers=cfg.walk_workers,
             full_walk_interval=cfg.full_walk_interval_seconds,
             request_timeout=cfg.request_timeout_seconds,
+            keyring_timeout=cfg.keyring_timeout_seconds,
             strict_child_count=cfg.strict_child_count,
         )
 
@@ -235,10 +237,13 @@ class ICloudClient:
     def connect(self, interactive: bool = True, fresh: bool = False) -> None:
         """Authenticate and, if needed, run 2FA. The trusted session (cookies +
         trust token) lives in state_dir, so after one successful 2FA the daemon
-        connects without a code (Apple trusts the session ~90 days observed). Password
-        from env IFOLDER_SYNC_PASSWORD, the Keychain, or a prompt, in that order; a
-        prompt-sourced password is stored in the Keychain for the non-interactive
-        daemon.
+        connects without a code (Apple trusts the session ~90 days observed).
+
+        The password (env IFOLDER_SYNC_PASSWORD, the Keychain, or a prompt, in that
+        order; a prompt-sourced one is stored in the Keychain for the daemon) is read
+        LAZILY — only when the saved session is gone and pyicloud needs a from-scratch
+        SRP login (see _authenticate_token_first). A valid session reconnects with no
+        Keychain access at all.
 
         fresh=True discards any saved session first. Even without fresh, an
         incomplete 2FA session (no trust token) is discarded automatically
@@ -261,14 +266,60 @@ class ICloudClient:
                     "discarded it\n(it would stop Apple from sending a fresh code)."
                 )
 
-        password, source = self._resolve_password(interactive)
-        # pyicloud writes session/cookie files at default umask (world-readable);
-        # they hold bearer credentials, so tighten the umask for the whole login.
+        # Construct token-only, WITHOUT reading the Keychain (authenticate=False skips both
+        # pyicloud's implicit keyring read and its inline authenticate()). The password is
+        # resolved lazily below only if the saved trusted session is gone — under launchd a
+        # Keychain read can block (ad-hoc-signed python, no interactive session), so we avoid
+        # it on the common ~4h session-lapse reconnect (the trust token lasts ~90 days).
+        self.api = PyiCloudService(
+            self.apple_id, password=None, cookie_directory=str(cookie_dir), authenticate=False
+        )
+        # api.session exists post-construction, so install the wrappers BEFORE auth: the
+        # session/cookie writes they protect happen during the auth requests themselves.
+        self._install_request_timeout()
+        self._install_atomic_session_save()
+
+        try:
+            self._authenticate_token_first(interactive)
+        finally:
+            self._secure_session_files()
+
+        try:
+            twofa.handle_2fa(self.api, interactive=interactive)
+        except RuntimeError as exc:
+            # twofa raises RuntimeError on a cancelled/failed 2FA challenge — all
+            # operator-actionable. Re-tag as AuthError so the CLI exits AUTH_REQUIRED.
+            raise AuthError(str(exc)) from exc
+        self._secure_session_files()
+
+    def _authenticate_token_first(self, interactive: bool) -> None:
+        """Authenticate, reading the password ONLY on a real from-scratch SRP login.
+
+        pyicloud's authenticate() validates the saved trusted session first (no password);
+        it only reaches _srp_authentication() — which needs the password — when that fails,
+        and _srp_authentication() raises PyiCloudFailedLoginException("No password set")
+        BEFORE any Apple request when _password_raw is None. So a first token-only attempt
+        either succeeds (no Keychain touched) or surfaces that signal, at which point we
+        resolve the password our way and retry."""
+        api = self.api
+        if api is None:  # pragma: no cover - connect() always constructs api first
+            raise RuntimeError("not connected to iCloud — call connect() first")
+        # pyicloud writes session/cookie files at default umask (world-readable); they hold
+        # bearer credentials, so tighten the umask around every auth request.
         old_umask = os.umask(0o077)
         try:
-            self.api = PyiCloudService(self.apple_id, password, cookie_directory=str(cookie_dir))
-        except PyiCloudFailedLoginException as exc:
-            raise AuthError("Apple ID or password rejected by Apple.") from exc
+            try:
+                api.authenticate()
+                return  # saved trusted session was valid: no password read at all
+            except PyiCloudFailedLoginException:
+                pass  # token paths exhausted -> a real SRP login is needed; fall through
+
+            password, source = self._resolve_password(interactive)
+            api._password_raw = password
+            try:
+                api.authenticate()
+            except PyiCloudFailedLoginException as exc:
+                raise AuthError("Apple ID or password rejected by Apple.") from exc
         finally:
             os.umask(old_umask)
 
@@ -278,16 +329,6 @@ class ICloudClient:
                 print("Password stored in the macOS Keychain (the daemon will use it).")
             except Exception as exc:  # noqa: BLE001
                 print(f"(Warning: could not store the password in the Keychain: {exc})")
-
-        try:
-            twofa.handle_2fa(self.api, interactive=interactive)
-        except RuntimeError as exc:
-            # twofa raises RuntimeError on a cancelled/failed 2FA challenge — all
-            # operator-actionable. Re-tag as AuthError so the CLI exits AUTH_REQUIRED.
-            raise AuthError(str(exc)) from exc
-        self._secure_session_files()
-        self._install_request_timeout()
-        self._install_atomic_session_save()
 
     def _install_request_timeout(self) -> None:
         """Wrap session.request so any call without an explicit timeout gets a
@@ -366,6 +407,43 @@ class ICloudClient:
         except OSError as exc:
             log.warning("could not tighten session file permissions: %s", exc)
 
+    def _read_keyring_password(self, interactive: bool) -> Optional[str]:
+        """Read the Keychain password (None if absent). `password_exists_in_keyring` is
+        itself a Keychain read (it calls `get_password_from_keyring`), so exists+get is
+        one bounded operation here, not two.
+
+        Non-interactive (daemon under launchd): a venv python is ad-hoc signed, so a
+        non-interactive Keychain authorization cannot be auto-granted and the underlying
+        `security` read can block forever — observed wedging the daemon ~17h. Run it on a
+        daemon thread and bound the wait; a blocked read raises AuthError instead of
+        hanging. The leaked blocked thread is acceptable: the daemon then clean-stops and
+        the process exits, taking the thread with it. Interactive reads stay unbounded (a
+        human can answer the OS authorization prompt)."""
+        if not interactive and self._keyring_timeout > 0:
+            box: dict[str, object] = {}
+
+            def _read() -> None:
+                try:
+                    box["value"] = get_password_from_keyring(self.apple_id)
+                except BaseException as exc:  # noqa: BLE001 - relayed to the caller below
+                    box["error"] = exc
+
+            t = threading.Thread(target=_read, daemon=True)
+            t.start()
+            t.join(self._keyring_timeout)
+            if t.is_alive():
+                raise AuthError(
+                    f"Keychain access timed out after {self._keyring_timeout:g}s (the daemon "
+                    "cannot complete a Keychain authorization under launchd — run "
+                    "`ifolder-sync auth` in a terminal, or authorize the Keychain item for "
+                    "non-interactive access)."
+                )
+            if "error" in box:
+                raise box["error"]  # type: ignore[misc]
+            value = box.get("value")
+            return value if value is None else str(value)
+        return get_password_from_keyring(self.apple_id)
+
     def _resolve_password(self, interactive: bool):
         """Returns (password, source). source in {"env","keyring","prompt"}.
         Resolves the password explicitly instead of relying on pyicloud's implicit
@@ -375,8 +453,11 @@ class ICloudClient:
         if pw:
             return pw, "env"
         try:
-            if password_exists_in_keyring(self.apple_id):
-                return get_password_from_keyring(self.apple_id), "keyring"
+            stored = self._read_keyring_password(interactive)
+            if stored is not None:
+                return stored, "keyring"
+        except AuthError:
+            raise  # a bounded-read timeout is fatal: do NOT fall through to a hanging retry
         except Exception:  # noqa: BLE001
             pass  # keyring unavailable -> fall back to prompt
         if interactive:
