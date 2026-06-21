@@ -10,12 +10,14 @@ Subcommands:
   sync           run one sync pass and exit
   start          run the daemon (foreground); `--background` detaches via launchd
   stop           stop a profile's background (launchd) daemon
+  restart        restart a profile's background (launchd) daemon (force-respawn)
   status         show all profiles' state, or one in detail with `--profile`
   doctor         audit baseline vs local vs remote consistency (read-only)
   logs           tail a profile's daemon log (`-f` to follow, `-n` lines)
   rebaseline     reset a profile's baseline (backup first) after the vault moved/drifted
   purge-trash    empty a profile's local soft-delete trash
   install-agent  generate a launchd LaunchAgent .plist for a profile
+  uninstall      stop and remove a profile's launchd agent (.plist)
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from http.cookiejar import LoadError, LWPCookieJar
 from logging.handlers import RotatingFileHandler
@@ -71,16 +74,60 @@ def _color(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
+@dataclass(frozen=True)
+class DaemonState:
+    """Observed daemon liveness: a three-state model (running / stopped / unknown) that
+    replaces the old liveness bool. `running` carries the pid; `foreground` marks a daemon
+    started in the foreground (no launchd job — observed via the lock fallback, Decision 5);
+    `detail` carries the reason an observation is `unknown` (an odd launchctl state, a
+    non-zero print rc) so `status` never collapses ambiguity to a false "stopped"."""
+
+    state: str  # "running" | "stopped" | "unknown"
+    pid: Optional[int] = None
+    foreground: bool = False
+    detail: str = ""
+
+    @classmethod
+    def running(cls, pid: int, foreground: bool = False) -> "DaemonState":
+        return cls("running", pid=pid, foreground=foreground)
+
+    @classmethod
+    def stopped(cls) -> "DaemonState":
+        return cls("stopped")
+
+    @classmethod
+    def unknown(cls, detail: str = "") -> "DaemonState":
+        return cls("unknown", detail=detail)
+
+    @property
+    def is_running(self) -> bool:
+        return self.state == "running"
+
+    def to_status(self) -> dict[str, Any]:
+        """The dashboard/`--json` contract: keep the legacy `running`/`pid` keys (renderers
+        read them) and add the explicit `state` (running/stopped/unknown) + `foreground`."""
+        return {
+            "running": self.is_running,
+            "pid": self.pid,
+            "state": self.state,
+            "foreground": self.foreground,
+        }
+
+
 def _daemon_status(profile: str) -> dict[str, Any]:
-    """Raw daemon liveness for both the text and --json renderers."""
-    pid = holder_pid(lock_path(profile))
-    return {"running": bool(pid), "pid": pid}
+    """Raw daemon liveness for both the text and --json renderers, observed from launchd
+    (`launchctl print`) with the lock/holder_pid path kept only as the foreground fallback."""
+    return _observe_daemon(profile).to_status()
 
 
 def _daemon_state(profile: str) -> str:
-    s = _daemon_status(profile)
-    if s["running"]:
-        return _color("running", "32;1") + f" (pid {s['pid']})"
+    st = _observe_daemon(profile)
+    if st.state == "running":
+        suffix = ", foreground" if st.foreground else ""
+        return _color("running", "32;1") + f" (pid {st.pid}{suffix})"
+    if st.state == "unknown":
+        detail = f" ({st.detail})" if st.detail else ""
+        return _color("unknown", "33") + detail
     return _color("stopped", "31")
 
 
@@ -449,7 +496,8 @@ def cmd_start(args):
 
 
 def _start_background(profile: str) -> None:
-    """Detach the daemon by handing it to launchd (load -w the profile's LaunchAgent)."""
+    """Detach the daemon by handing it to launchd: converge the job (bootout/bootstrap/
+    enable/kickstart -k), then VERIFY it actually came up before reporting the outcome."""
     cfg = Config.load(config_path(profile))
     _warn_tcc(cfg.local_path)
     if not _has_session(cfg.apple_id):
@@ -460,23 +508,92 @@ def _start_background(profile: str) -> None:
             f"{profile}` FIRST, otherwise launchd will restart it in a failing loop.",
             file=sys.stderr,
         )
-    plist = _write_agent_plist(profile)
-    _launchctl("load", plist)
-    print(f"Background daemon started via launchd ({_agent_label(profile)}).")
+    _converge_start(profile)
+    st = _verify(profile, want_running=True, timeout=cfg.lifecycle_verify_timeout_seconds)
+    if not st.is_running:
+        # A daemon that failed preflight/auth exits 0 by design (invariant 9), so it never
+        # comes up and verify times out — report the truth, never false success.
+        print(
+            f"Background daemon failed to start ({_agent_label(profile)}) — see logs.",
+            file=sys.stderr,
+        )
+        print(f"Logs: {log_file(profile)}", file=sys.stderr)
+        sys.exit(Exit.ERROR)
+    print(f"Background daemon started via launchd ({_agent_label(profile)}, pid {st.pid}).")
     print("It runs now, restarts on crash, and starts again at each login.")
     print(f"Logs:    {log_file(profile)}")
     print(f"Stop it: ifolder-sync stop --profile {profile}")
 
 
 def cmd_stop(args):
+    """Stop a profile's background (launchd) daemon, keyed off the job state, not a plist
+    file's presence. Idempotent: an already-stopped job is success. A foreground daemon (a
+    live lock holder with no launchd job) is reported, not falsely claimed stopped."""
     profile = _profile(args)
     label = _agent_label(profile)
+    before = _observe_daemon(profile)
+    if before.state == "running" and before.foreground:
+        # A foreground `start` (no launchd job): bootout cannot reach it. Don't lie.
+        print(
+            f"A foreground daemon holds profile '{profile}' (pid {before.pid}); there is no "
+            "launchd job to stop. Stop it where it runs (Ctrl-C) or send it SIGTERM.",
+            file=sys.stderr,
+        )
+        sys.exit(Exit.ERROR)
+    if not _converge_stop(profile):
+        print(f"launchctl bootout failed for {label}.", file=sys.stderr)
+        sys.exit(Exit.ERROR)
+    timeout = _lifecycle_timeout(profile)
+    st = _verify(profile, want_running=False, timeout=timeout)
+    if st.is_running:
+        print(f"Background daemon did not stop ({label}, pid {st.pid}).", file=sys.stderr)
+        sys.exit(Exit.ERROR)
+    if before.state == "stopped":
+        print(f"No running daemon for profile '{profile}' (already stopped).")
+    else:
+        print(f"Background daemon stopped ({label}).")
+
+
+def _lifecycle_timeout(profile: str) -> float:
+    """The verify-post-condition bound for a profile, defaulting cleanly when the config is
+    absent/unreadable (stop/restart must still work on a half-configured profile)."""
+    try:
+        return float(Config.load(config_path(profile)).lifecycle_verify_timeout_seconds)
+    except Exception:  # noqa: BLE001 — no/invalid config: use the dataclass default
+        return Config().lifecycle_verify_timeout_seconds
+
+
+def cmd_restart(args):
+    """Restart a profile's background daemon as a first-class verb (not `stop && start`):
+    the same converge chain force-respawns it immediately (kickstart -k bypasses the
+    ~60s ThrottleInterval), then verifies it came back up."""
+    profile = _profile(args)
+    cfg = Config.load(config_path(profile))
+    _warn_tcc(cfg.local_path)
+    _converge_start(profile)
+    st = _verify(profile, want_running=True, timeout=cfg.lifecycle_verify_timeout_seconds)
+    if not st.is_running:
+        print(f"Daemon failed to restart ({_agent_label(profile)}) — see logs.", file=sys.stderr)
+        print(f"Logs: {log_file(profile)}", file=sys.stderr)
+        sys.exit(Exit.ERROR)
+    print(f"Background daemon restarted ({_agent_label(profile)}, pid {st.pid}).")
+
+
+def cmd_uninstall(args):
+    """Stop the profile's launchd job (idempotent) and remove its LaunchAgent .plist. Safe to
+    run when nothing is installed."""
+    profile = _profile(args)
+    label = _agent_label(profile)
+    if not _converge_stop(profile):
+        print(f"launchctl bootout failed for {label}.", file=sys.stderr)
+        sys.exit(Exit.ERROR)
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-    if not plist_path.exists():
-        print(f"No LaunchAgent for profile '{profile}' (nothing to stop).")
-        return
-    _launchctl("unload", plist_path)
-    print(f"Background daemon stopped ({label}).")
+    existed = plist_path.exists()
+    plist_path.unlink(missing_ok=True)
+    if existed:
+        print(f"Uninstalled launchd agent {label} (stopped and removed {plist_path}).")
+    else:
+        print(f"No launchd agent for profile '{profile}' (nothing to uninstall).")
 
 
 def _has_session(apple_id: str) -> bool:
@@ -1375,31 +1492,100 @@ def _write_agent_plist(profile: str) -> Path:
     return plist_path
 
 
-# launchctl's returncode is unreliable across macOS releases (it can exit 0 on
-# "already loaded"); classify by known stderr substrings, not by returncode alone.
-_LAUNCHCTL_BENIGN = (
-    "already loaded",
-    "could not find specified service",
-    "no such file or directory",
-)
+# Modern domain-target launchctl verbs return documented exit codes, so the control plane
+# classifies by code per verb instead of matching English stderr substrings (the legacy
+# `load`/`unload` band-aid). Values verified live on macOS 26.5.
+_BOOTOUT_NOT_LOADED = 3  # "Boot-out failed: 3: No such process" — the job was not loaded
+_PRINT_NOT_FOUND = 113  # `launchctl print` on an unknown label — the job is not loaded
 
 
-def _launchctl(action: str, plist: Path) -> None:
-    """Run `launchctl <action> -w <plist>`, treating already-in-state as informational."""
-    proc = subprocess.run(
-        ["launchctl", action, "-w", str(plist)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode == 0:
-        return
-    stderr = proc.stderr.strip()
-    if any(token in stderr.lower() for token in _LAUNCHCTL_BENIGN):
-        print(f"launchd already in the desired state ({action}): {stderr}")
-        return
-    print(f"launchctl {action} failed: {stderr or proc.stdout.strip()!r}", file=sys.stderr)
-    sys.exit(1)
+def _target(profile: str) -> tuple[str, str]:
+    """The launchd (domain, target) pair for a profile, computed from the running uid:
+    domain `gui/<uid>` and target `gui/<uid>/com.ifolder-sync.<profile>`."""
+    domain = f"gui/{os.getuid()}"
+    return domain, f"{domain}/{_agent_label(profile)}"
+
+
+def _lc(*args: str) -> subprocess.CompletedProcess[str]:
+    """Thin `launchctl` runner. Returns the completed process so callers classify by the
+    per-verb return code (never check=True, never stderr-substring matching)."""
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True, check=False)
+
+
+def _converge_start(profile: str) -> None:
+    """Idempotently (re)start the profile's launchd job and force an immediate fresh spawn.
+
+    Regenerates the plist (keys unchanged), boots out any prior job (ignoring rc 3 = not
+    loaded so a clean prior state is fine), bootstraps the regenerated plist (failing loud
+    on a real error), enables the label (persists across reboots), and `kickstart -k`s it —
+    a force-respawn that bypasses ThrottleInterval for operator intent while the throttle
+    still spaces genuine crash restarts. Auto-migrates a user previously on `load -w`."""
+    domain, target = _target(profile)
+    plist = _write_agent_plist(profile)
+    _lc("bootout", target)  # ignore rc (3 == was not loaded; any prior state is fine)
+    r = _lc("bootstrap", domain, str(plist))
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        print(f"launchctl bootstrap failed: {msg!r}", file=sys.stderr)
+        sys.exit(Exit.ERROR)
+    _lc("enable", target)
+    _lc("kickstart", "-k", target)
+
+
+def _converge_stop(profile: str) -> bool:
+    """Idempotently stop the profile's launchd job. `bootout` rc 3 ("No such process") means
+    the job was already not loaded — treated as already-stopped success. Returns True when
+    the job is (now) not loaded, False on an unexpected launchctl failure."""
+    _, target = _target(profile)
+    r = _lc("bootout", target)
+    return r.returncode in (0, _BOOTOUT_NOT_LOADED)
+
+
+def _parse_print_field(body: str, key: str) -> Optional[str]:
+    """Pull a scalar `key = value` line out of a `launchctl print` body (e.g. `state` or
+    `pid`). launchctl indents these as `\\tkey = value`; returns None when absent."""
+    m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(\S+)", body, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _observe_daemon(profile: str) -> DaemonState:
+    """Ground-truth liveness via `launchctl print` (Decision 2), with the lock/holder_pid
+    path kept only as the foreground fallback (Decision 5):
+
+    - print rc 113 (not loaded) -> a live lock holder means a foreground daemon (running,
+      foreground); otherwise stopped.
+    - print rc 0 with `state = running` and a `pid` -> running (the supervisor's own pid).
+    - print rc 0 with any other state -> unknown (report it; never a false "stopped").
+    - any other non-zero print rc -> unknown.
+    """
+    _, target = _target(profile)
+    r = _lc("print", target)
+    if r.returncode == _PRINT_NOT_FOUND:
+        pid = holder_pid(lock_path(profile))
+        return DaemonState.running(pid, foreground=True) if pid else DaemonState.stopped()
+    if r.returncode != 0:
+        return DaemonState.unknown(f"launchctl print rc={r.returncode}")
+    state = _parse_print_field(r.stdout, "state")
+    pid_str = _parse_print_field(r.stdout, "pid")
+    pid = int(pid_str) if pid_str and pid_str.isdigit() else None
+    if state == "running" and pid:
+        return DaemonState.running(pid)
+    return DaemonState.unknown(f"state={state!r}")
+
+
+def _verify(profile: str, want_running: bool, timeout: float) -> DaemonState:
+    """Poll `_observe_daemon` (~0.2s cadence) until the post-condition (`want_running`) holds
+    or `timeout` elapses; return the final observation (the caller reports the true outcome).
+
+    Invariant-9 safe: a daemon that fails preflight exits 0 by design and never comes up, so
+    this MUST time out and return a not-running observation — the caller then prints "failed
+    — see logs" and exits non-zero. It never hangs and never prints false success."""
+    deadline = time.monotonic() + timeout
+    st = _observe_daemon(profile)
+    while st.is_running != want_running and time.monotonic() < deadline:
+        time.sleep(0.2)
+        st = _observe_daemon(profile)
+    return st
 
 
 def cmd_install_agent(args):
@@ -1408,13 +1594,16 @@ def cmd_install_agent(args):
     cfg = Config.load(config_path(profile))
     _warn_tcc(cfg.local_path)
     plist_path = _write_agent_plist(profile)
+    domain, target = _target(profile)
     print(f"LaunchAgent generated at {plist_path}")
     print("To enable (starts now and at each login):")
-    print(f"  launchctl load -w {plist_path}")
+    print(f"  launchctl bootstrap {domain} {plist_path} && launchctl kickstart -k {target}")
     print(f"  (or simply: ifolder-sync start --background --profile {profile})")
-    print("To stop/remove:")
-    print(f"  launchctl unload -w {plist_path}")
+    print("To stop:")
+    print(f"  launchctl bootout {target}")
     print(f"  (or simply: ifolder-sync stop --profile {profile})")
+    print("To remove the agent entirely:")
+    print(f"  ifolder-sync uninstall --profile {profile}")
     print(f"Logs in {log_file(profile)}")
     print(f"\nIMPORTANT: run `ifolder-sync auth --profile {profile}` BEFORE loading the agent,")
     print("otherwise the daemon cannot pass 2FA (it runs non-interactively).")
@@ -1515,6 +1704,14 @@ def build_parser() -> argparse.ArgumentParser:
     psp = sub.add_parser("stop", help="stop a profile's background (launchd) daemon")
     _add_profile(psp)
     psp.set_defaults(func=cmd_stop)
+
+    prs = sub.add_parser("restart", help="restart a profile's background (launchd) daemon")
+    _add_profile(prs)
+    prs.set_defaults(func=cmd_restart)
+
+    pun = sub.add_parser("uninstall", help="stop and remove a profile's launchd agent (.plist)")
+    _add_profile(pun)
+    pun.set_defaults(func=cmd_uninstall)
 
     pstat = sub.add_parser("status", help="show all profiles, or one in detail with --profile")
     pstat.add_argument(

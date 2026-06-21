@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from pyicloud.exceptions import (
@@ -39,6 +40,15 @@ from ifolder_sync.syncer import LocalScanError, SyncClient, SyncStats, VaultIden
 from ifolder_sync.trash import trash_count
 
 from .helpers import FakeICloud, sandbox_home
+
+
+@pytest.fixture(autouse=True)
+def _no_real_launchctl(monkeypatch):
+    """Never shell out to real launchctl: default the managed-daemon probe to not-loaded
+    (print rc 113), so the lock/holder_pid fallback decides liveness in tests."""
+    monkeypatch.setattr(
+        cli, "_lc", lambda *a: MagicMock(returncode=113, stdout="", stderr="not found")
+    )
 
 
 @pytest.fixture
@@ -326,7 +336,13 @@ def test_profile_status_data_shape(tmp_path, monkeypatch):
     assert data["remote_folder"] == "Notes"
     assert data["conflict_policy"] == "newer"
     assert data["obsidian"] is True
-    assert data["daemon"] == {"running": False, "pid": None}
+    # The 3-state contract (feature 06): legacy running/pid keys kept, state/foreground added.
+    assert data["daemon"] == {
+        "running": False,
+        "pid": None,
+        "state": "stopped",
+        "foreground": False,
+    }
     # No session saved -> the structured session state, not a colored string.
     assert data["session"]["state"] == "not found"
     assert data["baseline"] == "absent"

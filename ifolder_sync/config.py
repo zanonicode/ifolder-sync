@@ -294,6 +294,12 @@ class Config:
     # flushes coalesce to at most one per inflight_min_write_interval_ms.
     inflight_surface: bool = True
     inflight_min_write_interval_ms: int = 200
+    # `start`/`stop`/`restart` verify the post-condition (the daemon really came up / went
+    # down) by polling `launchctl print` for up to this many seconds before reporting the
+    # true outcome. A daemon that fails preflight exits 0 by design (invariant 9) and never
+    # comes up, so the verify times out and the command reports "failed — see logs"; this is
+    # the bound on that wait.
+    lifecycle_verify_timeout_seconds: float = 5.0
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
     @staticmethod
@@ -347,7 +353,12 @@ class Config:
             # `"walk_workers": true` from JSON; reject it explicitly.
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(f"`{name}` must be an integer.")
-        for name in ("retry_base_delay", "debounce_seconds", "dashboard_interval_seconds"):
+        for name in (
+            "retry_base_delay",
+            "debounce_seconds",
+            "dashboard_interval_seconds",
+            "lifecycle_verify_timeout_seconds",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"`{name}` must be a number.")
