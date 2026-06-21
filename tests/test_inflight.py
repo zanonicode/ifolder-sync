@@ -13,8 +13,8 @@ from __future__ import annotations
 import json
 import shutil
 
-from ifolder_sync.cli import _dashboard_view, _read_status_snapshot
-from ifolder_sync.config import Config, baseline_path, status_path
+from ifolder_sync.cli import _dashboard_view, _read_status_snapshot, cmd_sync
+from ifolder_sync.config import Config, baseline_path, config_path, status_path
 from ifolder_sync.inflight import InflightSurface
 from ifolder_sync.state import StateStore
 from ifolder_sync.syncer import Op, Syncer
@@ -228,6 +228,94 @@ def test_disabled_surface_writes_nothing(tmp_path, monkeypatch, fake):
     d._inflight_pass_finished()
     assert not status_path("default").exists()  # nothing written
     d.store.close()
+
+
+def test_cmd_sync_feeds_inflight_surface(tmp_path, monkeypatch, fake):
+    """A foreground `sync` (not just the daemon) emits live status.json rows stamped with its
+    OWN pid, so `status --watch` shows a manual sync's progress instead of an empty/stale view."""
+    import argparse
+    import os
+
+    from .helpers import sandbox_home, write_file
+
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "v"
+    vault.mkdir()
+    write_file(vault, "a.txt", b"hi", mtime=1000)
+    Config(apple_id="x@y.com", local_folder=str(vault), **PERMISSIVE_THRESHOLDS).save(
+        config_path("default")
+    )
+    monkeypatch.setattr(
+        "ifolder_sync.icloud_client.ICloudClient.from_config",
+        classmethod(lambda cls, c: fake),
+    )
+    seen: list = []
+    orig = InflightSurface.record
+
+    def _spy(self, ev):
+        seen.append((ev.relpath, ev.state))
+        orig(self, ev)
+
+    monkeypatch.setattr(InflightSurface, "record", _spy)
+
+    args = argparse.Namespace(
+        profile="default", dry_run=False, json=False, non_interactive=True, force_delete=False
+    )
+    cmd_sync(args)
+
+    assert ("a.txt", "uploading") in seen  # live rows emitted mid-pass (the wiring works)
+    data = json.loads(status_path("default").read_text())
+    assert data["pid"] == os.getpid()  # stamped by THIS foreground sync, not a daemon
+    assert data["rows"] == []  # cleared on finish (the upload completed)
+
+
+def test_cmd_sync_dry_run_writes_no_status(tmp_path, monkeypatch, fake):
+    """--dry-run takes no surface: it writes nothing and must not stamp a status.json."""
+    import argparse
+
+    from .helpers import sandbox_home, write_file
+
+    sandbox_home(tmp_path, monkeypatch)
+    vault = tmp_path / "v"
+    vault.mkdir()
+    write_file(vault, "a.txt", b"hi", mtime=1000)
+    Config(apple_id="x@y.com", local_folder=str(vault), **PERMISSIVE_THRESHOLDS).save(
+        config_path("default")
+    )
+    monkeypatch.setattr(
+        "ifolder_sync.icloud_client.ICloudClient.from_config",
+        classmethod(lambda cls, c: fake),
+    )
+    args = argparse.Namespace(
+        profile="default", dry_run=True, json=False, non_interactive=True, force_delete=False
+    )
+    cmd_sync(args)
+    assert not status_path("default").exists()
+
+
+def test_dashboard_view_ignores_snapshot_from_other_pid(tmp_path, monkeypatch):
+    """A status.json whose pid is NOT the live lock holder is stale (e.g. a dead daemon's file
+    while a foreground sync now holds the lock) and must NOT render as live activity."""
+    from .helpers import sandbox_home
+
+    sandbox_home(tmp_path, monkeypatch)
+    with StateStore(baseline_path("default")) as s:
+        s.set_meta("last_sync", "1.0")
+    status_path("default").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "pid": 7,  # written by a now-dead daemon
+                "rows": [{"relpath": "x.md", "state": "uploading", "op": "upload"}],
+            }
+        )
+    )
+    # a DIFFERENT live process holds the lock (e.g. a foreground sync) -> snapshot is stale
+    monkeypatch.setattr("ifolder_sync.cli.holder_pid", lambda _p: 999)
+    assert _dashboard_view("default")["attention"] == []
+    # when the holder matches the snapshot's pid, the live row IS shown
+    monkeypatch.setattr("ifolder_sync.cli.holder_pid", lambda _p: 7)
+    assert [r.relpath for r in _dashboard_view("default")["attention"]] == ["x.md"]
 
 
 # --------------------------------------------- the best-effort safety contract ---
