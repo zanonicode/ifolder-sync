@@ -221,6 +221,12 @@ class Config:
     # timeout=None by default, so one hung socket would wedge the daemon forever; a
     # timeout turns the hang into a retryable error. <=0 disables (no timeout).
     request_timeout_seconds: int = 60
+    # Non-interactive (daemon) Keychain reads are bounded by this many seconds. Under
+    # launchd a venv python is ad-hoc signed, so a non-interactive Keychain authorization
+    # cannot be auto-granted and the `security` read blocks forever (observed wedging the
+    # daemon ~17h). The bound turns that hang into a clean AuthError. Interactive reads stay
+    # unbounded (a human can answer the prompt). <=0 disables (unbounded, legacy behavior).
+    keyring_timeout_seconds: float = 10.0
     # The iCloud login token (web-auth cookie) lapses after some hours of uptime; a drive
     # call then raises HTTP 421 LOGIN_TOKEN_EXPIRED. The daemon reconnects in place (no 2FA
     # while the trust token is still valid) instead of looping every poll. This caps the
@@ -358,6 +364,7 @@ class Config:
             "debounce_seconds",
             "dashboard_interval_seconds",
             "lifecycle_verify_timeout_seconds",
+            "keyring_timeout_seconds",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):

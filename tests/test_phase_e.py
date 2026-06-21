@@ -233,12 +233,32 @@ def test_launchd_flag_parsed_by_argparse():
 
 
 # ----------------------------------------- P4-1 source: connect -> AuthError ---
+class _NoTokenPyiCloud:
+    """Token-only pyicloud whose saved session is gone: authenticate() raises the
+    PyiCloudFailedLoginException signal, so connect() falls through to _resolve_password."""
+
+    def __init__(self, apple_id, password=None, cookie_directory=None, *, authenticate=True):
+        self._password_raw = password
+        self.session = SimpleNamespace(
+            request=lambda *a, **k: None,
+            _save_session_data=lambda: None,
+            _ifolder_timeout_wrapped=False,
+            _ifolder_atomic_save=False,
+        )
+        self.requires_2fa = False
+        self.requires_2sa = False
+
+    def authenticate(self, force_refresh: bool = False, service=None) -> None:
+        raise PyiCloudFailedLoginException("No password set")
+
+
 def test_connect_no_password_raises_autherror(tmp_path, monkeypatch):
     # The most common auth failure (no env var, no keychain, non-interactive) must raise
     # AuthError so the CLI exits AUTH_REQUIRED(3), not a bare RuntimeError -> ERROR(1).
     sandbox_home(tmp_path, monkeypatch)
     monkeypatch.delenv("IFOLDER_SYNC_PASSWORD", raising=False)
-    monkeypatch.setattr(ic_module, "password_exists_in_keyring", lambda *a, **k: False)
+    monkeypatch.setattr(ic_module, "PyiCloudService", _NoTokenPyiCloud)
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: None)
     client = ICloudClient.from_config(Config(apple_id="x@y.com", local_folder=str(tmp_path)))
     with pytest.raises(AuthError):
         client.connect(interactive=False)
