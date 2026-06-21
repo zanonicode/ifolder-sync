@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from http.cookiejar import LoadError, LWPCookieJar
 from logging.handlers import RotatingFileHandler
@@ -57,7 +58,7 @@ from .config import (
     write_vault_marker,
 )
 from .exitcodes import Exit
-from .locking import holder_pid
+from .locking import AlreadyRunning, SingleInstanceLock, holder_pid
 from .trash import purge_trash, trash_count
 
 
@@ -306,37 +307,46 @@ def cmd_auth(args):
         )
 
 
+@contextmanager
+def _daemon_lock(profile: str, action: str):
+    """Hold the single-instance lock for the whole of a baseline-writing command, or refuse.
+
+    sync, doctor --fix-orphans, and rebaseline all mutate the baseline, so each must HOLD the
+    lock the daemon uses for the entire write — not merely snapshot holder_pid (a TOCTOU: a
+    daemon can start during the multi-second network walk/backup and write the baseline
+    concurrently). SystemExit is raised before the yield, so a refused command never enters
+    the body and nothing is released.
+    """
+    pid = holder_pid(lock_path(profile))
+    if pid:
+        print(
+            f"Error: the daemon is running (pid {pid}); {action} would race its baseline. "
+            f"Stop it first: `ifolder-sync stop --profile {profile}`.",
+            file=sys.stderr,
+        )
+        sys.exit(Exit.ERROR)
+    lock = SingleInstanceLock(lock_path(profile))
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        print(
+            f"Error: {exc} — {action} would race the baseline. "
+            f"Stop the daemon first: `ifolder-sync stop --profile {profile}`.",
+            file=sys.stderr,
+        )
+        sys.exit(Exit.ERROR)
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
 def cmd_sync(args):
     from .icloud_client import ICloudClient
-    from .locking import AlreadyRunning, SingleInstanceLock
     from .state import StateStore
     from .syncer import Syncer
 
     profile, cfg = _load_profile(args)
-    lock = None
-    if not args.dry_run:
-        # A non-dry-run sync mutates the baseline; it must hold the same single-instance
-        # lock the daemon uses, or a daemon start (or a second manual sync) racing in
-        # right after a plain holder_pid check would corrupt the baseline (TOCTOU).
-        pid = holder_pid(lock_path(profile))
-        if pid:
-            print(
-                f"Error: the daemon is running (pid {pid}) and a manual sync would race "
-                f"its baseline. Stop it first (`ifolder-sync stop --profile {profile}`) "
-                "or preview with --dry-run.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        lock = SingleInstanceLock(lock_path(profile))
-        try:
-            lock.acquire()
-        except AlreadyRunning as exc:
-            print(
-                f"Error: {exc} — a manual sync would race the baseline. Stop it first "
-                f"(`ifolder-sync stop --profile {profile}`) or preview with --dry-run.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
     # Progress to stderr (never stdout — keeps --json clean) so the user sees the slow
     # connect+scan is working and is not tempted to Ctrl-C mid-bootstrap (the worst moment).
     json_mode = getattr(args, "json", False)
@@ -346,7 +356,10 @@ def cmd_sync(args):
         if show_progress:
             print(msg, file=sys.stderr)
 
-    try:
+    # A non-dry-run sync mutates the baseline, so it holds the daemon's lock for the whole
+    # pass; --dry-run writes nothing and is allowed to run even while the daemon holds it.
+    lock_cm = nullcontext() if args.dry_run else _daemon_lock(profile, "a manual sync")
+    with lock_cm:
         client = ICloudClient.from_config(cfg)
         # --json is a machine contract: a 2FA/password prompt can't be answered by a
         # consumer and its text would land on stdout before the JSON, so force
@@ -364,13 +377,11 @@ def cmd_sync(args):
         else:
             prefix = "Dry-run (no changes written)" if args.dry_run else "Sync done"
             print(f"{prefix}: {stats.summary()}")
-    finally:
-        if lock is not None:
-            lock.release()
     # A pass can "succeed" yet leave work unfinished: the safety threshold suppressed
     # deletions, or some file operations failed. Surface that as a distinct exit code so
     # cron/monitoring can react instead of trusting a blanket 0. (Reached only on success;
-    # an exception above propagates straight to main's taxonomy.)
+    # an exception above propagates straight to main's taxonomy. The lock is already
+    # released by the with-block, so the exit code is computed daemon-mutex-free.)
     code = _outcome_exit_code(stats)
     if code:
         sys.exit(code)
@@ -682,7 +693,6 @@ def cmd_doctor(args):
     every command.) `--fix-orphans` is the one opt-in write: it backs up the baseline and
     drops only the orphan rows."""
     from .icloud_client import ICloudClient
-    from .locking import AlreadyRunning, SingleInstanceLock
     from .state import StateStore
     from .syncer import Syncer
 
@@ -695,33 +705,10 @@ def cmd_doctor(args):
         if show_progress:
             print(msg, file=sys.stderr)
 
-    lock = None
-    if fix:
-        # --fix-orphans WRITES the baseline, exactly like a sync pass, so it must HOLD the
-        # single-instance lock for the whole write — not merely snapshot holder_pid (a TOCTOU:
-        # a daemon could launch during the multi-second network walk and write the baseline
-        # concurrently, letting the drop discard a row the daemon just repopulated). Same gate
-        # as cmd_sync. The read-only audit (no --fix-orphans) takes no lock and runs alongside.
-        pid = holder_pid(lock_path(profile))
-        if pid:
-            print(
-                f"Error: the daemon is running (pid {pid}); --fix-orphans would race its "
-                f"baseline. Stop it first: `ifolder-sync stop --profile {profile}`.",
-                file=sys.stderr,
-            )
-            sys.exit(Exit.ERROR)
-        lock = SingleInstanceLock(lock_path(profile))
-        try:
-            lock.acquire()
-        except AlreadyRunning as exc:
-            print(
-                f"Error: {exc} — --fix-orphans would race the baseline. Stop the daemon first "
-                f"(`ifolder-sync stop --profile {profile}`).",
-                file=sys.stderr,
-            )
-            sys.exit(Exit.ERROR)
-
-    try:
+    # --fix-orphans WRITES the baseline (same gate as sync), so it holds the daemon's lock for
+    # the whole write; the read-only audit takes no lock and runs alongside a live daemon.
+    lock_cm = _daemon_lock(profile, "--fix-orphans") if fix else nullcontext()
+    with lock_cm:
         client = ICloudClient.from_config(cfg)
         interactive = not getattr(args, "non_interactive", False) and not json_mode
         progress(f"Connecting to iCloud as {cfg.apple_id}…")
@@ -748,9 +735,6 @@ def cmd_doctor(args):
                     print(f"\nFixed: dropped {count} orphan baseline row(s). Backup at {bak}.")
                 else:
                     print("\nNothing to fix: no orphan baseline rows.")
-    finally:
-        if lock is not None:
-            lock.release()
 
 
 # ---------------------------------------------------- live dashboard (status --watch) ---
@@ -1203,55 +1187,50 @@ def cmd_rebaseline(args):
     from .state import CorruptBaselineError, StateStore
 
     profile, cfg = _load_profile(args)
-    pid = holder_pid(lock_path(profile))
-    if pid:
-        print(
-            f"Error: the daemon is running (pid {pid}). Stop it first: "
-            f"`ifolder-sync stop --profile {profile}`.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    db = baseline_path(profile)
-    if db.exists():
-        bak = db.with_name(f"{db.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        try:
-            # WAL-safe consistent copy: a raw file copy would miss committed rows still
-            # in the -wal of a daemon killed (SIGKILL) without a clean checkpoint.
-            with StateStore(db) as store:
-                store.backup_to(bak)
-        except CorruptBaselineError:
-            # The DB is unreadable anyway; salvage the raw bytes for forensics.
-            shutil.copy2(db, bak)
-        # Unlink the main file AND its WAL siblings: orphaned -wal/-shm would otherwise
-        # attach stale frames to the next (fresh) baseline.
-        for sib in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
-            sib.unlink(missing_ok=True)
-        print(f"Baseline backed up to {bak} and reset.")
-    else:
-        print("No baseline to reset (fresh profile).")
-
-    root = cfg.local_path
-    if root.is_dir():
-        removed = 0
-        for p in root.rglob("*.part"):
-            p.unlink()
-            removed += 1
-        if removed:
-            print(f"Removed {removed} orphan .part file(s) from the vault.")
-        if read_vault_marker(root) is None:
-            write_vault_marker(root, profile)
-            print("Vault identity marker created.")
+    # rebaseline DELETES the baseline DB (+ its -wal/-shm), so it holds the daemon's lock for
+    # the whole backup+delete — a bare holder_pid snapshot is a TOCTOU (a daemon could start
+    # mid-delete and write the baseline we are tearing down). Same gate as sync.
+    with _daemon_lock(profile, "rebaseline"):
+        db = baseline_path(profile)
+        if db.exists():
+            bak = db.with_name(f"{db.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                # WAL-safe consistent copy: a raw file copy would miss committed rows still
+                # in the -wal of a daemon killed (SIGKILL) without a clean checkpoint.
+                with StateStore(db) as store:
+                    store.backup_to(bak)
+            except CorruptBaselineError:
+                # The DB is unreadable anyway; salvage the raw bytes for forensics.
+                shutil.copy2(db, bak)
+            # Unlink the main file AND its WAL siblings: orphaned -wal/-shm would otherwise
+            # attach stale frames to the next (fresh) baseline.
+            for sib in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+                sib.unlink(missing_ok=True)
+            print(f"Baseline backed up to {bak} and reset.")
         else:
-            # Identity belongs to the vault, not the profile: a vault that still has
-            # its marker keeps it (other profiles may share it).
-            print("Existing vault identity marker kept.")
-    else:
-        print(f"Local folder {root} not found — marker will be created on first sync.")
+            print("No baseline to reset (fresh profile).")
 
-    print("\nNext steps:")
-    print(f"  ifolder-sync sync --dry-run --profile {profile}   # preview (additive only)")
-    print(f"  ifolder-sync sync --profile {profile}             # apply")
+        root = cfg.local_path
+        if root.is_dir():
+            removed = 0
+            for p in root.rglob("*.part"):
+                p.unlink()
+                removed += 1
+            if removed:
+                print(f"Removed {removed} orphan .part file(s) from the vault.")
+            if read_vault_marker(root) is None:
+                write_vault_marker(root, profile)
+                print("Vault identity marker created.")
+            else:
+                # Identity belongs to the vault, not the profile: a vault that still has
+                # its marker keeps it (other profiles may share it).
+                print("Existing vault identity marker kept.")
+        else:
+            print(f"Local folder {root} not found — marker will be created on first sync.")
+
+        print("\nNext steps:")
+        print(f"  ifolder-sync sync --dry-run --profile {profile}   # preview (additive only)")
+        print(f"  ifolder-sync sync --profile {profile}             # apply")
 
 
 def _agent_label(profile: str) -> str:
