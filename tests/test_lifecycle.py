@@ -84,11 +84,14 @@ def test_converge_start_issues_modern_chain_in_order(tmp_path, monkeypatch):
 
     domain, target = _target("work")
     verbs = [c[0] for c in lc.calls]
-    assert verbs == ["bootout", "bootstrap", "enable", "kickstart"]
+    assert verbs == ["bootout", "enable", "bootstrap", "kickstart"]
     assert lc.calls[0] == ["bootout", target]
-    assert lc.calls[1][0] == "bootstrap" and lc.calls[1][1] == domain
-    assert lc.calls[1][2].endswith("com.ifolder-sync.work.plist")
-    assert lc.calls[2] == ["enable", target]
+    # enable BEFORE bootstrap: a legacy `unload -w` leaves the label disabled in launchd's
+    # store, and bootstrapping a disabled label fails with "Bootstrap failed: 5: I/O error".
+    assert lc.calls[1] == ["enable", target]
+    assert verbs.index("enable") < verbs.index("bootstrap")  # regression guard for the EIO-5 bug
+    assert lc.calls[2][0] == "bootstrap" and lc.calls[2][1] == domain
+    assert lc.calls[2][2].endswith("com.ifolder-sync.work.plist")
     assert lc.calls[3] == ["kickstart", "-k", target]
 
 
@@ -106,7 +109,7 @@ def test_converge_start_ignores_bootout_rc3(tmp_path, monkeypatch):
 
     _converge_start("work")  # must not raise despite rc 3
 
-    assert [c[0] for c in lc.calls] == ["bootout", "bootstrap", "enable", "kickstart"]
+    assert [c[0] for c in lc.calls] == ["bootout", "enable", "bootstrap", "kickstart"]
 
 
 def test_converge_start_fails_loud_on_bootstrap_error(tmp_path, monkeypatch):

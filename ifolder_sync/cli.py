@@ -1519,19 +1519,24 @@ def _converge_start(profile: str) -> None:
     """Idempotently (re)start the profile's launchd job and force an immediate fresh spawn.
 
     Regenerates the plist (keys unchanged), boots out any prior job (ignoring rc 3 = not
-    loaded so a clean prior state is fine), bootstraps the regenerated plist (failing loud
-    on a real error), enables the label (persists across reboots), and `kickstart -k`s it —
-    a force-respawn that bypasses ThrottleInterval for operator intent while the throttle
-    still spaces genuine crash restarts. Auto-migrates a user previously on `load -w`."""
+    loaded so a clean prior state is fine), enables the label (clears any legacy `unload -w`
+    disabled override — bootstrapping a disabled label fails with EIO; also persists across
+    reboots), bootstraps the regenerated plist (failing loud on a real error), and
+    `kickstart -k`s it — a force-respawn that bypasses ThrottleInterval for operator intent
+    while the throttle still spaces genuine crash restarts. Auto-migrates a user previously on
+    `load -w`/`unload -w`."""
     domain, target = _target(profile)
     plist = _write_agent_plist(profile)
     _lc("bootout", target)  # ignore rc (3 == was not loaded; any prior state is fine)
+    # enable BEFORE bootstrap: the legacy `unload -w` (old cmd_stop / older releases) leaves the
+    # label DISABLED in launchd's persistent store, and bootstrapping a disabled label fails with
+    # "Bootstrap failed: 5: Input/output error". enable clears that override (and persists).
+    _lc("enable", target)
     r = _lc("bootstrap", domain, str(plist))
     if r.returncode != 0:
         msg = (r.stderr or r.stdout).strip()
         print(f"launchctl bootstrap failed: {msg!r}", file=sys.stderr)
         sys.exit(Exit.ERROR)
-    _lc("enable", target)
     _lc("kickstart", "-k", target)
 
 

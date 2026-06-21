@@ -175,7 +175,7 @@ def _verbs(lc) -> list[str]:
 
 
 def test_start_background_converges_and_verifies(tmp_path, monkeypatch):
-    """`start --background` runs the modern converge chain (bootout -> bootstrap -> enable ->
+    """`start --background` runs the modern converge chain (bootout -> enable -> bootstrap ->
     kickstart -k) against gui/<uid>/<label>, then verifies via `print` before claiming success."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
@@ -186,12 +186,13 @@ def test_start_background_converges_and_verifies(tmp_path, monkeypatch):
 
     target = f"gui/{__import__('os').getuid()}/com.ifolder-sync.work"
     domain = f"gui/{__import__('os').getuid()}"
-    # The converge order: bootout, bootstrap, enable, kickstart -k (print(s) for verify last).
+    # The converge order: bootout, enable, bootstrap, kickstart -k (print(s) for verify last).
+    # enable precedes bootstrap so a legacy `unload -w` disabled label does not fail with EIO.
     converge = [c for c in lc.calls if c[0] != "print"]
     assert converge[0] == ["bootout", target]
-    assert converge[1][0] == "bootstrap" and converge[1][1] == domain
-    assert converge[1][2].endswith("com.ifolder-sync.work.plist")
-    assert converge[2] == ["enable", target]
+    assert converge[1] == ["enable", target]
+    assert converge[2][0] == "bootstrap" and converge[2][1] == domain
+    assert converge[2][2].endswith("com.ifolder-sync.work.plist")
     assert converge[3] == ["kickstart", "-k", target]
     assert "print" in _verbs(lc)  # the post-condition was actually observed
 
