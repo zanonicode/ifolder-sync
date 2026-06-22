@@ -306,6 +306,12 @@ class Config:
     # comes up, so the verify times out and the command reports "failed — see logs"; this is
     # the bound on that wait.
     lifecycle_verify_timeout_seconds: float = 5.0
+    # launchd's `ThrottleInterval` for the daemon plist: launchd will not (re)spawn the job more
+    # than once per this many seconds. It spaces out genuine crash restarts (KeepAlive restarts
+    # only on a non-zero exit) AND bounds how long `start`/`restart` wait for the throttled fresh
+    # spawn to appear before reporting success. Lower = snappier start/restart and faster
+    # crash-recovery; higher = more conservative crash-loop spacing. macOS default is 10.
+    throttle_interval_seconds: int = 15
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
     @staticmethod
@@ -353,6 +359,7 @@ class Config:
             "unreadable_max_passes",
             "max_file_size_mb",
             "inflight_min_write_interval_ms",
+            "throttle_interval_seconds",
         ):
             value = getattr(self, name)
             # bool is a subclass of int, so plain isinstance(..., int) would accept

@@ -165,8 +165,7 @@ def _fast_launchd_timing(monkeypatch):
     The real bounded-wait behavior is unit-tested in test_lifecycle.py."""
     monkeypatch.setattr(cli, "_BOOTOUT_SETTLE_SECONDS", 0.0)
     monkeypatch.setattr(cli, "_BOOTSTRAP_RETRY_SECONDS", 0.0)
-    monkeypatch.setattr(cli, "_THROTTLE_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(cli, "_VERIFY_BUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(cli, "_start_verify_timeout", lambda _cfg: 0.0)
 
 
 def test_write_agent_plist(tmp_path, monkeypatch):

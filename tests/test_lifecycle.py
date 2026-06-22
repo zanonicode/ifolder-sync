@@ -339,14 +339,38 @@ def test_daemonstate_to_status_keeps_legacy_keys():
 # ----------------------------------------------- throttle-aware (re)start verify ---
 def test_start_verify_timeout_outlasts_throttle():
     """The (re)start post-condition wait must OUTLAST launchd's ThrottleInterval, or a throttled
-    fresh spawn is falsely reported as 'failed to start' (the daemon does come up ~60s later).
-    A longer user-configured verify timeout is still honored."""
+    fresh spawn is falsely reported as 'failed to start' (the daemon comes up ~ThrottleInterval
+    seconds later). The floor follows the CONFIGURED throttle; a longer user verify timeout wins."""
     from ifolder_sync.config import Config
 
-    assert cli._start_verify_timeout(Config(lifecycle_verify_timeout_seconds=5.0)) >= (
-        cli._THROTTLE_INTERVAL_SECONDS
+    cfg = Config()  # default throttle dominates the short default verify timeout
+    assert cli._start_verify_timeout(cfg) == (
+        cfg.throttle_interval_seconds + cli._VERIFY_BUFFER_SECONDS
     )
-    assert cli._start_verify_timeout(Config(lifecycle_verify_timeout_seconds=120.0)) == 120.0
+    # tracks the configured throttle, not a hardcoded constant
+    assert cli._start_verify_timeout(Config(throttle_interval_seconds=42)) == (
+        42 + cli._VERIFY_BUFFER_SECONDS
+    )
+    # a longer user-configured verify timeout is still honored
+    assert (
+        cli._start_verify_timeout(
+            Config(throttle_interval_seconds=15, lifecycle_verify_timeout_seconds=120.0)
+        )
+        == 120.0
+    )
+
+
+def test_throttle_interval_reads_config(tmp_path, monkeypatch):
+    """The plist's ThrottleInterval is single-sourced from Config (not hardcoded), defaulting
+    cleanly when the config is absent/unreadable."""
+    from ifolder_sync.config import Config, config_path
+
+    sandbox_home(tmp_path, monkeypatch)
+    assert cli._throttle_interval("work") == Config().throttle_interval_seconds  # absent -> default
+    Config(apple_id="a@b.com", local_folder=str(tmp_path), throttle_interval_seconds=42).save(
+        config_path("work")
+    )
+    assert cli._throttle_interval("work") == 42
 
 
 def test_restart_accepts_background_flag():

@@ -8,6 +8,13 @@ carry behavior changes).
 ## [Unreleased]
 
 ### Changed
+- **`start --background` and `restart` are much faster (~70s → ~20s).** launchd throttles a
+  job's respawn by its plist `ThrottleInterval`, and `start`/`restart` wait for that throttled
+  spawn before reporting success (so a real failure isn't masked). The interval was a hardcoded
+  60s; it is now the configurable `throttle_interval_seconds` (default **15**, down from 60).
+  Lower = snappier start/restart and faster crash-recovery; raise it for more conservative
+  crash-loop spacing. The value is single-sourced into both the launchd plist and the verify
+  wait. (Takes effect on the next `start`/`restart`, which regenerates the plist.)
 - **Single-instance lock now uses a kernel advisory lock (`fcntl.flock`)** instead of a
   PID file with a `kern.boottime` stale-reclaim heuristic. The lock is held on a file
   descriptor kept open for the daemon's whole lifetime, and the kernel releases it

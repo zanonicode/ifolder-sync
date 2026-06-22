@@ -769,7 +769,7 @@ def test_agent_plist_values_enforce_invariant_9(isolate_home):
     # asserting the parsed VALUE is what actually guards it.
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
     assert payload["RunAtLoad"] is True
-    assert payload["ThrottleInterval"] == 60
+    assert payload["ThrottleInterval"] == 15  # default; single-sourced from Config (was 60)
     assert payload["ExitTimeOut"] == 30
     assert payload["ProcessType"] == "Background"
     assert payload["Label"] == "com.ifolder-sync.default"
