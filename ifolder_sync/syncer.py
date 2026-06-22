@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -218,36 +219,49 @@ class VaultIdentityError(RuntimeError):
 
 
 # --------------------------------------------------------- ignore matching ---
-def _seg_match(pat_segs: list[str], segs: list[str]) -> bool:
-    """True if pat_segs appears as a CONTIGUOUS sublist of segs (each segment matched
-    by fnmatch). Excluding 'a/b' this way catches the item AND everything below it, at
-    any depth."""
-    m, n = len(pat_segs), len(segs)
-    if m == 0 or m > n:
-        return False
-    return any(
-        all(fnmatch.fnmatch(segs[i + j], pat_segs[j]) for j in range(m)) for i in range(n - m + 1)
-    )
+# A compiled ignore pattern: given a path's POSIX segments, returns whether it matches.
+_IgnoreMatcher = Callable[[list[str]], bool]
 
 
-def path_is_ignored(pattern: str, segs: list[str]) -> bool:
-    """Decide whether ONE pattern matches a path (already split into POSIX segments).
+def _compile_ignore(pattern: str) -> Optional[_IgnoreMatcher]:
+    """Precompile ONE ignore pattern to a reusable segment-matcher, or None if it never matches
+    (an empty pattern). `fnmatch.translate(pat)` is the exact regex `fnmatch.fnmatch` builds under
+    POSIX normcase (identity on macOS), so matching is byte-identical to the old per-call fnmatch
+    -- just compiled once instead of per path. The engine precompiles at Syncer init so the hot
+    scan loop (local + remote walk + watcher, all via Syncer._ignored) never re-translates a
+    pattern per entry.
 
-    - simple name, no '/' (e.g. '.DS_Store', '*.icloud') -> matches that name in any
-      segment (covers the file OR the folder + its contents).
-    - path with '/' (e.g. '.obsidian/workspace.json', '.trash/') -> matches that span
-      at any depth, INCLUDING everything below it. A trailing '/' is just readability.
-
-    fnmatch does not treat '/' specially, but since we split into segments and match
-    segment by segment, a '*' never crosses a folder boundary.
+    - simple name, no '/' (e.g. '.DS_Store', '*.icloud') -> matches that name in ANY segment
+      (covers the file OR a folder + its contents).
+    - path with '/' (e.g. '.obsidian/workspace.json', '.trash/') -> matches that span as a
+      CONTIGUOUS sublist of segments at any depth, so a '*' never crosses a folder boundary.
+      A trailing '/' is just readability.
     """
     pat = pattern.strip().rstrip("/")
     if not pat:
-        return False
+        return None
     pat_segs = pat.split("/")
     if len(pat_segs) == 1:
-        return any(fnmatch.fnmatch(s, pat) for s in segs)
-    return _seg_match(pat_segs, segs)
+        rx = re.compile(fnmatch.translate(pat))
+        return lambda segs: any(rx.match(s) for s in segs)
+    rxs = [re.compile(fnmatch.translate(s)) for s in pat_segs]
+    m = len(rxs)
+
+    def match_span(segs: list[str]) -> bool:
+        n = len(segs)
+        if m > n:
+            return False
+        return any(all(rxs[j].match(segs[i + j]) for j in range(m)) for i in range(n - m + 1))
+
+    return match_span
+
+
+def path_is_ignored(pattern: str, segs: list[str]) -> bool:
+    """Decide whether ONE pattern matches a path (already split into POSIX segments). Reference
+    single-pattern entry point; the engine precompiles the pattern set once via `_compile_ignore`
+    and matches through `Syncer._ignored`. See `_compile_ignore` for the matching rules."""
+    matcher = _compile_ignore(pattern)
+    return bool(matcher and matcher(segs))
 
 
 @dataclass
@@ -314,6 +328,12 @@ class Syncer:
         self.local_root = config.local_path
         self.trash_dir = trash_dir or default_trash_dir()
         self.ignore_patterns = config.effective_ignore
+        # Precompile the ignore patterns once: the hot scan loop matches via these instead of
+        # re-running fnmatch.translate per path. The pattern set is frozen for the Syncer's life
+        # (a config change means a new Syncer / daemon restart).
+        self._ignore_compiled: list[_IgnoreMatcher] = [
+            m for p in self.ignore_patterns if (m := _compile_ignore(p)) is not None
+        ]
         self._symlink_warned: set[str] = set()
         self._oversize_warned: set[str] = set()  # max_file_size_mb: warn once per path
         self._nfc_active: Optional[bool] = None  # probed once (volume normalization)
@@ -429,7 +449,7 @@ class Syncer:
         name = segs[-1]
         if name.casefold() == _nfc(VAULT_MARKER_NAME).casefold() or name.endswith(PART_SUFFIX):
             return True
-        return any(path_is_ignored(pat, segs) for pat in self.ignore_patterns)
+        return any(matcher(segs) for matcher in self._ignore_compiled)
 
     def _skip_symlink(self, rel: str, p: Path) -> bool:
         """Symlinks are not synced: a symlinked file would be replaced by a regular
