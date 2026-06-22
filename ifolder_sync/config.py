@@ -376,6 +376,10 @@ class Config:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"`{name}` must be a number.")
+        # The launchd plist `ThrottleInterval` must be a positive integer: 0 disables crash-loop
+        # spacing (tight respawn loop) and a negative is an invalid plist value.
+        if self.throttle_interval_seconds < 1:
+            raise ValueError("`throttle_interval_seconds` must be a positive integer.")
 
     @property
     def local_path(self) -> Path:

@@ -253,6 +253,17 @@ def test_config_validate_rejects_bool_and_non_numbers():
     Config(**base, retry_base_delay=2, debounce_seconds=1.5).validate()  # int/float OK
 
 
+def test_config_validate_rejects_nonpositive_throttle_interval():
+    """`throttle_interval_seconds` maps to the launchd plist `ThrottleInterval`, which must be a
+    positive integer; 0 disables crash-loop spacing and negatives are an invalid plist value."""
+    base = dict(apple_id="a@b.com", local_folder="/x")
+    with pytest.raises(ValueError):
+        Config(**base, throttle_interval_seconds=0).validate()
+    with pytest.raises(ValueError):
+        Config(**base, throttle_interval_seconds=-5).validate()
+    Config(**base, throttle_interval_seconds=1).validate()  # positive OK
+
+
 # ------------------------------------------------------- P2-2 walk cache ---
 def test_full_walk_interval_default_raised_to_3600():
     assert Config().full_walk_interval_seconds == 3600
