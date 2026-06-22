@@ -70,6 +70,7 @@ class SyncClient(Protocol):
     def upload(self, relpath: str, src: os.PathLike[str], mtime: float) -> None: ...
     def mkdir(self, relpath: str) -> None: ...
     def delete(self, relpath: str) -> None: ...
+    def invalidate_walk_cache(self) -> None: ...
 
 
 # Remote mtime tolerance: iCloud rounds to the second and its clock skews from the
@@ -617,6 +618,13 @@ class Syncer:
                 "(a widened ignore would otherwise read as mass deletion)"
             )
             defer_deletes = True
+            # The etag-keyed walk cache fingerprints REMOTE content only, so a subtree
+            # cached under the old filters would replay stale membership (a newly-ignored
+            # path leaks; a newly-un-ignored one stays missing). Drop it — and the
+            # persisted copy a restart would re-import — so this pass walks fresh.
+            self.client.invalidate_walk_cache()
+            if not dry_run:
+                self.store.set_meta("walk_cache", "")
         if not defer_deletes and self._normalization_downgraded():
             # Unlike a filter edit, this does not self-heal: the baseline is NFC-keyed but
             # the volume now reports raw (NFD) names, so accented files would read as

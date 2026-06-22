@@ -337,6 +337,69 @@ def test_etag_cache_disabled_always_walks_fully(monkeypatch):
     assert (root.calls, a.calls, b.calls) == (2, 2, 2)
 
 
+def test_etag_cache_emit_respects_changed_ignore(monkeypatch):
+    """A subtree cached while NOT ignored must be pruned on a later cache HIT once the
+    ignore set excludes it. The cache key is the iCloud folder etag (a REMOTE fingerprint,
+    blind to the local ignore set): a newly-ignored, etag-stable subtree would otherwise be
+    replayed from cache forever, never pruned by a fresh listing."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    root, a, b = _etag_tree()
+    c = ICloudClient("x@y.com", walk_workers=4, full_walk_interval=3600)
+    monkeypatch.setattr(c, "_root_node", lambda: root)
+
+    r1 = c.walk(None)  # cold: `b` listed and cached with a stable etag
+    assert "b/f2.md" in r1
+
+    # `b` becomes ignored. Etags are unchanged (only the LOCAL ignore moved), so `b` is a
+    # cache HIT served via _emit_cached. The emit path must reapply the predicate.
+    r2 = c.walk(lambda rel: rel.split("/")[0] == "b")
+    assert "b" not in r2 and "b/f2.md" not in r2
+    assert "a/f1.md" in r2  # the un-ignored branch is still served from cache
+
+
+def test_invalidate_walk_cache_forces_fresh_listing(monkeypatch):
+    """invalidate_walk_cache() drops the etag cache so the next walk lists every folder
+    fresh — the only way a newly-UN-ignored path (absent from the cached children list,
+    its parent etag unchanged) can reappear."""
+    from ifolder_sync.icloud_client import ICloudClient
+
+    root, a, b = _etag_tree()
+    c = ICloudClient("x@y.com", walk_workers=4, full_walk_interval=3600)
+    monkeypatch.setattr(c, "_root_node", lambda: root)
+
+    c.walk(None)
+    assert (root.calls, a.calls, b.calls) == (1, 1, 1)
+    c.walk(None)
+    assert (root.calls, a.calls, b.calls) == (1, 1, 1)  # warm: served from cache
+
+    c.invalidate_walk_cache()
+    c.walk(None)
+    assert (root.calls, a.calls, b.calls) == (2, 2, 2)  # cache dropped: all re-listed
+
+
+def test_syncer_invalidates_walk_cache_when_ignore_changes(make_syncer, fake, local_dir, tmp_path):
+    """When the effective ignore set changes between passes, the engine drops the remote
+    walk cache (and its persisted copy) so the next walk re-lists with the new filters — the
+    etag cache cannot otherwise reflect a local ignore change."""
+    from ifolder_sync.config import Config
+    from ifolder_sync.syncer import Syncer
+
+    syncer1, store = make_syncer(ignore=[".DS_Store"])
+    syncer1.sync_once()
+    assert fake.calls["invalidate_walk_cache"] == 0  # first pass: hash recorded, no change yet
+
+    cfg2 = Config(
+        apple_id="x@y.com",
+        remote_folder="",
+        local_folder=str(local_dir),
+        ignore=[".DS_Store", "secret/"],
+    )
+    Syncer(cfg2, fake, store, trash_dir=tmp_path / "trash").sync_once()
+    assert fake.calls["invalidate_walk_cache"] == 1  # ignore changed -> walk cache dropped
+    assert store.get_meta("walk_cache") == ""  # persisted blob cleared so a restart can't re-import
+
+
 def test_poll_timeout_adaptive(tmp_path, monkeypatch):
     import time
 
