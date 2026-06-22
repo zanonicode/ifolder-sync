@@ -464,14 +464,17 @@ def cmd_sync(args):
 
 
 def cmd_start(args):
-    from .daemon import Daemon
-    from .locking import AlreadyRunning
-    from .state import CorruptBaselineError
-
     profile, cfg = _load_profile(args)
     if getattr(args, "background", False):
         _start_background(profile)
         return
+    # Heavy imports (pyicloud via .daemon, watchdog via the watcher) belong to the foreground
+    # path only — `start --background` hands off to launchd and never instantiates Daemon, so it
+    # must not pay the ~1.8s .daemon import.
+    from .daemon import Daemon
+    from .locking import AlreadyRunning
+    from .state import CorruptBaselineError
+
     # The foreground daemon (also the process launchd runs) owns a rotating file log.
     _setup_logging(getattr(args, "verbose", False), log_path=log_file(profile))
     # invariant 9: under launchd (KeepAlive SuccessfulExit=false) a non-zero exit on an
