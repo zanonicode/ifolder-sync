@@ -2319,3 +2319,81 @@ def test_writable_state_uses_synchronous_normal(tmp_path):
         assert store.conn.execute("PRAGMA synchronous").fetchone()[0] == 1
     finally:
         store.close()
+
+
+def test_upsert_skips_identical_row_and_tracks_dirty(tmp_path):
+    """A byte-identical upsert is a no-op (idle-pass dedup) and does not dirty the store, so the
+    per-op commit after it has nothing to flush; a changed field writes and dirties."""
+    from ifolder_sync.state import BaselineEntry, StateStore
+
+    store = StateStore(tmp_path / "b.sqlite3")
+    try:
+        store.upsert(BaselineEntry("a/f.md", "file", 10, 100.0, 10, 100.0, "etag1"))
+        assert store._dirty  # first write dirties
+        store.commit()
+        assert not store._dirty  # commit clears
+        store.upsert(BaselineEntry("a/f.md", "file", 10, 100.0, 10, 100.0, "etag1"))
+        assert not store._dirty  # identical re-upsert -> no-op, not dirty
+        store.upsert(BaselineEntry("a/f.md", "file", 10, 100.0, 10, 100.0, "etag2"))
+        assert store._dirty  # a changed field (etag) DOES write
+        assert store.get("a/f.md").remote_etag == "etag2"
+    finally:
+        store.close()
+
+
+def test_commit_skips_when_clean(tmp_path):
+    """commit() is a no-op when nothing was dirtied (an idle pass adds no WAL frames); never
+    affects a real write, which dirties and commits per-op."""
+    from ifolder_sync.state import StateStore
+
+    store = StateStore(tmp_path / "b.sqlite3")
+    try:
+        assert not store._dirty
+        store.commit()  # clean -> no-op, no raise
+        assert not store._dirty
+    finally:
+        store.close()
+
+
+def test_idle_pass_does_not_rewrite_baseline(make_syncer, fake, local_dir):
+    """After a fully-synced state, a second (idle) pass RECORD-s every path but writes NO baseline
+    row (byte-identical dedup), so it adds no baseline INSERTs — the steady-state win."""
+    syncer, store = make_syncer()
+    write_file(local_dir, "a.md", b"hello", mtime=1000)
+    write_file(local_dir, "sub/b.md", b"world", mtime=1000)
+    syncer.sync_once()  # pass 1: uploads + records baseline
+
+    inserts = []
+    store.conn.set_trace_callback(
+        lambda sql: inserts.append(sql) if "INSERT INTO baseline" in sql else None
+    )
+    try:
+        s = syncer.sync_once()  # pass 2: idle
+    finally:
+        store.conn.set_trace_callback(None)
+    assert s.summary().endswith("errors=0")
+    assert inserts == []  # no baseline row rewritten on the idle pass
+    store.close()
+
+
+def test_readonly_store_still_rejects_a_real_write(tmp_path):
+    """The dedup makes a byte-identical upsert a no-op even on a read-only store, but the real
+    safety net is intact: a read-only observer cannot MUTATE the daemon's baseline — any upsert
+    that would change a byte still raises at the SQLite connection level."""
+    import sqlite3
+
+    from ifolder_sync.state import BaselineEntry, StateStore
+
+    db = tmp_path / "b.sqlite3"
+    w = StateStore(db)
+    w.upsert(BaselineEntry("a/f.md", "file", 10, 100.0, 10, 100.0, "etag1"))
+    w.commit()
+    w.close()
+
+    ro = StateStore(db, read_only=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            changed = BaselineEntry("a/f.md", "file", 99, 100.0, 10, 100.0, "etag1")
+            ro.upsert(changed)  # size 10 -> 99: a real mutation must still be rejected
+    finally:
+        ro.close()
