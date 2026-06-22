@@ -828,3 +828,39 @@ def test_fakeicloud_satisfies_syncclient_at_runtime():
 def test_real_client_satisfies_syncclient_at_runtime(tmp_path):
     client = ICloudClient.from_config(Config(apple_id="x@y.com", local_folder=str(tmp_path)))
     assert isinstance(client, SyncClient)
+
+
+def test_exception_exit_code_skips_heavy_imports_for_cheap_errors(monkeypatch):
+    """A cheap command (status/stop/restart) failing with a plain OSError must not pay the ~1.8s
+    pyicloud import just to classify the exit code: a cold module's exception types can never match
+    a live exception, so the heavy classifiers are gated on sys.modules."""
+    import sys
+
+    import ifolder_sync.cli as cli
+    from ifolder_sync.state import CorruptBaselineError
+
+    for m in (
+        "pyicloud",
+        "pyicloud.exceptions",
+        "ifolder_sync.icloud_client",
+        "ifolder_sync.syncer",
+    ):
+        monkeypatch.delitem(sys.modules, m, raising=False)
+    assert cli._exception_exit_code(OSError("boom")) == cli.Exit.ERROR
+    assert cli._exception_exit_code(ValueError("x")) == cli.Exit.ERROR
+    assert cli._exception_exit_code(RuntimeError("x")) == cli.Exit.ERROR
+    assert cli._exception_exit_code(CorruptBaselineError("x")) == cli.Exit.ERROR
+    assert cli._exception_exit_code(KeyError("x")) is None  # unknown -> full traceback
+    assert "pyicloud" not in sys.modules  # never imported to classify a non-pyicloud error
+
+
+def test_exception_exit_code_maps_specific_types_when_warm():
+    """When the heavy modules ARE loaded, the specific mappings are preserved byte-for-byte."""
+    import ifolder_sync.cli as cli
+    from ifolder_sync.icloud_client import AuthError
+    from ifolder_sync.syncer import LocalScanError, RemoteScanError, VaultIdentityError
+
+    assert cli._exception_exit_code(AuthError("x")) == cli.Exit.AUTH_REQUIRED
+    assert cli._exception_exit_code(VaultIdentityError("x")) == cli.Exit.VAULT_IDENTITY
+    assert cli._exception_exit_code(LocalScanError("x")) == cli.Exit.SCAN_GUARD
+    assert cli._exception_exit_code(RemoteScanError("x")) == cli.Exit.SCAN_GUARD

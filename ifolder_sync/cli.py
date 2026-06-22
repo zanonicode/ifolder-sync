@@ -1911,39 +1911,52 @@ def _exception_exit_code(exc: BaseException) -> Optional[Exit]:
     """Map an exception to an exit code, most-specific first (LocalScanError/
     VaultIdentityError subclass RuntimeError; the auth exceptions subclass PyiCloudException).
     Returns None for an unrecognized type so main() re-raises it with a full traceback —
-    only known, explained failures get the clean one-line treatment."""
-    from pyicloud.exceptions import (
-        PyiCloud2FARequiredException,
-        PyiCloudAuthRequiredException,
-        PyiCloudException,
-        PyiCloudFailedLoginException,
-        PyiCloudServiceNotActivatedException,
-    )
+    only known, explained failures get the clean one-line treatment.
 
-    from .icloud_client import AuthError
-    from .state import CorruptBaselineError
-    from .syncer import LocalScanError, RemoteScanError, VaultIdentityError
+    The heavy classifiers (pyicloud / .icloud_client / .syncer exception types, which transitively
+    pull pyicloud ~1.8s) are imported ONLY when their module is already loaded: a live exception
+    can only be an instance of a type whose defining module was imported to create it, so a cheap
+    command (status/stop) failing with a plain OSError never pays that import to classify it."""
+    from .state import CorruptBaselineError  # light (sqlite3 only); always safe to import
 
-    if isinstance(
-        exc,
-        (
-            AuthError,
-            PyiCloud2FARequiredException,
-            PyiCloudFailedLoginException,
-            PyiCloudAuthRequiredException,
-            PyiCloudServiceNotActivatedException,
-        ),
-    ):
-        # AuthError (a RuntimeError) is checked here, before the generic RuntimeError
-        # branch below, so a rejected/absent password and a cancelled 2FA all exit 3.
-        return Exit.AUTH_REQUIRED
-    if isinstance(exc, VaultIdentityError):
-        return Exit.VAULT_IDENTITY
-    if isinstance(exc, (LocalScanError, RemoteScanError)):
-        return Exit.SCAN_GUARD
-    if isinstance(exc, (PyiCloudException, CorruptBaselineError)):
-        # P4-4: a 503/429/service error must not dump a multi-screen traceback.
+    if isinstance(exc, CorruptBaselineError):
         return Exit.ERROR
+    if "ifolder_sync.icloud_client" in sys.modules:
+        from .icloud_client import AuthError
+
+        # AuthError (a RuntimeError) is checked before the generic RuntimeError branch below, so a
+        # rejected/absent password and a cancelled 2FA all exit 3.
+        if isinstance(exc, AuthError):
+            return Exit.AUTH_REQUIRED
+    if "ifolder_sync.syncer" in sys.modules:
+        from .syncer import LocalScanError, RemoteScanError, VaultIdentityError
+
+        if isinstance(exc, VaultIdentityError):
+            return Exit.VAULT_IDENTITY
+        if isinstance(exc, (LocalScanError, RemoteScanError)):
+            return Exit.SCAN_GUARD
+    if "pyicloud" in sys.modules:
+        from pyicloud.exceptions import (
+            PyiCloud2FARequiredException,
+            PyiCloudAuthRequiredException,
+            PyiCloudException,
+            PyiCloudFailedLoginException,
+            PyiCloudServiceNotActivatedException,
+        )
+
+        if isinstance(
+            exc,
+            (
+                PyiCloud2FARequiredException,
+                PyiCloudFailedLoginException,
+                PyiCloudAuthRequiredException,
+                PyiCloudServiceNotActivatedException,
+            ),
+        ):
+            return Exit.AUTH_REQUIRED
+        if isinstance(exc, PyiCloudException):
+            # P4-4: a 503/429/service error must not dump a multi-screen traceback.
+            return Exit.ERROR
     if isinstance(exc, (ValueError, RuntimeError, OSError)):
         return Exit.ERROR
     return None

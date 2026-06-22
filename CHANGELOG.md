@@ -8,6 +8,14 @@ carry behavior changes).
 ## [Unreleased]
 
 ### Changed
+- **Cheap commands fail faster.** The global exit-code classifier no longer imports `pyicloud`
+  (~1.8s) unconditionally — it only consults the pyicloud/engine exception types when those
+  modules are already loaded. A `status`/`stop`/`restart` that errors with a plain `OSError` now
+  reports its exit code without paying that import. Exit-code mapping is unchanged.
+- **Cheaper baseline commits.** The SQLite baseline now runs `synchronous=NORMAL` under WAL, so
+  each per-op commit is a WAL append instead of a full fsync (~2-3x cheaper; ~60-180ms saved on a
+  full-vault bootstrap). Still crash-safe (durable against app/OS crash; only a power loss could
+  drop the last txn).
 - **`start --background` no longer pays the heavy daemon import.** `cmd_start` only imports the
   sync engine (`.daemon`, which transitively pulls `pyicloud` + `watchdog`, ~1.8s) on the
   foreground path that actually runs it; the `--background` path hands off to launchd and

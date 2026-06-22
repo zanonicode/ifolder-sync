@@ -69,6 +69,11 @@ class StateStore:
         # raw "database is locked" that used to crash `status`.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
+        # synchronous=NORMAL: under WAL each per-op commit (one per applied action, for
+        # SIGKILL-mid-pass crash-safety) becomes a WAL append instead of a full fsync — ~2-3x
+        # cheaper. Still durable against an application OR OS crash; only a sudden power loss can
+        # drop the last committed txn, which is not the threat the per-op commits guard against.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
 
     def quick_check(self) -> None:
         """Raise CorruptBaselineError if the database fails SQLite's integrity check.
