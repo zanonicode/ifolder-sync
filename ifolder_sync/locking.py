@@ -82,7 +82,11 @@ class SingleInstanceLock:
         try:
             os.fchmod(fd, 0o600)
         except OSError:
-            pass
+            # Fail closed (invariant 7): if owner-only mode cannot be guaranteed, refuse to hold
+            # the lock rather than run with a wider-than-0600 lock file. Close the fd so we leave
+            # neither a held flock nor a leaked descriptor behind.
+            os.close(fd)
+            raise
         os.set_inheritable(fd, False)  # a forked/exec'd child must not inherit and pin the lock
         while True:
             try:

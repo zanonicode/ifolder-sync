@@ -266,6 +266,25 @@ def test_killed_child_auto_releases_lock(tmp_path):
     parent.release()
 
 
+def test_acquire_fails_closed_if_chmod_fails(tmp_path, monkeypatch):
+    """Invariant 7 is fail-closed: if 0600 cannot be enforced on acquire, refuse to hold the
+    lock (and don't leak the fd) rather than run with a wider-than-owner-only lock file."""
+
+    def _boom(*_a, **_k):
+        raise OSError("chmod denied")
+
+    lock_path = tmp_path / "daemon.lock"
+    monkeypatch.setattr(os, "fchmod", _boom)
+    lock = SingleInstanceLock(lock_path)
+    with pytest.raises(OSError):
+        lock.acquire()
+    assert lock._fd is None  # never recorded the fd -> lock not held, no leak
+    monkeypatch.undo()
+    other = SingleInstanceLock(lock_path)
+    other.acquire()  # the failed acquire left no flock behind -> freely acquirable
+    other.release()
+
+
 def test_lock_file_0600_even_if_preexisting_wider(tmp_path):
     """A lock file left wider than 0600 by an earlier build is narrowed to 0600 on acquire:
     O_CREAT does not re-apply the mode to an existing file, so acquire() fchmods it back."""
