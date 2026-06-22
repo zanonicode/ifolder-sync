@@ -131,16 +131,36 @@ ifolder-sync sync --force-delete  # apply deletions even past the safety thresho
 ifolder-sync start                # run the daemon in foreground (poll + watch)
 ifolder-sync start --background   # run it detached via launchd (returns your terminal)
 ifolder-sync stop                 # stop the background (launchd) daemon
+ifolder-sync restart              # restart the background (launchd) daemon (atomic; verified)
 ifolder-sync status               # show every profile's state (--profile <name> for just one)
 ifolder-sync status --json        # machine-readable state (for menu-bar/Raycast integrations)
+ifolder-sync status --watch       # live dashboard: in-flight transfers, queue, recently synced
+ifolder-sync doctor               # read-only consistency audit (baseline vs local vs remote)
+ifolder-sync doctor --fix-orphans # drop orphan baseline rows (backs up the baseline first)
 ifolder-sync logs -f              # tail the daemon log and keep following (Ctrl-C stops)
 ifolder-sync rebaseline           # reset the baseline (backup first) after the vault moved/drifted
 ifolder-sync purge-trash          # empty the local soft-delete trash (confirms; -y to skip)
 ifolder-sync install-agent        # generate the launchd LaunchAgent without loading it
+ifolder-sync uninstall            # stop and remove the launchd LaunchAgent (.plist)
 ```
 
 JSON goes to **stdout**, human/diagnostic text to **stderr** — so `status --json | jq` and
 `sync --dry-run --json` are stable to script against. `NO_COLOR` is honored.
+
+- **`status --watch`** is a live dashboard: it redraws the daemon's state, the in-flight
+  transfers, the full pending queue, recently-synced files (and any path that is
+  re-syncing in a loop) until Ctrl-C. With no `--profile` and more than one profile it
+  shows a compact multi-profile overview; it is read-only and network-free (it polls the
+  daemon's snapshot, never the iCloud API). Install the optional `rich` extra
+  (`pip install "ifolder-sync[dashboard]"`) for a richer frame. Refresh cadence is
+  `--interval` or `dashboard_interval_seconds` (default 1s).
+- **`doctor`** is a read-only consistency audit — the read-only counterpart of a sync
+  pass: it runs the engine's decide phase with **no apply**, so it never writes the
+  baseline and never changes a local or iCloud file, and reports inconsistencies (orphan
+  baseline rows, would-be conflicts, planned transfers/deletions). `doctor --fix-orphans`
+  is the one opt-in write: it drops only the provably-orphan baseline rows, **backing up
+  the baseline first** and **holding the single-instance lock** (so it refuses while the
+  daemon is running). It still does a network walk and may persist the iCloud session.
 
 ### Exit codes
 
@@ -322,9 +342,14 @@ When **both sides change** the same file between two syncs:
   for `unreadable_max_passes` (default 20) against an *unchanged* remote signature does
   the engine treat it as a genuine empty husk and let the good side win (one warning).
   A conflict is never resolved against an unreadable remote.
-- **Single-instance lock:** a PID lockfile (`state/<profile>/daemon.lock`) stops two
-  daemons from racing the baseline; a lock left by a dead process is reclaimed
-  automatically. A manual `sync` refuses to run while the daemon is up.
+- **Single-instance lock:** a **kernel advisory lock** (`fcntl.flock`) on
+  `state/<profile>/daemon.lock` (kept `0600`) stops two daemons from racing the baseline.
+  The kernel releases the lock on **any** process exit — clean, crash, or `SIGKILL` — so
+  there is no stale-lock heuristic: a dead holder's lock is simply gone. (The pid written
+  in the lock file is a human-readable label only, never a liveness decision.) The lock
+  file must live on a **local filesystem** — flock is unreliable over NFS/SMB. A manual
+  `sync`, `rebaseline`, and `doctor --fix-orphans` each **hold** this lock for the whole
+  baseline write and refuse to run while the daemon is up.
 - **Credential perms:** the session/cookie files are kept `0600` in a `0700` directory
   (bearer credentials); downloads are path-traversal safe (a remote name cannot escape
   the vault root).
@@ -379,8 +404,19 @@ Layout:
 ## Run in the background (launchd details)
 
 `start --background` (see [Quick start](#quick-start)) generates
-`~/Library/LaunchAgents/com.ifolder-sync.<profile>.plist` and `launchctl load`s it —
-one agent per profile. Logs go to `~/.config/ifolder-sync/state/<profile>/logs/`.
+`~/Library/LaunchAgents/com.ifolder-sync.<profile>.plist` and hands the daemon to
+**launchd** — one agent per profile. The daemon log is `~/Library/Logs/ifolder-sync/<profile>.log`
+(tail it with `ifolder-sync logs -f`); launchd's own stdout/stderr crash capture lives under
+`~/.config/ifolder-sync/state/<profile>/logs/`.
+
+The lifecycle commands use the **modern domain-target launchctl control plane**
+(`bootstrap` / `bootout` / `enable` / `kickstart`, not the legacy `load` / `unload`),
+and they **verify the post-condition** before reporting success: `start --background`,
+`restart`, `stop` and `uninstall` each poll `launchctl print` until the daemon really is
+up (or down) — so a command never prints a false "started"/"stopped". A fresh spawn is
+throttled by launchd (see `throttle_interval_seconds`), so a (re)start may wait a few
+seconds for the throttled spawn to appear; the verify deliberately outlasts that window
+(a throttled-but-fine start must not read as a failure).
 
 - **Survives logouts and reboots:** the agent is registered with launchd, so after any
   reboot the cycle is simply *boot → log in → it's already running*. Technically it
@@ -388,11 +424,19 @@ one agent per profile. Logs go to `~/.config/ifolder-sync/state/<profile>/logs/`
   which is deliberate: the daemon needs your login Keychain (Apple ID password) and
   your user's file permissions. `stop` disables it persistently until the next
   `start --background`.
+- **`restart`** is a first-class verb (not `stop && start`): it converges the job
+  atomically (`bootout` → `enable` → `bootstrap` → `kickstart -k`) and verifies the
+  daemon came back up, so a restart never ends with the daemon stopped. It accepts
+  `--background` (for symmetry with `start`; `restart` always manages the launchd job).
+- **`uninstall`** stops the job and removes its `.plist`; it is idempotent (safe to run
+  when nothing is installed).
 - `install-agent` does the same generation *without* loading, if you prefer to drive
   `launchctl` yourself.
 - **Authenticate first** (`ifolder-sync auth`): the background daemon runs
-  non-interactively and cannot answer a 2FA prompt; it exits cleanly (with a logged
-  error) when it cannot authenticate.
+  non-interactively and cannot answer a 2FA prompt. It validates its saved trust token
+  first and only reads the password from the macOS Keychain when a real login is needed,
+  with a **bounded read** (`keyring_timeout_seconds`) so a non-grantable Keychain access
+  can never wedge the daemon — it fails fast with a clean auth error and stops.
 - The vault-location (TCC) restriction from [Quick start](#quick-start) applies
   especially here.
 
@@ -419,19 +463,27 @@ Each profile's config lives at `~/.config/ifolder-sync/profiles/<name>.json`:
 | `delete_threshold_count` | Pause deletes above this many files | `100` |
 | `walk_workers` | Concurrent remote folder listings (1 = serial) | `4` |
 | `full_walk_interval_seconds` | Max etag-cache age before a full remote walk (0 = no cache) | `3600` |
+| `throttle_interval_seconds` | launchd `ThrottleInterval`: min seconds between (re)spawns — bounds start/restart latency and crash-loop spacing (≥1) | `15` |
+| `dashboard_interval_seconds` | `status --watch` redraw cadence (floor 0.2s; `--interval` overrides) | `1.0` |
 | `ignore` | Patterns ignored on both sides (see above) | see defaults |
 
 The table above lists the everyday options. The remaining tuning/advanced options —
-request timeout, session auto-reconnect bounds, baseline backups, Unicode normalization,
-etag verification, the publish-before-content deferral window (`unreadable_max_passes`),
-the 0-byte settle window, the upload size cap, and strict child-count — are documented in
-full, with when-to-change guidance and example configs, in
+request timeout, the bounded Keychain read (`keyring_timeout_seconds`), session
+auto-reconnect bounds, baseline backups, Unicode normalization, etag verification, the
+publish-before-content deferral window (`unreadable_max_passes`), the 0-byte settle
+window, the upload size cap, strict child-count, the post-condition verify bound
+(`lifecycle_verify_timeout_seconds`), and the live-dashboard surface
+(`inflight_surface`, `inflight_min_write_interval_ms`) — are documented in full, with
+when-to-change guidance and example configs, in
 **[docs/ADVANCED_USAGE.md](docs/ADVANCED_USAGE.md)**.
 
 ## Troubleshooting
 
 - **Is it actually running?** `ifolder-sync status` (daemon liveness + session
-  validity) and `ifolder-sync logs -f` (live activity).
+  validity), `ifolder-sync status --watch` (live in-flight/queue dashboard), and
+  `ifolder-sync logs -f` (live activity).
+- **Suspect drift / inconsistency** (suppressed deletions, stuck files): run the
+  read-only `ifolder-sync doctor` audit before any destructive step.
 - **2FA stuck / "invalid code too many times" / no code arrives:**
   `ifolder-sync auth --fresh` discards the saved session and logs in from scratch.
 - **Moved or recreated the vault folder** (or "vault identity mismatch"):
@@ -445,18 +497,24 @@ full, with when-to-change guidance and example configs, in
 ```bash
 # upgrade (from the clone)
 git pull && pip install -e .
-ifolder-sync stop && ifolder-sync start --background   # reload the daemon
+ifolder-sync restart                               # per active profile (see the note below)
 
 # uninstall
-ifolder-sync stop                                  # per profile, if backgrounded
-rm -f ~/Library/LaunchAgents/com.ifolder-sync.*.plist
+ifolder-sync uninstall                             # per profile: stops + removes the .plist
 rm -rf ~/.config/ifolder-sync                      # configs, state, sessions, local trash
 pip uninstall ifolder-sync
 ```
 
-The Keychain entry (the Apple ID password saved by `auth`) can be removed with the
-Keychain Access app if desired. Your vault and the remote iCloud folder are never
-touched by uninstalling.
+> **One-time after upgrading: run `ifolder-sync restart` for each active profile.** The
+> single-instance lock is now a kernel `fcntl.flock` (it used to be a PID file). A daemon
+> started by an older version holds the lock file **without** a kernel flock, so a
+> new-code process cannot see it; restarting makes the new code take the kernel lock.
+> `restart` is atomic (it verifies the daemon came back up), so it is the correct upgrade
+> step — `stop && start --background` also works.
+
+`uninstall` removes the launchd agent and its `.plist` per profile. The Keychain entry
+(the Apple ID password saved by `auth`) can be removed with the Keychain Access app if
+desired. Your vault and the remote iCloud folder are never touched by uninstalling.
 
 ## Tests & development
 

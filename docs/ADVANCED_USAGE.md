@@ -19,9 +19,11 @@ New here? Start with the [README](../README.md). For the internal design, see
   - [Reliability & network](#reliability--network)
   - [Data integrity & propagation-lag](#data-integrity--propagation-lag)
   - [Performance](#performance)
+  - [Lifecycle & dashboard](#lifecycle--dashboard)
   - [Limits](#limits)
   - [Ignore patterns](#ignore-patterns)
 - [Example configurations](#example-configurations)
+- [Inspecting & operating a live vault](#inspecting--operating-a-live-vault)
 - [Conflicts & recovery playbook](#conflicts--recovery-playbook)
 - [Operational tips](#operational-tips)
 
@@ -107,6 +109,7 @@ are correct for an Obsidian vault and should be left alone.
 | `request_timeout_seconds` | int · `60` | `(connect, read)` timeout on every iCloud request. pyicloud defaults to *no* timeout, so a single hung socket could wedge the daemon forever; this turns a hang into a retryable error. `<= 0` disables (not recommended). |
 | `max_session_reconnects` | int · `5` | The iCloud *login token* lapses after some hours of uptime (HTTP 421 `LOGIN_TOKEN_EXPIRED`). The daemon reconnects in place — no 2FA, the trust token is still valid — instead of looping every poll. This caps consecutive reconnects with no clean pass between them before it clean-stops with a "run auth" hint. `0` = clean-stop on the first relapse. |
 | `min_reconnect_interval_seconds` | int · `120` | Minimum gap between two SRP reconnects, so a relapse storm cannot replay logins every poll (Apple lockout risk). Within the window it retries without reconnecting. |
+| `keyring_timeout_seconds` | float · `10.0` | Bound on a **non-interactive** macOS Keychain read. Under launchd a venv Python is ad-hoc signed, so a non-interactive Keychain authorization cannot be auto-granted and the `security` read can block forever (once observed wedging the daemon ~17h). The daemon validates its saved trust token first and reads the password only when a real SRP login is needed; this bound turns a wedged read into a clean auth error and a tidy stop. Interactive reads (a human at a prompt) stay unbounded. `<= 0` disables the bound (legacy, unbounded). |
 
 ### Data integrity & propagation-lag
 
@@ -129,6 +132,19 @@ before changing them.**
 | `walk_workers` | int · `4` | Concurrent remote folder listings (one network call per changed folder). `1` = serial. Raise for a very wide tree on a fast link; lower to be gentle on rate limits. |
 | `full_walk_interval_seconds` | int · `3600` | Max age of the etag cache before a full uncached remote walk runs as ground truth (plus small per-instance jitter). The etag cache makes most passes ~1 call, so this rarely fires. `0` disables caching (a full walk every pass — slow). |
 | `baseline_backups` | int · `5` | After each pass that changed something, the baseline DB is snapshotted into a ring of this many rotated copies (a recovery net for corruption; never auto-restored). `0` disables. |
+
+### Lifecycle & dashboard
+
+These govern the launchd control plane (`start --background`/`stop`/`restart`/`uninstall`)
+and the live `status --watch` dashboard. They almost never need tuning.
+
+| Field | Type · default | What it does · when to change |
+|-------|----------------|-------------------------------|
+| `throttle_interval_seconds` | int · `15` | The launchd plist `ThrottleInterval`: launchd will not (re)spawn the job more than once per this many seconds. This bounds **both** how fast `start`/`restart` see a fresh spawn appear **and** how tightly genuine crash restarts (`KeepAlive` fires only on a non-zero exit) are spaced. Lower = snappier start/restart and faster crash recovery; higher = more conservative crash-loop spacing. Must be `>= 1` (macOS default is `10`). Written into the plist, so a change takes effect once the agent is regenerated (`start --background`, `restart`, or `install-agent`). |
+| `lifecycle_verify_timeout_seconds` | float · `5.0` | How long `start`/`stop`/`restart`/`uninstall` poll `launchctl print` to verify the post-condition (the daemon really came up / went down) before reporting the true outcome — no more false "started". `start`/`restart` floor this at the throttle window (a throttled-but-fine spawn must not read as "failed to start"); `stop`/`uninstall` keep the short value (teardown is not throttled). |
+| `inflight_surface` | bool · `true` | The daemon (and a foreground `sync`) writes a live `status.json` snapshot of in-flight transfers so `status --watch` can show real-time progress. `false` disables **all** producer-side dashboard work (zero overhead) — the dashboard then falls back to the persisted "stuck" set only. |
+| `inflight_min_write_interval_ms` | int · `200` | Throttle for those in-flight snapshot writes: rapid updates coalesce to at most one flush per this many milliseconds. Raise to write less often on a slow disk; lower for a more granular dashboard. |
+| `dashboard_interval_seconds` | float · `1.0` | How often `status --watch` re-polls the snapshot/meta and redraws. Purely view-side (no engine effect). `--interval` overrides it per run; the floor is `0.2s`. |
 
 ### Limits
 
@@ -270,6 +286,102 @@ ifolder-sync auth  --profile work          # same account → reuses the trusted
 ifolder-sync start --profile work --background
 ifolder-sync status                        # shows every profile
 ```
+
+---
+
+## Inspecting & operating a live vault
+
+Beyond `init` / `auth` / `start`, these commands cover watching, auditing, and managing
+a running daemon. All take `--profile` (default `default`).
+
+### Live dashboard — `status --watch`
+
+`ifolder-sync status --watch` opens a live dashboard that redraws until Ctrl-C:
+
+- **in-flight transfers** the daemon is moving *right now* (uploading / downloading /
+  deleting), backed by the atomic `status.json` snapshot (`inflight_surface`);
+- the **full pending queue** (`queued`) plus the persisted *stuck* set (settle-waits and
+  propagation-lag `pending` backoffs);
+- a short **recently-synced** rail so a fast transfer is not invisible, and a **flapping**
+  flag for any path that completes repeatedly within a moving window (a re-sync loop);
+- the suppressed-deletes banner when the safety threshold withheld deletions.
+
+With no `--profile` and multiple profiles configured it shows a compact one-line-per-profile
+overview instead. Redraw cadence is `dashboard_interval_seconds` (default `1.0s`); override
+per run with `--interval <seconds>` (floor `0.2s`). If the optional `rich` extra is installed
+the frame upgrades to truecolor boxes; otherwise a plain ANSI frame is used. A foreground
+`ifolder-sync sync` also feeds this surface, so a manual pass is visible too.
+
+> The dashboard only renders the live snapshot when its writer is the **current** lock
+> holder — a stale `status.json` left by a dead daemon never shows as live activity.
+
+### Consistency audit — `doctor` (read-only) and `doctor --fix-orphans`
+
+`ifolder-sync doctor` is the **read-only** counterpart of a sync pass: it runs the engine's
+decide phase with **no apply** — it changes no local files, never writes the baseline, and
+makes no remote change (it does perform a network walk and may refresh the iCloud session,
+like every command). It reports inconsistencies grouped by kind:
+
+- **orphan baseline rows** — paths present only in the baseline, absent from a *successful*
+  local **and** remote scan (the residue of a moved/renamed folder, e.g. a macOS
+  case-only rename);
+- would-conflict, unsettled/pending, and the planned upload/download/delete tallies.
+
+`status` points you here automatically (`→ run doctor …`) whenever the last pass logged
+errors or suppressed deletions.
+
+`ifolder-sync doctor --fix-orphans` is the one opt-in **write**: it drops only the
+provably-orphan baseline rows, **after** backing up the baseline (a collision-safe
+`baseline.sqlite3.pre-fix-orphans-<timestamp>` copy) and clearing the stale walk cache. It
+touches no local or remote content, and **refuses while the daemon is running** (it holds
+the same single-instance lock the daemon uses, so it can never race a live baseline write —
+stop the daemon first). `doctor` and `doctor --fix-orphans` both accept `--json` (schema 1)
+and `--non-interactive`. A scan failure aborts the audit, so `--fix-orphans` can never act
+on a partial tree.
+
+```bash
+ifolder-sync doctor                          # read-only: what disagrees, and why
+ifolder-sync stop                            # required before a fix (it writes the baseline)
+ifolder-sync doctor --fix-orphans            # backup + drop only orphan rows
+ifolder-sync start --background
+```
+
+### `restart` — first-class atomic restart
+
+`ifolder-sync restart` restarts the background (launchd) daemon as a single verb, **not**
+`stop && start`. It runs the modern launchd converge chain — regenerate the plist →
+`bootout` the old job → wait for that async unload → `enable` the label → `bootstrap` →
+`kickstart -k` a fresh spawn — then **verifies** the daemon actually came back up before
+printing success. It is **atomic**: a restart never ends with the daemon stopped. The verify
+wait outlasts `throttle_interval_seconds` (a throttled-but-fine respawn must not read as
+"failed to start"), so a restart can take up to roughly the throttle window plus a few seconds
+(`throttle_interval_seconds` + a ~5s slack) to confirm.
+`--background` is accepted for symmetry with `start` but is a no-op (restart always manages
+the launchd daemon). This is the command to run after upgrading (see below).
+
+### `uninstall` — remove the launchd agent
+
+`ifolder-sync uninstall` stops the profile's launchd job (idempotent), verifies it went
+down, then removes its `LaunchAgent .plist`. Safe to run when nothing is installed
+("nothing to uninstall"). It removes only the launchd agent — your config, baseline, trash,
+and the synced vault are untouched.
+
+### The single-instance lock (kernel `fcntl.flock`)
+
+Each profile's daemon holds a kernel advisory lock (`fcntl.flock`) on
+`state/<profile>/daemon.lock` for its whole lifetime, so two daemons can never race the same
+SQLite baseline. The kernel releases the lock on **any** process exit — clean, crash, or
+SIGKILL — so there is no stale-lock heuristic: a dead holder's lock is freed instantly. The
+PID written into the lock file is a human-readable **label only**, never a liveness decision.
+The lock file is `0600`. It must live on a **local** filesystem (here, APFS under `$HOME`):
+`flock` semantics are unreliable over network filesystems (NFS, some SMB), so a state
+directory on a network share is unsupported.
+
+> **Upgrade note (one-time, required).** After upgrading ifolder-sync, run
+> **`ifolder-sync restart`** for each active profile. A daemon started by the previous
+> version holds the lock file **without** a kernel `flock`, so a new-code process cannot see
+> it; restarting makes the new code take the kernel lock. Until you restart, a manual
+> `sync`/`doctor --fix-orphans` may not detect the old daemon's hold.
 
 ---
 
@@ -461,6 +573,14 @@ over-limit file that's *also* in a conflict can't be pushed until the limit allo
   heartbeat, so a quiet log is normal.
 - **Health at a glance:** `ifolder-sync status` (daemon liveness, session validity, last
   sync, local trash count). `status --json | jq` for menu-bar/Raycast integrations.
+- **Watch it live:** `ifolder-sync status --watch` for a redrawing dashboard of in-flight
+  transfers, the pending queue, and anything stuck (see
+  [Inspecting & operating a live vault](#inspecting--operating-a-live-vault)).
+- **Audit without touching anything:** `ifolder-sync doctor` is a read-only consistency
+  check (orphan baseline rows, would-be conflicts/deletes); `doctor --fix-orphans` drops
+  stale baseline rows after a backup (stop the daemon first).
+- **Restart after an upgrade:** `ifolder-sync restart` per active profile — required so the
+  new code takes the kernel `flock` lock (the old daemon held the file without one).
 - **Exit codes are meaningful** — cron/monitoring can branch on them
   (`3` = auth needed, `4` = scan guard aborted, `5` = vault mismatch, `6` = deletes
   suppressed, `7` = some file ops failed). Full table in the

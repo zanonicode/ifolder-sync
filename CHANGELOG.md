@@ -7,7 +7,45 @@ carry behavior changes).
 
 ## [Unreleased]
 
+### Added
+- **Live status dashboard — `ifolder-sync status --watch`.** A redrawing dashboard of the
+  daemon's in-flight transfers, the full pending queue, recently-synced files, and any path
+  re-syncing in a loop (flapping), with a compact multi-profile overview when no `--profile`
+  is given. It is read-only and network-free: it polls an atomic `status.json` snapshot the
+  daemon (and a foreground `sync`) writes — gated by the new `inflight_surface` (default on),
+  coalesced by `inflight_min_write_interval_ms` (default 200), and redrawn every
+  `dashboard_interval_seconds` (default 1.0, `--interval` overrides). The optional `rich`
+  extra (`pip install "ifolder-sync[dashboard]"`) upgrades the frame; without it a plain ANSI
+  frame is used.
+- **Sync doctor — `ifolder-sync doctor`.** A read-only consistency audit (the decide phase of
+  a sync pass with no apply, via `Syncer.plan()`): it reports orphan baseline rows, would-be
+  conflicts, unsettled/pending paths, and the planned upload/download/delete tallies without
+  changing any local, remote, or baseline state. `doctor --fix-orphans` is the one opt-in
+  write — it drops only the provably-orphan baseline rows after backing up the baseline and
+  clearing the stale walk cache, holding the single-instance lock (so it refuses while the
+  daemon is running). Both accept `--json` (schema 1) and `--non-interactive`.
+- **Modern launchd control plane** for the lifecycle commands. `start --background`, `stop`,
+  `restart`, and `uninstall` drive launchd through the modern domain-target verbs
+  (`bootout`/`enable`/`bootstrap`/`kickstart -k` against `gui/<uid>/com.ifolder-sync.<profile>`)
+  instead of the legacy `load`/`unload`, and each **verifies its post-condition** (polls
+  `launchctl print` until the daemon is really up/down) before reporting success — no more
+  false "started"/"stopped".
+  - **`ifolder-sync restart`** is a new first-class, atomic verb (not `stop && start`): it
+    converges the job (regenerate plist → `bootout` → settle → `enable` → `bootstrap` →
+    `kickstart -k`) and verifies it came back up, so a restart never ends with the daemon
+    stopped. It accepts `--background` for symmetry with `start`.
+  - **`ifolder-sync uninstall`** stops the job (idempotent) and removes its LaunchAgent
+    `.plist`, leaving config/baseline/vault untouched.
+  - New tunables: `throttle_interval_seconds` (the plist `ThrottleInterval`) and
+    `lifecycle_verify_timeout_seconds` (the post-condition verify bound).
+
 ### Changed
+- **Lazy, bounded Keychain auth.** The daemon now validates its saved trust token **first**
+  and reads the password from the macOS Keychain only when a real SRP login is needed, with a
+  **bounded read** (`keyring_timeout_seconds`, default 10.0s). Under launchd a venv Python is
+  ad-hoc signed, so a non-interactive Keychain authorization cannot be auto-granted and the
+  read could block forever (once observed wedging the daemon ~17h); the bound turns that hang
+  into a clean auth error and a tidy stop. Interactive reads stay unbounded.
 - **Idle sync passes are much cheaper (~9x).** When nothing has changed, the engine no longer
   rewrites every baseline row with identical values — the SQLite baseline skips a byte-identical
   write (and its commit), so a steady-state pass over a large vault drops from ~1.5s to ~0.17s. A
