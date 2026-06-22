@@ -360,15 +360,19 @@ def test_status_shows_foreground_daemon_via_lock_fallback(tmp_path, monkeypatch,
     running (foreground), not stopped — Decision 5."""
     import os
 
+    from ifolder_sync.locking import SingleInstanceLock
+
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
-    lock_path("work").write_text(str(os.getpid()))  # a live pid holds the lock
+    held = SingleInstanceLock(lock_path("work"))
+    held.acquire()  # a live foreground daemon holds the kernel lock
     monkeypatch.setattr(cli, "_lc", _fake_lc(running_pid=None))  # no launchd job
-
-    main(["status", "--profile", "work"])
-
-    out = capsys.readouterr().out
-    assert f"running (pid {os.getpid()}, foreground)" in out
+    try:
+        main(["status", "--profile", "work"])
+        out = capsys.readouterr().out
+        assert f"running (pid {os.getpid()}, foreground)" in out
+    finally:
+        held.release()
 
 
 # --- session / auth state in status -------------------------------------------

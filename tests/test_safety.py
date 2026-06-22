@@ -5,7 +5,9 @@ and no post-upload stat (AT-09).
 
 from __future__ import annotations
 
+import fcntl
 import os
+import signal
 
 import pytest
 
@@ -114,86 +116,17 @@ def test_lock_file_is_owner_only_0600(tmp_path):
         lock.release()
 
 
-def test_stale_lock_reclaimed(tmp_path):
+def test_single_instance_lock_reacquire_after_release(tmp_path):
+    """A released lock is immediately reacquirable -- the kernel frees the flock on release,
+    leaving the (now-unlocked) lock file on disk for the next acquirer to reopen and re-flock."""
     lock_path = tmp_path / "daemon.lock"
-    lock_path.write_text("2147483647")  # almost certainly not a live PID (legacy 1-line lock)
-    lock = SingleInstanceLock(lock_path)
-    lock.acquire()
-    # P2-7: the lock now stores "pid\nboot_time"; the first line is the owning pid.
+    a = SingleInstanceLock(lock_path)
+    a.acquire()
+    a.release()
+    b = SingleInstanceLock(lock_path)
+    b.acquire()
     assert lock_path.read_text().splitlines()[0].strip() == str(os.getpid())
-    lock.release()
-
-
-def test_lock_from_previous_boot_is_stale(tmp_path):
-    """P2-7: a lock whose recorded boot time differs from this boot is treated as stale
-    even if its PID is alive — after a reboot the PID may have been recycled."""
-    from ifolder_sync.locking import _boot_time, holder_pid
-
-    if _boot_time() is None:
-        pytest.skip("boot time unavailable (non-macOS); falls back to the liveness check")
-    lock_path = tmp_path / "daemon.lock"
-    other_boot = (_boot_time() or 0) - 100000  # a different (earlier) boot
-    lock_path.write_text(f"{os.getpid()}\n{other_boot}")  # OUR live pid, but a prior boot
-    assert holder_pid(lock_path) is None  # stale despite being alive
-    # a current-boot lock with our live pid IS held
-    lock_path.write_text(f"{os.getpid()}\n{_boot_time() or ''}")
-    assert holder_pid(lock_path) == os.getpid()
-
-
-def test_same_boot_jitter_is_not_stale(tmp_path, monkeypatch):
-    """A same-boot kern.boottime jitter (NTP disciplines the wall clock) must NOT flip a live
-    lock to stale; tolerated two-sided since the wall clock can step in either direction."""
-    from ifolder_sync.locking import _BOOT_TOL, holder_pid
-
-    assert _BOOT_TOL >= 1
-    stamped = 1780079296
-    lock_path = tmp_path / "daemon.lock"
-    lock_path.write_text(f"{os.getpid()}\n{stamped}")
-    monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda: stamped + 1)
-    assert holder_pid(lock_path) == os.getpid()  # forward 1s jitter (the live bug)
-    monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda: stamped - 1)
-    assert holder_pid(lock_path) == os.getpid()  # backward jitter too (two-sided)
-
-
-def test_boot_skew_tolerance_boundary(tmp_path, monkeypatch):
-    """Boundary: delta within _BOOT_TOL is held, delta beyond it is stale (pins the band so a
-    future widening cannot silently erode the previous-boot guard)."""
-    from ifolder_sync.locking import _BOOT_TOL, holder_pid
-
-    base = 1780079296
-    lock_path = tmp_path / "daemon.lock"
-    lock_path.write_text(f"{os.getpid()}\n{base}")
-    for delta, held in ((0, True), (_BOOT_TOL, True), (_BOOT_TOL + 1, False)):
-        monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda d=delta: base + d)
-        got = holder_pid(lock_path)
-        assert (got == os.getpid()) is held
-
-
-def test_previous_boot_lock_still_stale_with_tolerance(tmp_path, monkeypatch):
-    """P2-7 survives the tolerance: a genuine previous-boot lock (delta >> band) is still stale,
-    deterministic on any platform (no real sysctl, no macOS-only skip)."""
-    from ifolder_sync.locking import holder_pid
-
-    stamped = 1780079296
-    lock_path = tmp_path / "daemon.lock"
-    lock_path.write_text(f"{os.getpid()}\n{stamped}")
-    monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda: stamped + 100000)
-    assert holder_pid(lock_path) is None
-
-
-def test_multiday_boottime_drift_is_not_stale(tmp_path, monkeypatch):
-    """Regression: kern.boottime drift grows with uptime (~1s/day) and reached 3s after ~3.4 days,
-    exceeding the original _BOOT_TOL=2 and false-staling a live daemon (status lied "stopped"). The
-    band must cover realistic multi-day drift; this fails under any tolerance below 5s."""
-    from ifolder_sync.locking import _BOOT_TOL, holder_pid
-
-    assert _BOOT_TOL >= 5  # floor above the observed 3s drift, with margin
-    stamped = 1780079296
-    lock_path = tmp_path / "daemon.lock"
-    lock_path.write_text(f"{os.getpid()}\n{stamped}")
-    for drift in (5, -5):  # NTP can step either way
-        monkeypatch.setattr("ifolder_sync.locking._boot_time", lambda d=drift: stamped + d)
-        assert holder_pid(lock_path) == os.getpid()
+    b.release()
 
 
 def test_retry_recovers_from_transient():
@@ -227,3 +160,140 @@ def test_retry_skips_logic_error():
     with pytest.raises(PyiCloudAPIResponseException):
         with_retry(bad, attempts=3, base=0)
     assert calls["n"] == 1  # 400 is a logic error -> not retried
+
+
+# ---------------------------------------------------------------- flock lock ---
+# The single-instance lock is a kernel advisory lock (fcntl.flock) held on an fd kept
+# open for the process lifetime; the kernel frees it on ANY exit. The pid in the file
+# body is a human label only -- flock acquirability, not the pid, decides liveness.
+
+
+def test_two_instances_in_process_contend(tmp_path):
+    """Mutual exclusion via the kernel: two SingleInstanceLock objects on one path hold
+    DISTINCT fds (distinct open file descriptions), so the second flock genuinely conflicts --
+    even in one process. Subsumes the deleted kern.boottime/_BOOT_TOL false-stale tests: flock
+    never reads the boot clock, so the multi-day-drift false-stale class is structurally gone."""
+    lock_path = tmp_path / "daemon.lock"
+    a = SingleInstanceLock(lock_path)
+    a.acquire()
+    b = SingleInstanceLock(lock_path)
+    with pytest.raises(AlreadyRunning) as exc:
+        b.acquire()
+    assert str(os.getpid()) in str(exc.value)  # pid written + read back as a human label
+    a.release()
+    b.acquire()  # freed -> now acquirable
+    b.release()
+
+
+def test_write_label_does_not_drop_lock(tmp_path):
+    """acquire() writes the pid label by reusing the held fd (ftruncate+write), never re-opening
+    or O_TRUNC-creating the file, so the advisory lock is not momentarily dropped by the write."""
+    lock_path = tmp_path / "daemon.lock"
+    a = SingleInstanceLock(lock_path)
+    a.acquire()
+    try:
+        assert lock_path.read_text().splitlines()[0].strip() == str(os.getpid())
+        with pytest.raises(AlreadyRunning):
+            SingleInstanceLock(lock_path).acquire()  # still held after the label write
+    finally:
+        a.release()
+
+
+def test_holder_pid_none_when_unheld_pidfile(tmp_path):
+    """flock acquirability -- not the pid in the body -- decides liveness. A lock file naming a
+    LIVE pid but held by NO flock is free (holder_pid -> None); only a real flock holder yields a
+    pid. Guards the _observe_daemon foreground fallback against a phantom holder."""
+    from ifolder_sync.locking import holder_pid
+
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text(f"{os.getpid()}\n")  # our live pid, but nothing holds the flock
+    assert holder_pid(lock_path) is None
+    held = SingleInstanceLock(lock_path)
+    held.acquire()
+    try:
+        assert holder_pid(lock_path) == os.getpid()
+    finally:
+        held.release()
+    assert holder_pid(lock_path) is None  # released -> free again
+
+
+def test_migration_crossover_legacy_pidfile_is_acquirable(tmp_path):
+    """Upgrade crossover: a legacy O_EXCL pidfile (a bare pid[/boot] body) carries NO kernel
+    flock, so new-code acquire() takes the lock cleanly and rewrites the body to its own pid.
+    This is why the upgrade requires a daemon restart (an old-code holder is invisible to the new
+    flock probe); the test pins that a leftover file never wedges a fresh start."""
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text(f"{os.getpid()}\n1780079296")  # legacy two-line body, no flock held
+    lock = SingleInstanceLock(lock_path)
+    lock.acquire()  # not blocked by a merely-written legacy pidfile
+    try:
+        assert lock_path.read_text().splitlines()[0].strip() == str(os.getpid())
+    finally:
+        lock.release()
+
+
+@pytest.mark.skipif(not hasattr(fcntl, "flock"), reason="flock unavailable on this platform")
+def test_killed_child_auto_releases_lock(tmp_path):
+    """The kernel drops the flock on ANY process exit, including SIGKILL -- no liveness probe and
+    no stale-reclaim. A child holds the lock; the parent is refused; after SIGKILL the parent
+    acquires with no cleanup. Replaces the deleted os.kill/kern.boottime stale-reclaim tests."""
+    lock_path = tmp_path / "daemon.lock"
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(r)
+        try:
+            SingleInstanceLock(lock_path).acquire()
+            os.write(w, b"1")  # signal: lock held
+            os.close(w)
+            signal.pause()  # wait to be killed
+        finally:
+            os._exit(0)
+    os.close(w)
+    parent = SingleInstanceLock(lock_path)
+    try:
+        assert os.read(r, 1) == b"1"  # block until the child holds the lock (no sleep)
+        with pytest.raises(AlreadyRunning):
+            parent.acquire()  # child holds it
+    finally:
+        os.close(r)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # child already exited
+        os.waitpid(pid, 0)  # always reap (no zombie), even if an assertion above failed
+    parent.acquire()  # kernel auto-released the dead child's flock
+    parent.release()
+
+
+def test_acquire_fails_closed_if_chmod_fails(tmp_path, monkeypatch):
+    """Invariant 7 is fail-closed: if 0600 cannot be enforced on acquire, refuse to hold the
+    lock (and don't leak the fd) rather than run with a wider-than-owner-only lock file."""
+
+    def _boom(*_a, **_k):
+        raise OSError("chmod denied")
+
+    lock_path = tmp_path / "daemon.lock"
+    monkeypatch.setattr(os, "fchmod", _boom)
+    lock = SingleInstanceLock(lock_path)
+    with pytest.raises(OSError):
+        lock.acquire()
+    assert lock._fd is None  # never recorded the fd -> lock not held, no leak
+    monkeypatch.undo()
+    other = SingleInstanceLock(lock_path)
+    other.acquire()  # the failed acquire left no flock behind -> freely acquirable
+    other.release()
+
+
+def test_lock_file_0600_even_if_preexisting_wider(tmp_path):
+    """A lock file left wider than 0600 by an earlier build is narrowed to 0600 on acquire:
+    O_CREAT does not re-apply the mode to an existing file, so acquire() fchmods it back."""
+    lock_path = tmp_path / "daemon.lock"
+    lock_path.write_text("999999\n")
+    os.chmod(lock_path, 0o644)
+    lock = SingleInstanceLock(lock_path)
+    lock.acquire()
+    try:
+        assert oct(lock_path.stat().st_mode & 0o777) == "0o600"
+    finally:
+        lock.release()

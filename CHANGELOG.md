@@ -7,6 +7,24 @@ carry behavior changes).
 
 ## [Unreleased]
 
+### Changed
+- **Single-instance lock now uses a kernel advisory lock (`fcntl.flock`)** instead of a
+  PID file with a `kern.boottime` stale-reclaim heuristic. The lock is held on a file
+  descriptor kept open for the daemon's whole lifetime, and the kernel releases it
+  automatically on **any** exit — clean shutdown, crash, or `SIGKILL`. This retires the
+  PID-liveness probe and the boot-time drift band (`_BOOT_TOL`) entirely: no more false
+  "stale" reclaim and no boot-time-drift false "stopped". The PID in the lock file is now a
+  human-readable label only — never a liveness decision (flock acquirability is the
+  authority). Public API (`SingleInstanceLock`, `AlreadyRunning`, `holder_pid`) is unchanged.
+
+  **Upgrade note (required action):** **stop or restart the daemon** as part of this
+  upgrade — run `ifolder-sync restart` (or `stop` then `start`) for every active profile
+  (`--profile …`). A daemon started by the previous version holds the lock file *without* a
+  kernel `flock`, so a new-code process cannot see it and would wrongly consider the lock
+  free — risking two writers on one baseline. Restarting replaces the old process with one
+  that takes the kernel lock; this is a one-time action at upgrade. (The lock file must live
+  on a local filesystem; `flock` is unreliable over NFS/SMB.)
+
 ## [0.13.0] - 2026-06-15
 
 Engine-safety fix for iCloud's publish-before-content propagation lag, plus the Obsidian
