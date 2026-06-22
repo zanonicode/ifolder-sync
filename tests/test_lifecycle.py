@@ -75,52 +75,131 @@ def test_target_uses_uid_and_label():
 
 
 # ------------------------------------------------- converge command construction ---
+def _settled_responder(extra=None):
+    """Default `_lc` responder for converge tests: `print` reports NOT loaded (rc 113) so the
+    async bootout-settle wait returns immediately; every other verb succeeds. `extra(args)` may
+    override specific verbs (return a CompletedProcess-like, or None to fall through)."""
+
+    def responder(args):
+        if extra is not None:
+            r = extra(args)
+            if r is not None:
+                return r
+        if args[0] == "print":
+            return _ok(returncode=113)  # not loaded -> settle wait returns at once
+        return _ok()
+
+    return responder
+
+
 def test_converge_start_issues_modern_chain_in_order(tmp_path, monkeypatch):
     sandbox_home(tmp_path, monkeypatch)
-    lc = _recording_lc(lambda args: _ok())  # every verb succeeds
+    lc = _recording_lc(_settled_responder())
     monkeypatch.setattr(cli, "_lc", lc)
 
     _converge_start("work")
 
     domain, target = _target("work")
     verbs = [c[0] for c in lc.calls]
-    assert verbs == ["bootout", "enable", "bootstrap", "kickstart"]
+    # bootout, a settle-poll (print rc 113), enable BEFORE bootstrap, bootstrap, kickstart -k.
+    assert verbs == ["bootout", "print", "enable", "bootstrap", "kickstart"]
     assert lc.calls[0] == ["bootout", target]
-    # enable BEFORE bootstrap: a legacy `unload -w` leaves the label disabled in launchd's
-    # store, and bootstrapping a disabled label fails with "Bootstrap failed: 5: I/O error".
-    assert lc.calls[1] == ["enable", target]
-    assert verbs.index("enable") < verbs.index("bootstrap")  # regression guard for the EIO-5 bug
-    assert lc.calls[2][0] == "bootstrap" and lc.calls[2][1] == domain
-    assert lc.calls[2][2].endswith("com.ifolder-sync.work.plist")
-    assert lc.calls[3] == ["kickstart", "-k", target]
+    assert verbs.index("enable") < verbs.index("bootstrap")  # EIO-5 regression guard (FIX #27)
+    bootstrap = next(c for c in lc.calls if c[0] == "bootstrap")
+    assert bootstrap[1] == domain and bootstrap[2].endswith("com.ifolder-sync.work.plist")
+    assert lc.calls[-1] == ["kickstart", "-k", target]
 
 
 def test_converge_start_ignores_bootout_rc3(tmp_path, monkeypatch):
     """A not-loaded prior job (bootout rc 3) must not abort the start chain."""
     sandbox_home(tmp_path, monkeypatch)
 
-    def responder(args):
+    def extra(args):
         if args[0] == "bootout":
             return _ok(returncode=3, stderr="Boot-out failed: 3: No such process")
-        return _ok()
+        return None
 
-    lc = _recording_lc(responder)
+    lc = _recording_lc(_settled_responder(extra))
     monkeypatch.setattr(cli, "_lc", lc)
 
     _converge_start("work")  # must not raise despite rc 3
 
-    assert [c[0] for c in lc.calls] == ["bootout", "enable", "bootstrap", "kickstart"]
+    assert [c[0] for c in lc.calls] == ["bootout", "print", "enable", "bootstrap", "kickstart"]
 
 
-def test_converge_start_fails_loud_on_bootstrap_error(tmp_path, monkeypatch):
+def test_converge_start_waits_for_bootout_to_settle(tmp_path, monkeypatch):
+    """bootout is async: _converge_start polls `print` until the label unloads (rc 113) before
+    bootstrapping, so a slow teardown never races the EIO-5 that would leave the job down."""
     sandbox_home(tmp_path, monkeypatch)
+    state = {"prints": 0}
 
-    def responder(args):
+    def extra(args):
+        if args[0] == "print":
+            state["prints"] += 1
+            # still loaded for the first two polls, then unloaded
+            if state["prints"] < 3:
+                return _ok(returncode=0, stdout=PRINT_RUNNING)
+            return _ok(returncode=113)
+        return None
+
+    lc = _recording_lc(_settled_responder(extra))
+    monkeypatch.setattr(cli, "_lc", lc)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+
+    _converge_start("work")
+
+    verbs = [c[0] for c in lc.calls]
+    bootstrap_idx = verbs.index("bootstrap")
+    settle_prints = [i for i, c in enumerate(lc.calls) if c[0] == "print" and i < bootstrap_idx]
+    assert len(settle_prints) >= 3  # waited for the label to unload before bootstrapping
+
+
+def test_converge_start_recovers_when_bootstrap_races_but_loaded(tmp_path, monkeypatch):
+    """A post-bootout EIO-5 where the label is nonetheless LOADED must NOT exit / leave the
+    daemon down: _bootstrap_with_retry treats loaded-despite-error as success so the trailing
+    `kickstart -k` force-respawns it. A restart is atomic — it never ends stopped."""
+    sandbox_home(tmp_path, monkeypatch)
+    state = {"prints": 0}
+
+    def extra(args):
         if args[0] == "bootstrap":
             return _ok(returncode=5, stderr="Bootstrap failed: 5: Input/output error")
-        return _ok()
+        if args[0] == "print":
+            state["prints"] += 1
+            # settle wait: not loaded (113); post-bootstrap probe: LOADED (rc 0)
+            if state["prints"] == 1:
+                return _ok(returncode=113)
+            return _ok(returncode=0, stdout=PRINT_RUNNING)
+        return None
 
-    monkeypatch.setattr(cli, "_lc", _recording_lc(responder))
+    lc = _recording_lc(_settled_responder(extra))
+    monkeypatch.setattr(cli, "_lc", lc)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+
+    _converge_start("work")  # must NOT raise
+
+    assert lc.calls[-1][0] == "kickstart"  # recovered -> force-respawn happened
+
+
+def test_converge_start_exits_when_bootstrap_never_loads(tmp_path, monkeypatch):
+    """A genuine bootstrap failure where the label never loads still fails loud (exit ERROR)
+    after the bounded retry — truthful, never a false success."""
+    sandbox_home(tmp_path, monkeypatch)
+
+    def extra(args):
+        if args[0] == "bootstrap":
+            return _ok(returncode=5, stderr="Bootstrap failed: 5: Input/output error")
+        return None  # print falls through to rc 113 (never loads)
+
+    monkeypatch.setattr(cli, "_lc", _recording_lc(_settled_responder(extra)))
+    clock = {"t": 0.0}
+
+    def tick() -> float:
+        clock["t"] += 1.0
+        return clock["t"]
+
+    monkeypatch.setattr(cli.time, "monotonic", tick)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
 
     with pytest.raises(SystemExit) as exc:
         _converge_start("work")
@@ -255,3 +334,23 @@ def test_daemonstate_to_status_keeps_legacy_keys():
     assert stopped == {"running": False, "pid": None, "state": "stopped", "foreground": False}
     unknown = DaemonState.unknown("state='waiting'").to_status()
     assert unknown["state"] == "unknown" and unknown["running"] is False
+
+
+# ----------------------------------------------- throttle-aware (re)start verify ---
+def test_start_verify_timeout_outlasts_throttle():
+    """The (re)start post-condition wait must OUTLAST launchd's ThrottleInterval, or a throttled
+    fresh spawn is falsely reported as 'failed to start' (the daemon does come up ~60s later).
+    A longer user-configured verify timeout is still honored."""
+    from ifolder_sync.config import Config
+
+    assert cli._start_verify_timeout(Config(lifecycle_verify_timeout_seconds=5.0)) >= (
+        cli._THROTTLE_INTERVAL_SECONDS
+    )
+    assert cli._start_verify_timeout(Config(lifecycle_verify_timeout_seconds=120.0)) == 120.0
+
+
+def test_restart_accepts_background_flag():
+    """`restart --background` must parse (symmetry with `start`) instead of erroring
+    'unrecognized arguments: --background'."""
+    args = cli.build_parser().parse_args(["restart", "--background", "--profile", "work"])
+    assert args.background is True and args.profile == "work" and args.func is cli.cmd_restart

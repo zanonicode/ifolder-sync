@@ -509,7 +509,7 @@ def _start_background(profile: str) -> None:
             file=sys.stderr,
         )
     _converge_start(profile)
-    st = _verify(profile, want_running=True, timeout=cfg.lifecycle_verify_timeout_seconds)
+    st = _verify(profile, want_running=True, timeout=_start_verify_timeout(cfg))
     if not st.is_running:
         # A daemon that failed preflight/auth exits 0 by design (invariant 9), so it never
         # comes up and verify times out — report the truth, never false success.
@@ -563,6 +563,18 @@ def _lifecycle_timeout(profile: str) -> float:
         return Config().lifecycle_verify_timeout_seconds
 
 
+def _start_verify_timeout(cfg: Config) -> float:
+    """Post-condition wait for a (re)start. launchd can delay a fresh spawn up to
+    ThrottleInterval, so the success-poll must OUTLAST the throttle or a throttled-but-fine
+    start reads as a false 'failed to start'. The poll returns the instant the daemon is
+    running, so a fast start stays fast — only a throttled or genuinely-failed start waits.
+    Stop/uninstall keep the short lifecycle_verify_timeout_seconds (teardown is not throttled)."""
+    return max(
+        cfg.lifecycle_verify_timeout_seconds,
+        _THROTTLE_INTERVAL_SECONDS + _VERIFY_BUFFER_SECONDS,
+    )
+
+
 def cmd_restart(args):
     """Restart a profile's background daemon as a first-class verb (not `stop && start`):
     the same converge chain force-respawns it immediately (kickstart -k bypasses the
@@ -571,7 +583,7 @@ def cmd_restart(args):
     cfg = Config.load(config_path(profile))
     _warn_tcc(cfg.local_path)
     _converge_start(profile)
-    st = _verify(profile, want_running=True, timeout=cfg.lifecycle_verify_timeout_seconds)
+    st = _verify(profile, want_running=True, timeout=_start_verify_timeout(cfg))
     if not st.is_running:
         print(f"Daemon failed to restart ({_agent_label(profile)}) — see logs.", file=sys.stderr)
         print(f"Logs: {log_file(profile)}", file=sys.stderr)
@@ -1455,6 +1467,18 @@ def _agent_program() -> list[str]:
     return [sys.executable, "-m", "ifolder_sync"]
 
 
+# launchd throttles a job's respawn by this many seconds (the plist `ThrottleInterval`).
+# Single-sourced so the start/restart post-condition wait can outlast it (a throttled fresh
+# spawn must not read as "failed to start").
+_THROTTLE_INTERVAL_SECONDS = 60
+_VERIFY_BUFFER_SECONDS = 5.0
+# bootout is asynchronous; let a prior job finish unloading before re-bootstrapping (a
+# still-loaded label bootstraps with "5: Input/output error"). Bounded so a stuck teardown
+# never hangs the command.
+_BOOTOUT_SETTLE_SECONDS = 5.0
+_BOOTSTRAP_RETRY_SECONDS = 5.0
+
+
 def _write_agent_plist(profile: str) -> Path:
     """Write (overwrite) the profile's launchd LaunchAgent .plist; return its path.
 
@@ -1482,7 +1506,7 @@ def _write_agent_plist(profile: str) -> Path:
         "ProgramArguments": [*program, "start", "--profile", profile, "--launchd"],
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
-        "ThrottleInterval": 60,
+        "ThrottleInterval": _THROTTLE_INTERVAL_SECONDS,
         # Grace period for SIGTERM (stop/logout) to finish the current apply action
         # and commit before launchd SIGKILLs. Does not delay a clean exit.
         "ExitTimeOut": 30,
@@ -1515,27 +1539,53 @@ def _lc(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["launchctl", *args], capture_output=True, text=True, check=False)
 
 
+def _await_not_loaded(target: str, timeout: float) -> None:
+    """Block until `launchctl print <target>` reports the job not loaded (rc 113) or `timeout`
+    elapses. bootout is asynchronous: a daemon slow to exit may still be unloading, and
+    bootstrapping a still-loaded label fails with EIO-5 — which would leave the job down."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _lc("print", target).returncode == _PRINT_NOT_FOUND:
+            return
+        time.sleep(0.2)
+
+
+def _bootstrap_with_retry(domain: str, target: str, plist: str) -> bool:
+    """Bootstrap the job, tolerating the transient post-bootout race ("5: Input/output error"
+    while the prior job finishes unloading): retry within a bounded window, and treat an
+    already-loaded label (print rc != 113 despite a non-zero bootstrap) as success so the
+    caller's `kickstart -k` force-respawns it rather than leaving the daemon down. Returns
+    True once the label is loaded."""
+    deadline = time.monotonic() + _BOOTSTRAP_RETRY_SECONDS
+    while True:
+        if _lc("bootstrap", domain, plist).returncode == 0:
+            return True
+        if _lc("print", target).returncode != _PRINT_NOT_FOUND:
+            return True  # loaded despite the error (raced / already present) — recoverable
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 def _converge_start(profile: str) -> None:
     """Idempotently (re)start the profile's launchd job and force an immediate fresh spawn.
 
     Regenerates the plist (keys unchanged), boots out any prior job (ignoring rc 3 = not
-    loaded so a clean prior state is fine), enables the label (clears any legacy `unload -w`
-    disabled override — bootstrapping a disabled label fails with EIO; also persists across
-    reboots), bootstraps the regenerated plist (failing loud on a real error), and
-    `kickstart -k`s it — a force-respawn that bypasses ThrottleInterval for operator intent
-    while the throttle still spaces genuine crash restarts. Auto-migrates a user previously on
-    `load -w`/`unload -w`."""
+    loaded), WAITS for that async bootout to finish (_await_not_loaded), enables the label
+    (clears any legacy `unload -w` disabled override; persists across reboots), bootstraps
+    with bounded retry (tolerating the post-bootout EIO-5 race WITHOUT leaving the job down —
+    _bootstrap_with_retry), then `kickstart -k`s a fresh spawn (force-respawn for operator
+    intent; the throttle still spaces genuine crash restarts). Atomic: a restart never ends
+    with the daemon stopped. Auto-migrates a user previously on `load -w`/`unload -w`."""
     domain, target = _target(profile)
     plist = _write_agent_plist(profile)
     _lc("bootout", target)  # ignore rc (3 == was not loaded; any prior state is fine)
-    # enable BEFORE bootstrap: the legacy `unload -w` (old cmd_stop / older releases) leaves the
-    # label DISABLED in launchd's persistent store, and bootstrapping a disabled label fails with
-    # "Bootstrap failed: 5: Input/output error". enable clears that override (and persists).
+    _await_not_loaded(target, _BOOTOUT_SETTLE_SECONDS)
+    # enable BEFORE bootstrap: a legacy `unload -w` leaves the label DISABLED in launchd's
+    # store, and bootstrapping a disabled label fails with "5: Input/output error".
     _lc("enable", target)
-    r = _lc("bootstrap", domain, str(plist))
-    if r.returncode != 0:
-        msg = (r.stderr or r.stdout).strip()
-        print(f"launchctl bootstrap failed: {msg!r}", file=sys.stderr)
+    if not _bootstrap_with_retry(domain, target, str(plist)):
+        print(f"launchctl bootstrap failed for {target} — see logs.", file=sys.stderr)
         sys.exit(Exit.ERROR)
     _lc("kickstart", "-k", target)
 
@@ -1714,6 +1764,11 @@ def build_parser() -> argparse.ArgumentParser:
     psp.set_defaults(func=cmd_stop)
 
     prs = sub.add_parser("restart", help="restart a profile's background (launchd) daemon")
+    prs.add_argument(
+        "--background",
+        action="store_true",
+        help="accepted for symmetry with `start`; restart always manages the launchd daemon",
+    )
     _add_profile(prs)
     prs.set_defaults(func=cmd_restart)
 
