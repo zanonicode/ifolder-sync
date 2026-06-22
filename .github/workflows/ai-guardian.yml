@@ -26,7 +26,7 @@ jobs:
       pull-requests: write       # upsert the advisory comment
       id-token: write            # Vertex WIF OIDC
     steps:
-      - uses: actions/checkout@v6        # MUST precede auth (auth writes gha-creds-*.json into the workspace)
+      - uses: actions/checkout@v7        # MUST precede auth (auth writes gha-creds-*.json into the workspace)
         with:
           fetch-depth: 0                 # full history so the 3-dot merge-base (origin/main...HEAD) is reachable
       - name: make origin/main resolvable for the diff
