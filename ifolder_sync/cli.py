@@ -563,6 +563,15 @@ def _lifecycle_timeout(profile: str) -> float:
         return Config().lifecycle_verify_timeout_seconds
 
 
+def _throttle_interval(profile: str) -> int:
+    """The launchd ThrottleInterval (seconds) for a profile's plist, defaulting cleanly when the
+    config is absent/unreadable (install-agent/start must still write a valid plist)."""
+    try:
+        return int(Config.load(config_path(profile)).throttle_interval_seconds)
+    except Exception:  # noqa: BLE001 — no/invalid config: use the dataclass default
+        return Config().throttle_interval_seconds
+
+
 def _start_verify_timeout(cfg: Config) -> float:
     """Post-condition wait for a (re)start. launchd can delay a fresh spawn up to
     ThrottleInterval, so the success-poll must OUTLAST the throttle or a throttled-but-fine
@@ -571,14 +580,15 @@ def _start_verify_timeout(cfg: Config) -> float:
     Stop/uninstall keep the short lifecycle_verify_timeout_seconds (teardown is not throttled)."""
     return max(
         cfg.lifecycle_verify_timeout_seconds,
-        _THROTTLE_INTERVAL_SECONDS + _VERIFY_BUFFER_SECONDS,
+        cfg.throttle_interval_seconds + _VERIFY_BUFFER_SECONDS,
     )
 
 
 def cmd_restart(args):
     """Restart a profile's background daemon as a first-class verb (not `stop && start`):
-    the same converge chain force-respawns it immediately (kickstart -k bypasses the
-    ~60s ThrottleInterval), then verifies it came back up."""
+    the same converge chain force-respawns it (`kickstart -k`), then verifies it came back up.
+    launchd still throttles the respawn by ThrottleInterval, so the verify wait outlasts it (a
+    throttled-but-fine spawn must not read as 'failed to start')."""
     profile = _profile(args)
     cfg = Config.load(config_path(profile))
     _warn_tcc(cfg.local_path)
@@ -1467,10 +1477,9 @@ def _agent_program() -> list[str]:
     return [sys.executable, "-m", "ifolder_sync"]
 
 
-# launchd throttles a job's respawn by this many seconds (the plist `ThrottleInterval`).
-# Single-sourced so the start/restart post-condition wait can outlast it (a throttled fresh
-# spawn must not read as "failed to start").
-_THROTTLE_INTERVAL_SECONDS = 60
+# Slack added to the configured ThrottleInterval when bounding the (re)start verify wait, so a
+# spawn launchd holds for the full throttle window is still observed before the poll gives up.
+# (The throttle itself is `Config.throttle_interval_seconds`, single-sourced into the plist.)
 _VERIFY_BUFFER_SECONDS = 5.0
 # bootout is asynchronous; let a prior job finish unloading before re-bootstrapping (a
 # still-loaded label bootstraps with "5: Input/output error"). Bounded so a stuck teardown
@@ -1506,7 +1515,7 @@ def _write_agent_plist(profile: str) -> Path:
         "ProgramArguments": [*program, "start", "--profile", profile, "--launchd"],
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
-        "ThrottleInterval": _THROTTLE_INTERVAL_SECONDS,
+        "ThrottleInterval": _throttle_interval(profile),
         # Grace period for SIGTERM (stop/logout) to finish the current apply action
         # and commit before launchd SIGKILLs. Does not delay a clean exit.
         "ExitTimeOut": 30,
