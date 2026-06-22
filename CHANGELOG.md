@@ -8,6 +8,11 @@ carry behavior changes).
 ## [Unreleased]
 
 ### Changed
+- **`start --background` no longer pays the heavy daemon import.** `cmd_start` only imports the
+  sync engine (`.daemon`, which transitively pulls `pyicloud` + `watchdog`, ~1.8s) on the
+  foreground path that actually runs it; the `--background` path hands off to launchd and
+  returns, so the eager import was pure waste (~0.6s CPU / ~1.5s wall per `start --background`).
+  Moved the import past the `--background` early-return.
 - **`start --background` and `restart` are much faster (~70s → ~20s).** launchd throttles a
   job's respawn by its plist `ThrottleInterval`, and `start`/`restart` wait for that throttled
   spawn before reporting success (so a real failure isn't masked). The interval was a hardcoded

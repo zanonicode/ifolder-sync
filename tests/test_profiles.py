@@ -606,3 +606,19 @@ def test_init_nonempty_remote_folder_unaffected(tmp_path, monkeypatch):
     _init_answers(monkeypatch, "x@y.com", "Notes", str(vault), "60", "newer", "n", "n")
     main(["init", "--profile", "work"])
     assert Config.load(config_path("work")).remote_folder == "Notes"
+
+
+def test_start_background_does_not_import_daemon(monkeypatch):
+    """`start --background` hands off to launchd and never instantiates Daemon, so it must not
+    pay the heavy `.daemon` import (pyicloud + watchdog, ~1.8s). That import belongs to the
+    foreground path only; the --background path must stay light."""
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.delitem(sys.modules, "ifolder_sync.daemon", raising=False)
+    monkeypatch.setattr(cli, "_load_profile", lambda _args: ("default", object()))
+    monkeypatch.setattr(cli, "_start_background", lambda _profile: None)
+
+    cli.cmd_start(SimpleNamespace(background=True))
+
+    assert "ifolder_sync.daemon" not in sys.modules
