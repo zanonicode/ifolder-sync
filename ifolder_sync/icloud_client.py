@@ -615,6 +615,16 @@ class ICloudClient:
         self._children_cache = children
         self._last_full_walk = time.time()
 
+    def invalidate_walk_cache(self) -> None:
+        """Drop the etag-keyed walk cache so the next walk lists every folder fresh.
+        Used when the ignore set changes: the cache key is the iCloud folder etag (a
+        REMOTE fingerprint, blind to the local ignore set), so a subtree cached under the
+        old ignore set would otherwise be replayed with stale membership — in particular a
+        now-UN-ignored path stays missing, since it was never recorded in the cached
+        children list and its parent's etag did not change."""
+        self._etag_cache.clear()
+        self._children_cache.clear()
+
     def _walk_impl(
         self, is_ignored: Optional[Callable[[str], bool]], allow_cache: bool
     ) -> dict[str, RemoteEntry]:
@@ -633,7 +643,7 @@ class ICloudClient:
                 to_list = []
                 for rel, node, etag in frontier:
                     if allow_cache and etag and self._etag_cache.get(rel) == etag:
-                        self._emit_cached(rel, out)
+                        self._emit_cached(rel, out, is_ignored)
                     else:
                         to_list.append((rel, node, etag))
                 futures = [
@@ -700,17 +710,28 @@ class ICloudClient:
             msg,
         )
 
-    def _emit_cached(self, rel: str, out: dict[str, RemoteEntry]) -> None:
+    def _emit_cached(
+        self,
+        rel: str,
+        out: dict[str, RemoteEntry],
+        is_ignored: Optional[Callable[[str], bool]] = None,
+    ) -> None:
         """Emit a folder's whole subtree from cache, zero network calls: its etag
-        matched, so by the verified propagation property nothing below changed."""
+        matched, so by the verified propagation property nothing below changed. The
+        ignore predicate is reapplied here (symmetric with _ingest_children) because the
+        cache key is the iCloud folder etag — a REMOTE fingerprint, blind to the local
+        ignore set — so a subtree cached before an ignore rule was added would otherwise
+        be replayed unfiltered until its (possibly frozen) etag changes."""
         cached = self._children_cache.get(rel)
         if cached is None:
             raise _WalkCacheMiss(rel)
         for child in cached:
             crel = f"{rel}/{child.name}" if rel else child.name
+            if is_ignored is not None and is_ignored(crel):
+                continue
             out[crel] = RemoteEntry(crel, child.kind, child.size, child.mtime, child.etag or "")
             if child.kind == "dir":
-                self._emit_cached(crel, out)
+                self._emit_cached(crel, out, is_ignored)
 
     # --- path operations (used by the syncer) ---------------------------------
     def _navigate(self, relpath: str, create_dirs: bool = False):

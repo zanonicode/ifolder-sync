@@ -54,6 +54,7 @@ class FakeICloud:
                 "mkdir",
                 "connect",
                 "ensure_remote_root",
+                "invalidate_walk_cache",
             )
         }
 
@@ -108,6 +109,9 @@ class FakeICloud:
         self.files.pop(relpath, None)
         for k in [k for k in self.files if k.startswith(relpath + "/")]:
             self.files.pop(k, None)
+
+    def invalidate_walk_cache(self) -> None:
+        self.calls["invalidate_walk_cache"] += 1
 
     def stat(self, relpath: str) -> Optional[RemoteEntry]:
         self.calls["stat"] += 1
