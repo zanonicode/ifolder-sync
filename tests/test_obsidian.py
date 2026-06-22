@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from ifolder_sync.syncer import path_is_ignored
 
 from .helpers import write_file
@@ -112,3 +114,59 @@ def test_plugin_data_json_syncs_when_obsidian_off(make_syncer, fake, local_dir):
 
     assert (local_dir / ".obsidian/plugins/foo/data.json").read_bytes() == b'{"setting":1}'
     store.close()
+
+
+def test_compile_ignore_precompiles_patterns():
+    """`_compile_ignore` precompiles ONE pattern to a reusable segment-matcher (or None for an
+    empty pattern) so the hot scan loop never re-runs fnmatch.translate per path."""
+    from ifolder_sync.syncer import _compile_ignore
+
+    assert _compile_ignore("") is None
+    assert _compile_ignore("   ") is None
+    single = _compile_ignore("*.icloud")
+    assert single is not None and single("a/b/file.icloud".split("/"))
+    assert not single("a/b/file.md".split("/"))
+    multi = _compile_ignore(".obsidian/workspace.json")
+    assert multi is not None and multi("notes/.obsidian/workspace.json".split("/"))
+    assert not multi(".obsidian/app.json".split("/"))
+
+
+def _fnmatch_reference(pattern, segs):
+    """The pre-refactor per-call fnmatch logic, inline, for a byte-identical equivalence proof."""
+    import fnmatch
+
+    pat = pattern.strip().rstrip("/")
+    if not pat:
+        return False
+    pat_segs = pat.split("/")
+    if len(pat_segs) == 1:
+        return any(fnmatch.fnmatch(s, pat) for s in segs)
+    m, n = len(pat_segs), len(segs)
+    if m == 0 or m > n:
+        return False
+    return any(
+        all(fnmatch.fnmatch(segs[i + j], pat_segs[j]) for j in range(m)) for i in range(n - m + 1)
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern,path",
+    [
+        ("*.icloud", "a/b/file.icloud"),
+        ("*.icloud", "notes/icloud.md"),
+        (".obsidian/workspace.json", "notes/sub/.obsidian/workspace.json"),
+        (".obsidian/cache", "vault/.obsidian/cache/blob.bin"),
+        (".obsidian/plugins/*/data.json", ".obsidian/plugins/excalidraw/data.json"),
+        (".obsidian/plugins/*/data.json", ".obsidian/plugins/excalidraw/manifest.json"),
+        ("*.PART", "foo.part"),  # case sensitivity: *.PART must NOT match foo.part
+        ("*.part", "foo.PART"),  # and *.part must NOT match foo.PART
+        ("*.md", "deep/nested/path/to/file.md"),
+        ("", "anything"),
+        ("a/b", "x/a/b/c/d"),
+    ],
+)
+def test_compiled_ignore_byte_identical_to_fnmatch(pattern, path):
+    """The precompiled matcher is byte-identical to the old per-call fnmatch logic (POSIX normcase
+    is identity on macOS), including case-sensitivity."""
+    segs = path.split("/")
+    assert path_is_ignored(pattern, segs) == _fnmatch_reference(pattern, segs)

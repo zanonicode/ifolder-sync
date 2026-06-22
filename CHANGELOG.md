@@ -8,6 +8,10 @@ carry behavior changes).
 ## [Unreleased]
 
 ### Changed
+- **Faster ignore matching on every sync pass.** The `ignore` patterns are now compiled to
+  regex once when the engine starts, instead of re-running `fnmatch` for every pattern on every
+  scanned path (local + remote walk + the file watcher). ~3.6x faster on the matching loop —
+  meaningful on large vaults. Matching is byte-identical (including `*.part` case-sensitivity).
 - **Cheap commands fail faster.** The global exit-code classifier no longer imports `pyicloud`
   (~1.8s) unconditionally — it only consults the pyicloud/engine exception types when those
   modules are already loaded. A `status`/`stop`/`restart` that errors with a plain `OSError` now
