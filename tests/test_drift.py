@@ -187,15 +187,20 @@ def test_secure_session_files_sets_0600(tmp_path, monkeypatch):
 
 
 def test_manual_sync_blocked_while_daemon_runs(tmp_path, monkeypatch, capsys):
+    from ifolder_sync.locking import SingleInstanceLock
+
     _sandbox(tmp_path, monkeypatch)
     vault = tmp_path / "vault"
     vault.mkdir()
     Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("work"))
-    lock_path("work").write_text(str(os.getpid()))  # a live daemon holds the lock
-
-    with pytest.raises(SystemExit):
-        main(["sync", "--profile", "work"])
-    assert "daemon is running" in capsys.readouterr().err
+    held = SingleInstanceLock(lock_path("work"))
+    held.acquire()  # a live daemon holds the kernel lock
+    try:
+        with pytest.raises(SystemExit):
+            main(["sync", "--profile", "work"])
+        assert "daemon is running" in capsys.readouterr().err
+    finally:
+        held.release()
 
 
 def test_invalid_profile_name_rejected(tmp_path, monkeypatch):
@@ -576,15 +581,20 @@ def test_rebaseline_keeps_existing_marker(tmp_path, monkeypatch):
 
 
 def test_rebaseline_refuses_running_daemon(tmp_path, monkeypatch):
+    from ifolder_sync.locking import SingleInstanceLock
+
     _sandbox(tmp_path, monkeypatch)
     vault = tmp_path / "vault"
     vault.mkdir()
     Config(apple_id="x@y.com", local_folder=str(vault)).save(config_path("work"))
-    lock_path("work").write_text(str(os.getpid()))  # a live pid holds the lock
-
-    with pytest.raises(SystemExit):
-        main(["rebaseline", "--profile", "work"])
-    assert baseline_path("work").parent.exists()
+    held = SingleInstanceLock(lock_path("work"))
+    held.acquire()  # a live daemon holds the kernel lock
+    try:
+        with pytest.raises(SystemExit):
+            main(["rebaseline", "--profile", "work"])
+        assert baseline_path("work").parent.exists()
+    finally:
+        held.release()
 
 
 def test_rebaseline_refuses_when_lock_held(tmp_path, monkeypatch, capsys):

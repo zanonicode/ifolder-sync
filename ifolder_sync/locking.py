@@ -1,15 +1,21 @@
-"""Single-instance lock backed by a PID file, with stale-lock reclaim.
+"""Single-instance lock backed by a kernel advisory lock (fcntl.flock).
 
-Prevents two daemons from racing the same SQLite baseline. A lock left by a crashed
-process (its PID no longer alive) is reclaimed automatically, so launchd KeepAlive can
-restart the daemon without manual cleanup.
+Prevents two daemons from racing the same SQLite baseline. The lock is held on a file
+descriptor kept open for the whole process lifetime; the kernel drops it on ANY process
+exit (clean, SIGKILL, or crash), so a dead holder's lock is freed instantly with no
+liveness heuristic and no stale-reclaim. The pid written into the file body is a
+human-readable label only -- never a liveness decision (flock acquirability is the authority).
+
+Assumes the lock file lives on a LOCAL filesystem (here: APFS under $HOME). flock semantics
+are unreliable over network filesystems (NFS, some SMB); this lock is not valid there. The
+lock is ADVISORY: it only excludes other processes that also flock the same path, which is
+exactly the single-instance contract (nothing else touches the file).
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
-import re
-import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -18,114 +24,104 @@ class AlreadyRunning(RuntimeError):
     """Raised when another live instance already holds the lock."""
 
 
-_boot_time_cache: Optional[int] = None
-
-# kern.boottime "sec" = wall_clock - uptime, so NTP discipline of the wall clock makes the
-# reported value drift across a boot session (seconds, ~1s per day of uptime); a real reboot
-# shifts it by at least the prior uptime + downtime (tens of seconds to hours). Tolerate the
-# drift so a live lock is not misread as stale: the band sits above realistic multi-day drift
-# yet well below the reboot floor. Widening is the safe direction — the dangerous error is a
-# live lock seen as stale (a second daemon on one baseline); a previous boot stays far outside.
-_BOOT_TOL = 30  # seconds
-
-
-def _boot_time() -> Optional[int]:
-    """macOS boot wall-clock time (epoch seconds), memoized. The lock file lives in the
-    home dir, so it survives a reboot; after a reboot its PID may have been recycled by an
-    unrelated process, which os.kill(pid, 0) cannot tell from a live daemon. Stamping the
-    boot time lets a lock from a previous boot be recognized as stale. Returns None if it
-    cannot be read (then only the liveness check is used — the prior behavior)."""
-    global _boot_time_cache
-    if _boot_time_cache is None:
-        try:
-            out = subprocess.run(
-                ["sysctl", "-n", "kern.boottime"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-            m = re.search(r"sec\s*=\s*(\d+)", out)  # "{ sec = 1718000000, usec = 0 } ..."
-            _boot_time_cache = int(m.group(1)) if m else 0
-        except (OSError, subprocess.SubprocessError, ValueError):
-            _boot_time_cache = 0
-    return _boot_time_cache or None
-
-
-def _read_lock(path: Path) -> tuple[int, Optional[int]]:
-    """(pid, boot_time) from the lock file. boot_time is None for a pre-P2-7 single-line
-    lock or when it was unavailable at write time."""
+def _read_pid_label(path: Path) -> Optional[int]:
+    """First line of the lock file parsed as an int, for human messages only. None if the
+    label is absent, torn, or unparseable -- the caller already knows a live holder exists."""
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        return 0, None
+        return None
+    if not lines:
+        return None
     try:
-        pid = int(lines[0].strip() or "0") if lines else 0
+        return int(lines[0].strip())
     except ValueError:
-        pid = 0
-    boot: Optional[int] = None
-    if len(lines) > 1 and lines[1].strip():
-        try:
-            boot = int(lines[1].strip())
-        except ValueError:
-            boot = None
-    return pid, boot
+        return None
 
 
 def holder_pid(path: Path) -> Optional[int]:
-    """PID of the live process holding the lock, or None (absent/stale lock)."""
-    pid, boot = _read_lock(path)
-    if not pid:
+    """PID label of the live process holding the lock, or None when the lock is free.
+
+    Liveness is decided by the kernel: a non-blocking flock probe on a throwaway fd. A
+    successful probe means nobody holds the lock (release it, return None); a refused probe
+    means a live holder exists (return its pid label). The pid is never a liveness input -- a
+    crashed holder's lock is already gone, so the probe is never blocked by a dead process
+    (this retires the kern.boottime/_BOOT_TOL stale-reclaim heuristic)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)  # LOCK_EX needs no write access; only acquire() writes
+    except FileNotFoundError:
+        return None  # no lock file -> free
+    except OSError:
+        # can't probe (fd exhaustion / EIO) -> assume held, the safe side
+        return _read_pid_label(path)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return _read_pid_label(path)
+        fcntl.flock(fd, fcntl.LOCK_UN)
         return None
-    cur = _boot_time()
-    if boot is not None and cur is not None and abs(boot - cur) > _BOOT_TOL:
-        return None  # lock from a previous boot: its PID may have been recycled -> stale
-    return pid if _alive(pid) else None
+    finally:
+        os.close(fd)
 
 
 class SingleInstanceLock:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._held = False
+        self._fd: Optional[int] = None
 
     def acquire(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # O_EXCL makes creation atomic: two simultaneous starts cannot both win. 0600 keeps
-        # the pidfile owner-only (invariant 7's posture for state files); umask only clears
-        # bits, so the mode is an exact ceiling on a freshly O_EXCL-created file.
-        for _ in range(2):
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            except FileExistsError:
-                pid = holder_pid(self.path)
-                if pid:
-                    raise AlreadyRunning(f"ifolder-sync already running (pid {pid})") from None
-                try:
-                    self.path.unlink()  # stale lock: owner is dead
-                except FileNotFoundError:
-                    pass
-                continue
-            with os.fdopen(fd, "w") as fh:
-                fh.write(f"{os.getpid()}\n{_boot_time() or ''}")
-            self._held = True
+        if self._fd is not None:
             return
-        raise AlreadyRunning("could not acquire the lock (contention)")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # O_RDWR (not O_WRONLY): holder_pid() reads the pid label back through an fd on the same
+        # path; the file is the flock target, not a write-once pidfile. 0o600 keeps the lock
+        # owner-only (invariant 7's posture); O_CREAT does not re-apply the mode to a pre-existing
+        # file, so fchmod enforces 0600 even on a lock file left by an older build.
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        os.set_inheritable(fd, False)  # a forked/exec'd child must not inherit and pin the lock
+        while True:
+            try:
+                # LOCK_NB: a live holder is rejected at once, never a hang. flock raises
+                # BlockingIOError (an OSError subclass) on contention; treat any flock error as a
+                # refusal -- for a data-safety mutex, refuse to start rather than risk two writers.
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except InterruptedError:
+                # Defense-in-depth: CPython already retries EINTR internally (PEP 475) and a
+                # non-blocking flock barely has an EINTR window, but retry by hand so a signal
+                # at startup can never surface here as a false AlreadyRunning (a refused start).
+                continue
+            except OSError:
+                os.close(fd)
+                raise AlreadyRunning(
+                    f"ifolder-sync already running (pid {_read_pid_label(self.path)})"
+                ) from None
+        # The lock is ours. Rewrite the body to our pid as a human-readable label only; a stale
+        # label from a crashed prior holder is meaningless (the kernel already freed its lock).
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass  # the label is cosmetic; a write failure must not drop a lock we already hold
+        # Keep the fd open for the whole process lifetime: flock is tied to the open file
+        # description, so closing it would release the lock.
+        self._fd = fd
 
     def release(self) -> None:
-        if not self._held:
+        if self._fd is None:
             return
         try:
-            if self.path.exists() and _read_lock(self.path)[0] == os.getpid():
-                self.path.unlink()
-        except FileNotFoundError:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
             pass
-        self._held = False
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        finally:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
