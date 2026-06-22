@@ -159,6 +159,16 @@ def _fake_lc(running_pid: int | None = None, bootstrap_rc: int = 0):
     return lc
 
 
+def _fast_launchd_timing(monkeypatch):
+    """Collapse the bounded launchd waits (bootout-settle, bootstrap-retry, throttle-aware
+    verify floor) to zero so these command-FLOW tests exercise the logic without real sleeps.
+    The real bounded-wait behavior is unit-tested in test_lifecycle.py."""
+    monkeypatch.setattr(cli, "_BOOTOUT_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(cli, "_BOOTSTRAP_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(cli, "_THROTTLE_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(cli, "_VERIFY_BUFFER_SECONDS", 0.0)
+
+
 def test_write_agent_plist(tmp_path, monkeypatch):
     _sandbox(tmp_path, monkeypatch)
     plist = _write_agent_plist("work")
@@ -179,6 +189,7 @@ def test_start_background_converges_and_verifies(tmp_path, monkeypatch):
     kickstart -k) against gui/<uid>/<label>, then verifies via `print` before claiming success."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
+    _fast_launchd_timing(monkeypatch)
     lc = _fake_lc(running_pid=4321)
     monkeypatch.setattr(cli, "_lc", lc)
 
@@ -202,6 +213,7 @@ def test_start_background_failed_verify_exits(tmp_path, monkeypatch):
     out -> the command reports failure and exits non-zero, never false success."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work", lifecycle_verify_timeout_seconds=0.05)
+    _fast_launchd_timing(monkeypatch)
     lc = _fake_lc(running_pid=None)  # print always 113 -> never running
     monkeypatch.setattr(cli, "_lc", lc)
 
@@ -251,6 +263,7 @@ def test_start_bootstrap_failure_exits(tmp_path, monkeypatch):
     """A non-zero `bootstrap` is a real failure: report it and exit non-zero (no false success)."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
+    _fast_launchd_timing(monkeypatch)
     lc = _fake_lc(running_pid=None, bootstrap_rc=5)
     monkeypatch.setattr(cli, "_lc", lc)
 
@@ -263,6 +276,7 @@ def test_restart_converges_and_verifies(tmp_path, monkeypatch, capsys):
     """`restart` is a first-class verb running the same converge+verify chain (force-respawn)."""
     _sandbox(tmp_path, monkeypatch)
     _make_profile_config("work")
+    _fast_launchd_timing(monkeypatch)
     lc = _fake_lc(running_pid=777)
     monkeypatch.setattr(cli, "_lc", lc)
 
