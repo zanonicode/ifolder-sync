@@ -26,11 +26,11 @@ jobs:
       contents: read
       id-token: write # Vertex WIF (the system-under-test)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
       - run: python -m pip install -e ".[ai]"
@@ -93,7 +93,7 @@ jobs:
           if [ -n "$ANTHROPIC_API_KEY" ]; then
             promptfoo eval -c promptfooconfig.yaml --output report.html || true
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
           name: eval-report

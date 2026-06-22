@@ -20,7 +20,7 @@ jobs:
       contents: read
       security-events: write # upload SARIF to the Security tab
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: trivy fs -> SARIF
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (SHA-pinned; GHSA-69fq-xp46-6x23)
         with:
@@ -39,7 +39,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # gitleaks needs full history
       - uses: gitleaks/gitleaks-action@v3
