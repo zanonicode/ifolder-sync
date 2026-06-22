@@ -750,13 +750,14 @@ class Syncer:
             self._commit(dry_run)
 
         if not dry_run:
-            self.store.commit()
             # A pass cut short by a stop signal is partial: don't advance last_sync (it
             # would read as a clean completion in `status`); last_stats still reflects
-            # what was applied.
+            # what was applied. Write both meta keys uncommitted, then one trailing commit
+            # (the per-action commits already flushed every applied baseline write).
             if not self._should_stop():
-                self.store.set_meta("last_sync", str(time.time()))
-            self.store.set_meta("last_stats", stats.summary())
+                self.store.set_meta("last_sync", str(time.time()), commit=False)
+            self.store.set_meta("last_stats", stats.summary(), commit=False)
+            self.store.commit()
         return stats
 
     # ----------------------------------------------------- decide-only plan ---

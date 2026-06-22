@@ -41,6 +41,9 @@ class StateStore:
     def __init__(self, db_path: Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
         self.read_only = read_only
+        # Set by any real write (upsert/delete/set_meta); commit() skips when clean so an idle
+        # pass (every path RECORD-ed with already-stored values) flushes nothing.
+        self._dirty = False
         if read_only:
             # A mode=ro URI connection: SQLite itself rejects every write ("attempt to write
             # a readonly database"), so a read-only observer (the dashboard, feature 04) is
@@ -145,7 +148,18 @@ class StateStore:
             remote_etag=r["remote_etag"],
         )
 
+    def get(self, relpath: str) -> Optional[BaselineEntry]:
+        r = self.conn.execute("SELECT * FROM baseline WHERE relpath = ?", (relpath,)).fetchone()
+        return self._row(r) if r else None
+
     def upsert(self, entry: BaselineEntry) -> None:
+        # Skip a byte-identical rewrite: on an in-sync pass every path is RECORD-ed with the same
+        # values already stored, so the INSERT (and its per-op commit) is pure waste. Exact
+        # field-wise == (dataclass); a within-tolerance mtime drift differs and still writes, so
+        # behavior is unchanged — only true no-ops are skipped.
+        if self.get(entry.relpath) == entry:
+            return
+        self._dirty = True
         self.conn.execute(
             """
             INSERT INTO baseline
@@ -171,6 +185,7 @@ class StateStore:
         )
 
     def delete(self, relpath: str) -> None:
+        self._dirty = True
         self.conn.execute("DELETE FROM baseline WHERE relpath = ?", (relpath,))
 
     def drop_rows(self, relpaths: list[str]) -> int:
@@ -179,23 +194,31 @@ class StateStore:
         recovery net for a wrong drop) and ensure no daemon is writing concurrently — this
         mutates the baseline the same way a sync pass does."""
         self.conn.executemany("DELETE FROM baseline WHERE relpath = ?", [(r,) for r in relpaths])
-        self.conn.commit()
+        self._dirty = True
+        self.commit()
         return len(relpaths)
 
-    def set_meta(self, key: str, value: str) -> None:
+    def set_meta(self, key: str, value: str, *, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
-        self.conn.commit()
+        self._dirty = True
+        if commit:
+            self.commit()
 
     def get_meta(self, key: str) -> Optional[str]:
         r = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return r["value"] if r else None
 
     def commit(self) -> None:
+        # No-op when nothing was dirtied: an idle pass (all upserts byte-identical) flushes no WAL
+        # frame. A real write sets _dirty, so the per-op commit (crash-safety) is unaffected.
+        if not self._dirty:
+            return
         self.conn.commit()
+        self._dirty = False
 
     def close(self) -> None:
         self.conn.close()

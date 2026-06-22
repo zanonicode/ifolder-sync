@@ -8,6 +8,10 @@ carry behavior changes).
 ## [Unreleased]
 
 ### Changed
+- **Idle sync passes are much cheaper (~9x).** When nothing has changed, the engine no longer
+  rewrites every baseline row with identical values — the SQLite baseline skips a byte-identical
+  write (and its commit), so a steady-state pass over a large vault drops from ~1.5s to ~0.17s. A
+  *real* change still writes and commits per-action exactly as before (crash-safety unchanged).
 - **Faster ignore matching on every sync pass.** The `ignore` patterns are now compiled to
   regex once when the engine starts, instead of re-running `fnmatch` for every pattern on every
   scanned path (local + remote walk + the file watcher). ~3.6x faster on the matching loop —
