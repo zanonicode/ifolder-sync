@@ -2305,3 +2305,17 @@ def test_track_drift_flags_drift_suspected_at_startup(tmp_path, monkeypatch):
     d._track_drift(SyncStats(skipped_deletes=2))
     assert "DRIFT SUSPECTED" in (d.store.get_meta("last_error") or "")
     d.store.close()
+
+
+def test_writable_state_uses_synchronous_normal(tmp_path):
+    """WAL synchronous=NORMAL makes each per-op commit a WAL append (no full fsync) ~2-3x cheaper,
+    while staying crash-safe: durable against app/OS crash under WAL; only a power loss can drop the
+    last committed txn — not the SIGKILL-mid-pass threat the per-op commits guard against."""
+    from ifolder_sync.state import StateStore
+
+    store = StateStore(tmp_path / "baseline.sqlite3")
+    try:
+        # PRAGMA synchronous: 0=OFF 1=NORMAL 2=FULL 3=EXTRA
+        assert store.conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+    finally:
+        store.close()
