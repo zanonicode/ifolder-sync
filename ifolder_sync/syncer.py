@@ -805,7 +805,14 @@ class Syncer:
         if state == "orphan-baseline":
             reason = "in baseline, absent from local and remote"
         elif state == "would-conflict":
-            reason = f"policy={self.cfg.conflict_policy}"
+            entry = self._load_unreadable_counts().get(rel)
+            threshold = max(1, int(self.cfg.unreadable_max_passes))
+            if entry and len(entry) > 3 and int(entry[3]) >= threshold:
+                # A routed escalated-husk row resolves deterministically (local wins),
+                # not by the conflict policy — saying "policy=…" here would mislead.
+                reason = "escalated unreadable remote; local wins"
+            else:
+                reason = f"policy={self.cfg.conflict_policy}"
         elif state == "planned-delete" and suppressed:
             reason = "suppressed (over delete threshold)"
         row_kind: Kind = "dir" if kind == "dir" else "file"
@@ -1124,6 +1131,20 @@ class Syncer:
         threshold = max(1, int(self.cfg.unreadable_max_passes))
         return int(entry[3]) >= threshold
 
+    def _unreadable_converges(
+        self, relpath: str, lentry: Optional[LocalEntry], rentry: Optional[RemoteEntry]
+    ) -> bool:
+        """Whether a sustained-unreadable husk should be routed to the conflict valve.
+        Needs a good local side the valve could actually upload: an empty local never wins,
+        and an over-cap local (max_file_size_mb) would soft-skip the upload and oscillate
+        the counter — both keep deferring instead (quiet, visible in the stuck registry)."""
+        if lentry is None or lentry.size <= 0:
+            return False
+        limit_mb = self.cfg.max_file_size_mb
+        if limit_mb > 0 and lentry.size > limit_mb * 1024 * 1024:
+            return False
+        return self._unreadable_escalated(relpath, rentry)
+
     def _defer_unreadable(
         self,
         relpath: str,
@@ -1201,6 +1222,11 @@ class Syncer:
                     # collide), and recording a false "they agree" would freeze a real
                     # divergence with no backup. verify_adopt downloads + byte-compares,
                     # then records (truly identical) or resolves as a conflict (different).
+                    # An adopt's byte-compare can never run against a sustained-unreadable
+                    # remote: past the escalation window, skip straight to the conflict
+                    # valve (which re-probes readability and converges local-wins).
+                    if self._unreadable_converges(relpath, lentry, rentry):
+                        return Op.CONFLICT
                     if lentry.size == rentry.size and abs(lentry.mtime - rentry.mtime) <= MTIME_TOL:
                         return Op.VERIFY_ADOPT
                     # Simultaneous create where the remote is an empty husk: iCloud
@@ -1223,6 +1249,13 @@ class Syncer:
                     and base.remote_size > 0
                 ):
                     return Op.SETTLE_WAIT
+                # A husk that outlasted the whole escalation window never materializes on
+                # its own; a plain download would defer forever (the counter warns once
+                # and nothing converges — observed live at 742 passes). Route it to the
+                # conflict valve, which re-probes readability and lets the good local
+                # side win (v0.13.0's documented behavior, previously conflicts-only).
+                if self._unreadable_converges(relpath, lentry, rentry):
+                    return Op.CONFLICT
                 return Op.DOWNLOAD
             if (
                 self.cfg.verify_remote_etag
@@ -1234,6 +1267,8 @@ class Syncer:
                 # Same size+mtime but the iCloud etag moved: the remote content changed
                 # under an identical signature (a same-size edit, or publish-before-
                 # content). Rescue it; _do_download records the new etag so this fires once.
+                if self._unreadable_converges(relpath, lentry, rentry):
+                    return Op.CONFLICT
                 return Op.DOWNLOAD
             return Op.RECORD
         if lentry and not rentry:
@@ -1522,23 +1557,41 @@ class Syncer:
         if remote_unreadable is not None:
             if not self._unreadable_escalated(relpath, rentry):
                 raise remote_unreadable
-            # Sustained corruption AND local also changed (a conflict always means both
-            # sides changed): converge by letting the good local side win via the empty-
-            # side-never-wins valve — the never-materializing remote goes to recoverable
-            # trash on upload — so the two devices no longer diverge forever.
+            # Sustained corruption with a good local side (a real both-changed conflict,
+            # or a download/adopt the decide layer routed here because its husk outlasted
+            # the window): converge by letting the good local side win via the empty-
+            # side-never-wins valve — on upload the never-materializing remote goes to
+            # the recoverable iCloud trash (when remote_trash is on, the default) — so
+            # the two devices no longer diverge forever. The counter is cleared only when
+            # the upload really happened: a soft-skip (vanished file) must keep the path
+            # visibly stuck instead of restarting the window and re-firing the warning.
             stats.conflicts += 1
             log.warning(
                 "%s: remote blob unreadable for the escalation window; treating it as an "
                 "empty husk and keeping local content (an empty side never wins)",
                 relpath,
             )
-            self._do_upload(relpath, stats, False)
-            self._clear_unreadable(relpath, dry_run)
+            if self._do_upload(relpath, stats, False):
+                self._clear_unreadable(relpath, dry_run)
             return
         # Remote is readable from here on. The probe above discarded its bytes; the policy
         # resolution below re-reads it via its own backup/download. A genuinely 0-byte remote
         # (size 0) is treated as readable and handled by the empty-side-never-wins valve.
         self._clear_unreadable(relpath, dry_run)
+        base = self.store.get(relpath)
+        if (
+            rentry.size > 0
+            and base is not None
+            and not self._changed(
+                lentry.size, lentry.mtime, base.local_size, base.local_mtime, MTIME_TOL_LOCAL
+            )
+        ):
+            # The husk healed between decide and apply: with the local side unchanged vs
+            # baseline this was a routed download, never a real conflict — deliver the
+            # remote edit (exactly what the plain DOWNLOAD did before the window) instead
+            # of applying a conflict policy that could let the stale local clobber it.
+            self._do_download(relpath, rentry, stats, False)
+            return
         stats.conflicts += 1
         log.warning("CONFLICT on %s (policy=%s)", relpath, policy)
         # Engine-wide safety invariant: a 0-byte side NEVER overwrites a non-empty side,
@@ -1599,7 +1652,7 @@ class Syncer:
         p = Path(relpath)
         return str(p.with_name(f"{p.stem}.conflict-{stamp}{p.suffix}"))
 
-    def _backup_local_then(self, relpath: str, action: Callable[[], None]) -> None:
+    def _backup_local_then(self, relpath: str, action: Callable[[], object]) -> None:
         src = self.local_root / relpath
         if src.exists():
             bkp = self.local_root / self._conflict_name(relpath)
@@ -1608,7 +1661,7 @@ class Syncer:
         action()
 
     def _backup_remote_then(
-        self, relpath: str, rentry: RemoteEntry, action: Callable[[], None]
+        self, relpath: str, rentry: RemoteEntry, action: Callable[[], object]
     ) -> None:
         bkp = self.local_root / self._conflict_name(relpath)
         bkp.parent.mkdir(parents=True, exist_ok=True)
@@ -1688,14 +1741,17 @@ class Syncer:
             pass  # cp missing / unsupported / src gone -> let copy2 decide (it may raise)
         shutil.copy2(src, snap)
 
-    def _do_upload(self, relpath: str, stats: SyncStats, dry_run: bool) -> None:
+    def _do_upload(self, relpath: str, stats: SyncStats, dry_run: bool) -> bool:
+        """Returns True when the upload really happened (or would, in dry-run) — False on
+        the soft-skips (over-cap, vanished source), so callers that key follow-up state
+        off a successful upload (the unreadable-escalation valve) never act on a no-op."""
         src = self.local_root / relpath
         if self._too_large_to_upload(relpath, src, stats):
-            return
+            return False
         stats.uploaded += 1
         log.info("UP   %s", relpath)
         if dry_run:
-            return
+            return True
         # Upload a frozen snapshot, not the live file: under continuous editing
         # (editor autosave) the file changes between the scan and the send, so the
         # scan-time signature would describe bytes other than the ones uploaded —
@@ -1710,12 +1766,13 @@ class Syncer:
             except FileNotFoundError:
                 log.warning("vanished before upload, skipping: %s", relpath)
                 stats.errors += 1
-                return
+                return False
             st = snap.stat()
             self.client.upload(relpath, snap, mtime=st.st_mtime)
         self.store.upsert(
             BaselineEntry(relpath, "file", st.st_size, st.st_mtime, st.st_size, st.st_mtime)
         )
+        return True
 
     # --- download-failure backoff (a broken iCloud blob: 200 + Content-Length N + 0 bytes)
     def _download_backed_off(self, relpath: str, rentry: RemoteEntry) -> bool:

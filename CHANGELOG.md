@@ -108,6 +108,19 @@ carry behavior changes).
   the state it prescribes), and the daemon stamps a machine-readable `last_error_at` epoch
   so the ordering survives DST/timezone changes. Both the text and `--json` views share
   the demotion.
+- **A sustained-unreadable remote now converges for downloads and adopts, not only
+  conflicts.** v0.13.0 documented that after `unreadable_max_passes` the good local side
+  wins, but only the conflict path implemented it: a pure download (local unchanged,
+  remote moved to a never-materializing husk) or a first-sight adopt deferred forever —
+  observed live at 742 passes on a plugin `manifest.json`. The decide layer now routes an
+  escalated husk with a good (non-empty) local copy to the conflict valve, which re-probes
+  readability and uploads the local content (the husk goes to the recoverable iCloud trash
+  when `remote_trash` is on — the default), clearing the stuck counter. If the husk heals
+  right at the window, the re-probe catches it and the **remote edit is delivered** (a
+  plain download), never clobbered by a conflict policy. A remote-created husk with **no**
+  local side keeps deferring and stays visible in the stuck registry (`status --watch` /
+  `doctor`) — deleting content the engine never managed to read remains an operator
+  decision. A 0-byte or over-`max_file_size_mb` local still never wins.
 
 ## [0.13.0] - 2026-06-15
 
