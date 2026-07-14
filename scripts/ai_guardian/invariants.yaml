@@ -61,12 +61,16 @@
     deletion.
 
 - id: UNREADABLE_DEFER
-  title: "Unreadable remote blobs are deferred, never clobbered (v0.13.0 propagation lag)"
+  title: "Unreadable remote blobs are deferred within the escalation window; after it, only a good local side may win (v0.13.0 propagation lag)"
   safety_critical: true
   source_symbol: "ifolder_sync/syncer.py::_defer_unreadable"
   anchor_test: "tests/test_drift.py::test_unreadable_remote_conflict_never_clobbers"
   check: >
-    Does this diff resolve a conflict against an unreadable remote (a 0-byte body whose
-    record lists size N>0), count such a remote as an error instead of deferring it, or let
-    a good local side be overwritten before the unreadable-escalation window — risking data
-    loss from iCloud publish-before-content lag?
+    Does this diff resolve any action against an unreadable remote (a 0-byte body whose
+    record lists size N>0) BEFORE the unreadable-escalation window has elapsed against an
+    unchanged remote signature, count such a remote as an error instead of deferring it,
+    skip the readability re-probe when converging after the window, or let an empty or
+    absent local side win over the remote at any time — risking data loss from iCloud
+    publish-before-content lag? (Post-window convergence where a good, non-empty local
+    side wins and the husk goes to recoverable trash is the SANCTIONED design, for every
+    op — not a weakening.)
