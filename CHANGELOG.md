@@ -91,6 +91,16 @@ carry behavior changes).
   that takes the kernel lock; this is a one-time action at upgrade. (The lock file must live
   on a local filesystem; `flock` is unreliable over NFS/SMB.)
 
+### Fixed
+- **`auth` recovers after an Apple ID password change.** A stored Keychain password
+  rejected by Apple (the SRP-complete 401 with pyicloud's wrong-password message) now
+  falls back to ONE interactive prompt and overwrites the stale Keychain item on success —
+  previously the prompt was only reachable with an *empty* Keychain, leaving `auth`
+  unrecoverable without manual Keychain surgery. Bounded at 2 real SRP attempts
+  (Apple-lockout safety); locked-account/transient 401s never trigger the prompt; the
+  daemon's non-interactive path still never prompts; a rejected `IFOLDER_SYNC_PASSWORD`
+  is named explicitly.
+
 ## [0.13.0] - 2026-06-15
 
 Engine-safety fix for iCloud's publish-before-content propagation lag, plus the Obsidian
