@@ -7,6 +7,17 @@ carry behavior changes).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-14
+
+Three features land — the live status dashboard, the read-only `doctor` audit, and the
+modern launchd control plane (atomic `restart`, `uninstall`, verified post-conditions) —
+alongside a kernel-`flock` single-instance lock, a large performance pass (~9x cheaper
+idle syncs), and the Apple-ID-password-change recovery fixes.
+
+> **Upgrade note (required action):** run `ifolder-sync restart` (per active profile)
+> after upgrading — the new kernel lock requires replacing a daemon started by an older
+> version (details under *Changed*).
+
 ### Added
 - **Live status dashboard — `ifolder-sync status --watch`.** A redrawing dashboard of the
   daemon's in-flight transfers, the full pending queue, recently-synced files, and any path
@@ -281,7 +292,8 @@ Phase D — refactor & performance, no behavior change beyond the items called o
   installed no dependencies. Moved into `[project]`, added an SPDX license and a CI build
   gate (build + install across Python 3.10–3.14, ruff + mypy + pytest).
 
-[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.14.0
 [0.13.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.13.0
 [0.12.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.12.0
 [0.11.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.11.0
