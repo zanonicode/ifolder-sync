@@ -91,6 +91,16 @@ carry behavior changes).
   that takes the kernel lock; this is a one-time action at upgrade. (The lock file must live
   on a local filesystem; `flock` is unreliable over NFS/SMB.)
 
+### Fixed
+- **`status` no longer claims `Session: valid` while every reconnect fails auth.** The
+  session state is demoted to a red `stale` (with the failure timestamp and the recovery
+  command) when an `auth:`-classified `last_error` is newer than `last_sync` — the local
+  trust-cookie expiry alone cannot see a server-side revocation (e.g. an Apple ID password
+  change). A successful trusted `auth` clears the recorded auth error (so the hint lifts
+  the state it prescribes), and the daemon stamps a machine-readable `last_error_at` epoch
+  so the ordering survives DST/timezone changes. Both the text and `--json` views share
+  the demotion.
+
 ## [0.13.0] - 2026-06-15
 
 Engine-safety fix for iCloud's publish-before-content propagation lag, plus the Obsidian
