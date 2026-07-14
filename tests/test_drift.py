@@ -2136,7 +2136,9 @@ def test_unreadable_got_zero_raises_typed():
 def test_unreadable_sustained_escalates_one_warning(make_syncer, fake, local_dir, caplog):
     """A permanently-unreadable remote (same signature every pass) defers silently until the
     sustained window elapses, then emits EXACTLY ONE 'likely genuine corruption' warning,
-    with stats.errors==0 throughout."""
+    with stats.errors==0 throughout. (The pass AFTER the warning converges via the conflict
+    valve — see test_escalated_unreadable_download_converges_local_wins — which is why the
+    warning can never fire twice for the same signature.)"""
     import logging
 
     from ifolder_sync.state import BaselineEntry
@@ -2177,6 +2179,188 @@ def test_unreadable_fast_churn_no_false_corruption(make_syncer, fake, local_dir,
             assert s.errors == 0 and s.pending >= 1, s.summary()
 
     assert not any("likely genuine corruption" in r.message for r in caplog.records), caplog.text
+    store.close()
+
+
+def test_escalated_unreadable_download_converges_local_wins(make_syncer, fake, local_dir):
+    """v0.13.0 documented 'the good local side wins after the window' but delivered it only
+    for CONFLICTs: a pure DOWNLOAD (local unchanged, remote moved to an unreadable husk with
+    a frozen signature) deferred forever — live evidence: 3 files stuck 742/268/268 passes.
+    After the window the decide layer must route the path to the conflict valve, which
+    uploads the good local copy and clears the counter."""
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    write_file(local_dir, "x.json", b"LOCAL", mtime=1000.0)  # local unchanged -> DOWNLOAD
+    store.upsert(BaselineEntry("x.json", "file", 5, 1000.0, 5, 1000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("x.json", size=9, mtime=2000.0, etag="e1")
+
+    for _ in range(4):  # 3 deferring passes fill the window; the 4th converges
+        s = syncer.sync_once()
+        assert s.errors == 0, s.summary()
+
+    assert fake.files["x.json"]["content"] == b"LOCAL"  # the good local side won
+    assert fake.calls["upload"] >= 1
+    assert json.loads(store.get_meta("unreadable_counts") or "{}") == {}
+    s = syncer.sync_once()
+    assert s.pending == 0 and s.errors == 0, s.summary()
+    store.close()
+
+
+def test_escalated_unreadable_etag_moved_converges_local_wins(make_syncer, fake, local_dir):
+    # The etag-moved rescue (same size+mtime, moved etag) is the third download-bound
+    # decide site: it must converge past the window exactly like the plain download.
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    write_file(local_dir, "y.json", b"LOCAL", mtime=1000.0)
+    store.upsert(BaselineEntry("y.json", "file", 5, 1000.0, 9, 2000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("y.json", size=9, mtime=2000.0, etag="e1")  # size+mtime match base
+
+    for _ in range(4):
+        s = syncer.sync_once()
+        assert s.errors == 0, s.summary()
+
+    assert fake.files["y.json"]["content"] == b"LOCAL"
+    assert json.loads(store.get_meta("unreadable_counts") or "{}") == {}
+    store.close()
+
+
+def test_escalated_unreadable_heals_at_the_window_delivers_remote_edit(
+    make_syncer, fake, local_dir
+):
+    # The husk materializes AFTER the window elapsed (observed live: homepage/manifest.json
+    # healed 27s past its window): the valve's re-probe finds it readable, and — because the
+    # local side is unchanged vs baseline (this was a routed download, never a real
+    # conflict) — the REMOTE edit must be delivered, not clobbered by a conflict policy.
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(policy="local", unreadable_max_passes=3)  # worst-case policy
+    write_file(local_dir, "x.json", b"LOCAL", mtime=1000.0)
+    store.upsert(BaselineEntry("x.json", "file", 5, 1000.0, 5, 1000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("x.json", size=9, mtime=2000.0, etag="e1")
+
+    for _ in range(3):  # fill the window
+        s = syncer.sync_once()
+        assert s.errors == 0, s.summary()
+
+    fake.put("x.json", b"HEALED!!!", mtime=2000.0, etag="e1")  # same signature, body arrives
+    fake.unreadable.discard("x.json")
+
+    s = syncer.sync_once()
+    assert s.errors == 0 and s.conflicts == 0, s.summary()
+    assert (local_dir / "x.json").read_bytes() == b"HEALED!!!"  # remote edit delivered
+    assert fake.files["x.json"]["content"] == b"HEALED!!!"  # never overwritten by stale local
+    assert json.loads(store.get_meta("unreadable_counts") or "{}") == {}
+    store.close()
+
+
+def test_escalated_unreadable_oversize_local_keeps_deferring(make_syncer, fake, local_dir):
+    # An over-cap local cannot be uploaded by the valve (the soft-skip would oscillate the
+    # counter and re-fire the one-time warning every window): keep deferring instead.
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3, max_file_size_mb=1)
+    big = b"x" * (1024 * 1024 + 1)
+    write_file(local_dir, "big.bin", big, mtime=1000.0)
+    store.upsert(BaselineEntry("big.bin", "file", len(big), 1000.0, len(big), 1000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("big.bin", size=9, mtime=2000.0, etag="e1")
+
+    for _ in range(6):  # well past the window
+        s = syncer.sync_once()
+        assert s.pending >= 1 and s.errors == 0, s.summary()
+
+    assert fake.calls["upload"] == 0
+    assert "big.bin" in json.loads(store.get_meta("unreadable_counts") or "{}")
+    store.close()
+
+
+def test_escalated_unreadable_verify_adopt_converges_local_wins(make_syncer, fake, local_dir):
+    # First sight on both sides with equal size+mtime (VERIFY_ADOPT) against an unreadable
+    # remote: the adopt's byte-compare can never run, so after the window the same
+    # conflict-valve convergence must apply.
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    write_file(local_dir, "a.md", b"LOCALDATA", mtime=2000.0)  # 9 bytes, mtime == remote
+    fake.put_unreadable("a.md", size=9, mtime=2000.0, etag="e1")
+
+    for _ in range(4):
+        s = syncer.sync_once()
+        assert s.errors == 0, s.summary()
+
+    assert fake.files["a.md"]["content"] == b"LOCALDATA"
+    assert json.loads(store.get_meta("unreadable_counts") or "{}") == {}
+    store.close()
+
+
+def test_escalated_unreadable_remote_created_keeps_deferring(make_syncer, fake, local_dir, caplog):
+    # No local side exists: there is nothing safe to converge with, and deleting content
+    # the engine never managed to read stays an operator decision — keep deferring
+    # (visible via the stuck registry in status/doctor), never delete, never fabricate
+    # a local file. The one-warning-per-signature contract must hold on this path, the
+    # only one where sustained deferral still exists.
+    import logging
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    fake.put_unreadable("ghost.md", size=7, mtime=2000.0, etag="e1")
+
+    with caplog.at_level(logging.WARNING, logger="ifolder-sync.syncer"):
+        for _ in range(6):  # well past the window
+            s = syncer.sync_once()
+            assert s.pending >= 1 and s.errors == 0, s.summary()
+
+    warnings = [r for r in caplog.records if "likely genuine corruption" in r.message]
+    assert len(warnings) == 1, [r.message for r in warnings]
+    assert fake.calls["delete"] == 0 and fake.calls["upload"] == 0
+    assert not (local_dir / "ghost.md").exists()
+    assert "ghost.md" in fake.files
+    store.close()
+
+
+def test_escalated_unreadable_rescue_download_keeps_deferring(make_syncer, fake, local_dir):
+    # Local deleted + remote edited-but-unreadable (RESCUE_DOWNLOAD): the rescue can never
+    # read its content and there is no local side to converge with — same operator-decision
+    # stance as the remote-created husk: keep deferring, never delete the remote, never
+    # fabricate a local file.
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    store.upsert(BaselineEntry("gone.md", "file", 5, 1000.0, 5, 1000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("gone.md", size=9, mtime=2000.0, etag="e1")  # remote edited; no local
+
+    for _ in range(6):  # well past the window
+        s = syncer.sync_once()
+        assert s.pending >= 1 and s.errors == 0, s.summary()
+
+    assert fake.calls["delete"] == 0 and fake.calls["upload"] == 0
+    assert not (local_dir / "gone.md").exists()
+    assert "gone.md" in fake.files
+    store.close()
+
+
+def test_escalated_unreadable_empty_local_keeps_deferring(make_syncer, fake, local_dir):
+    # A 0-byte local never wins (engine-wide empty-side valve): even past the window the
+    # husk must not be overwritten with emptiness — keep deferring instead.
+    from ifolder_sync.state import BaselineEntry
+
+    syncer, store = make_syncer(unreadable_max_passes=3)
+    write_file(local_dir, "z.md", b"", mtime=1000.0)
+    store.upsert(BaselineEntry("z.md", "file", 0, 1000.0, 0, 1000.0, "e0"))
+    store.commit()
+    fake.put_unreadable("z.md", size=9, mtime=2000.0, etag="e1")
+
+    for _ in range(6):
+        s = syncer.sync_once()
+        assert s.pending >= 1 and s.errors == 0, s.summary()  # deferring, not silently adopted
+
+    assert fake.calls["upload"] == 0
+    assert fake.files["z.md"]["size"] == 9  # husk untouched
+    base = store.all()["z.md"]
+    assert (base.remote_size, base.remote_mtime) == (0, 1000.0)  # baseline row untouched
     store.close()
 
 

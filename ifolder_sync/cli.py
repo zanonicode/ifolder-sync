@@ -769,7 +769,7 @@ def cmd_status(args):
 
 
 _DOCTOR_LABELS = {
-    "would-conflict": "Would conflict (both sides changed since baseline)",
+    "would-conflict": "Would conflict (both sides changed, or an escalated unreadable remote)",
     "drift": "Unsettled / pending (empty-husk wait, adopt-verify)",
     "planned-delete": "Planned deletions",
     "planned-download": "Planned downloads (remote -> local)",
