@@ -7,6 +7,12 @@ carry behavior changes).
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-07-14
+
+A visibility patch for the live dashboard: the directory phase of a sync pass is no longer a
+blind window. No behavior change to the sync engine itself; the fix becomes visible after the
+daemon's next restart.
+
 ### Fixed
 - **Dashboard blind window during the directory phase of a pass.** `status --watch` rendered
   "all synced — 0 active" while the engine was creating remote folders (network-bound, seconds
@@ -302,7 +308,8 @@ Phase D — refactor & performance, no behavior change beyond the items called o
   installed no dependencies. Moved into `[project]`, added an SPDX license and a CI build
   gate (build + install across Python 3.10–3.14, ruff + mypy + pytest).
 
-[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/zanonicode/ifolder-sync/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.14.1
 [0.14.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.14.0
 [0.13.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.13.0
 [0.12.0]: https://github.com/zanonicode/ifolder-sync/releases/tag/v0.12.0
