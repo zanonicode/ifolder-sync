@@ -51,7 +51,7 @@ dev = [
 # lazy-imported inside method bodies, so the unit tests run on `dev` alone (pydantic);
 # only the ai-guardian workflow installs this extra.
 ai = [
-    "google-genai==2.9.0",
+    "google-genai==2.10.0",
     "pydantic>=2",
     "PyGithub>=2",
 ]
