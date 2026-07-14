@@ -429,6 +429,186 @@ def test_status_session_not_found(tmp_path, monkeypatch, capsys):
     assert "Session:       not found" in _status_out(capsys)
 
 
+def _write_meta(**meta: str) -> None:
+    with StateStore(baseline_path("work")) as store:
+        for key, value in meta.items():
+            store.set_meta(key, value)
+
+
+def _local_epoch(ts: str) -> float:
+    import time
+
+    return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+
+
+def test_status_session_demoted_when_auth_error_newer_than_last_sync(tmp_path, monkeypatch, capsys):
+    # A password change revokes the trust token SERVER-side; the local cookie expiry alone
+    # keeps claiming "valid". An auth-classified last_error newer than last_sync is the
+    # cheap network-free signal that reconnects are failing NOW.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(
+        last_sync=str(_local_epoch("2026-07-11 16:29:49")),
+        last_error="2026-07-11 16:30:56 auth: reconnect failed: iCloud requires 2FA verification",
+    )
+    out = _status_out(capsys)
+    assert "Session:       stale" in out
+    assert "valid — trusted until" not in out
+    assert "run `ifolder-sync auth`" in out
+
+
+def test_status_session_demoted_when_auth_error_and_no_last_sync(tmp_path, monkeypatch, capsys):
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(last_error="2026-07-11 16:30:56 auth: 2FA required")
+    assert "Session:       stale" in _status_out(capsys)
+
+
+def test_status_session_stays_valid_when_sync_succeeded_after_auth_error(
+    tmp_path, monkeypatch, capsys
+):
+    # A successful pass AFTER the recorded auth error proves the session works (e.g. a
+    # foreground `sync` that does not clear last_error): no demotion.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(
+        last_sync=str(_local_epoch("2026-07-11 17:00:00")),
+        last_error="2026-07-11 16:30:56 auth: reconnect failed",
+    )
+    assert "Session:       valid — trusted until" in _status_out(capsys)
+
+
+def test_status_session_stays_valid_on_non_auth_error(tmp_path, monkeypatch, capsys):
+    # Only auth-classified errors question the session; a walk/network failure does not.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(
+        last_sync=str(_local_epoch("2026-07-11 16:29:49")),
+        last_error="2026-07-11 16:30:56 walk failed: connection reset",
+    )
+    assert "Session:       valid — trusted until" in _status_out(capsys)
+
+
+def test_status_json_session_demoted(tmp_path, monkeypatch, capsys):
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(
+        last_sync=str(_local_epoch("2026-07-11 16:29:49")),
+        last_error="2026-07-11 16:30:56 auth: reconnect failed",
+    )
+    main(["status", "--profile", "work", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["profiles"][0]["session"]["state"] == "stale"
+    # Demotion must preserve the cookie-expiry date (rendered in local time).
+    assert data["profiles"][0]["session"]["trusted_until"] in ("2034-12-31", "2035-01-01")
+
+
+def test_status_session_demoted_on_tie_between_error_and_last_sync(tmp_path, monkeypatch, capsys):
+    # Demote-on-tie is deliberate (`<`, not `<=`): equal stamps give no proof the
+    # successful pass came AFTER the failure.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    epoch = str(_local_epoch("2026-07-11 16:30:56"))
+    _write_meta(last_sync=epoch, last_error="2026-07-11 16:30:56 auth: x", last_error_at=epoch)
+    assert "Session:       stale" in _status_out(capsys)
+
+
+def test_status_session_kept_valid_on_unparseable_error_timestamp(tmp_path, monkeypatch, capsys):
+    # A malformed stamp with no machine epoch cannot be ordered against last_sync: the
+    # predicate keeps the local verdict instead of guessing.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(
+        last_sync=str(_local_epoch("2026-07-11 16:29:49")),
+        last_error="XXXX-XX-XX XX:XX:XX auth: boom",
+    )
+    assert "Session:       valid — trusted until" in _status_out(capsys)
+
+
+def test_demote_predicate_tolerates_garbage_last_sync():
+    # Unit-level: a non-float last_sync must not crash the predicate nor suppress the
+    # demotion (the auth error is the only orderable evidence left).
+    from ifolder_sync.cli import _demote_stale_session
+
+    auth = {"state": "valid", "color": "32;1", "detail": " — x", "trusted_until": "2035-01-01"}
+    out = _demote_stale_session(
+        auth, {"last_error": "2026-07-11 16:30:56 auth: x", "last_sync": "garbage"}
+    )
+    assert out["state"] == "stale"
+
+
+def test_status_demotion_prefers_machine_epoch_over_wall_clock(tmp_path, monkeypatch, capsys):
+    # The wall-clock prefix can lie across a DST/timezone change; the sibling
+    # last_error_at epoch is authoritative for the ordering.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_session(cookie_expires="2035-01-01 00:00:00Z")
+    _write_meta(
+        last_sync=str(_local_epoch("2026-07-11 16:29:49")),
+        last_error="2000-01-01 00:00:00 auth: reconnect failed",
+        last_error_at=str(_local_epoch("2026-07-11 16:30:56")),
+    )
+    assert "Session:       stale" in _status_out(capsys)
+
+
+class _StubAuthClient:
+    """cmd_auth stand-in: successful connect, trusted session, no network."""
+
+    def __init__(self, trusted: bool = True):
+        self.api = MagicMock(is_trusted_session=trusted)
+
+    def connect(self, interactive: bool = True, fresh: bool = False) -> None:
+        pass
+
+    def print_diagnostics(self, include_phones: bool = True) -> None:
+        pass
+
+
+def _stub_auth(monkeypatch, trusted: bool = True) -> None:
+    import ifolder_sync.icloud_client as ic
+
+    monkeypatch.setattr(
+        ic.ICloudClient, "from_config", staticmethod(lambda cfg: _StubAuthClient(trusted))
+    )
+
+
+def test_auth_success_clears_stale_auth_error(tmp_path, monkeypatch, capsys):
+    # The demotion's own recovery hint is `run ifolder-sync auth`: a successful trusted
+    # auth must retract the recorded auth failure, or status keeps saying "stale — run
+    # `ifolder-sync auth`" right after the user did exactly that.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_meta(last_error="2026-07-11 16:30:56 auth: reconnect failed", last_error_at="123.0")
+    _stub_auth(monkeypatch)
+
+    main(["auth", "--profile", "work"])
+
+    with StateStore(baseline_path("work")) as store:
+        assert store.get_meta("last_error") == ""
+        assert store.get_meta("last_error_at") == ""
+
+
+def test_auth_success_keeps_non_auth_error(tmp_path, monkeypatch, capsys):
+    # Only auth-classified errors are counter-evidenced by a successful auth; a walk
+    # failure remains the operator's business.
+    _sandbox(tmp_path, monkeypatch)
+    _make_profile_config("work")
+    _write_meta(last_error="2026-07-11 16:30:56 walk failed: boom")
+    _stub_auth(monkeypatch)
+
+    main(["auth", "--profile", "work"])
+
+    with StateStore(baseline_path("work")) as store:
+        assert store.get_meta("last_error") == "2026-07-11 16:30:56 walk failed: boom"
+
+
 def test_logs_shows_tail(tmp_path, monkeypatch, capsys):
     _sandbox(tmp_path, monkeypatch)
     log_dir = state_dir("work") / "logs"
