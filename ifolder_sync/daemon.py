@@ -348,6 +348,10 @@ class Daemon:
 
     def _set_last_error(self, msg: str):
         try:
+            # last_error_at is the machine-readable ordering key: the wall-clock prefix in
+            # last_error is for humans and cannot be re-ordered against the epoch last_sync
+            # across a DST fall-back hour or a system timezone change.
+            self.store.set_meta("last_error_at", str(time.time()), commit=False)
             self.store.set_meta("last_error", f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}")
         except Exception:  # noqa: BLE001
             pass
@@ -357,6 +361,7 @@ class Daemon:
         "" (not via _set_last_error, which prepends a timestamp) so the status renderer's
         truthy check treats it as 'no error'."""
         try:
+            self.store.set_meta("last_error_at", "", commit=False)
             self.store.set_meta("last_error", "")
         except Exception:  # noqa: BLE001
             pass

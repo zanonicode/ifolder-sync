@@ -92,6 +92,22 @@ carry behavior changes).
   on a local filesystem; `flock` is unreliable over NFS/SMB.)
 
 ### Fixed
+- **`auth` recovers after an Apple ID password change.** A stored Keychain password
+  rejected by Apple (the SRP-complete 401 with pyicloud's wrong-password message) now
+  falls back to ONE interactive prompt and overwrites the stale Keychain item on success —
+  previously the prompt was only reachable with an *empty* Keychain, leaving `auth`
+  unrecoverable without manual Keychain surgery. Bounded at 2 real SRP attempts
+  (Apple-lockout safety); locked-account/transient 401s never trigger the prompt; the
+  daemon's non-interactive path still never prompts; a rejected `IFOLDER_SYNC_PASSWORD`
+  is named explicitly.
+- **`status` no longer claims `Session: valid` while every reconnect fails auth.** The
+  session state is demoted to a red `stale` (with the failure timestamp and the recovery
+  command) when an `auth:`-classified `last_error` is newer than `last_sync` — the local
+  trust-cookie expiry alone cannot see a server-side revocation (e.g. an Apple ID password
+  change). A successful trusted `auth` clears the recorded auth error (so the hint lifts
+  the state it prescribes), and the daemon stamps a machine-readable `last_error_at` epoch
+  so the ordering survives DST/timezone changes. Both the text and `--json` views share
+  the demotion.
 - **A sustained-unreadable remote now converges for downloads and adopts, not only
   conflicts.** v0.13.0 documented that after `unreadable_max_passes` the good local side
   wins, but only the conflict path implemented it: a pure download (local unchanged,

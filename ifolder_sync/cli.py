@@ -175,9 +175,48 @@ def _auth_status(apple_id: str) -> dict[str, Any]:
     return s("expired", "31", f" on {when} — run `ifolder-sync auth`", when)
 
 
-def _auth_state(apple_id: str) -> str:
-    st = _auth_status(apple_id)
-    return _color(st["state"], st["color"]) + st["detail"]
+def _demote_stale_session(auth: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    """Demote a locally-"valid" session when the daemon's own history contradicts it.
+
+    "valid" comes from the trust cookie's expiry DATE — a purely local check, blind to a
+    server-side revocation (e.g. an Apple ID password change). The daemon stamps auth
+    failures into last_error as "<YYYY-MM-DD HH:MM:SS> auth: ..." plus a machine-readable
+    last_error_at epoch, so an auth error newer than the last successful pass means
+    reconnects are failing right now; anything else (older error, non-auth error,
+    unparseable format) keeps the local verdict. The epoch is preferred for the ordering;
+    the wall-clock prefix is a fallback for rows written before last_error_at existed
+    (mktime can mis-order it across a DST fall-back hour or a timezone change)."""
+    if auth["state"] != "valid":
+        return auth
+    err = (meta or {}).get("last_error") or ""
+    err_ts, msg = err[:19], err[20:]
+    if not msg.startswith("auth:"):
+        return auth
+    err_epoch: Optional[float] = None
+    try:
+        err_epoch = float((meta or {}).get("last_error_at") or "")
+    except ValueError:
+        pass
+    if err_epoch is None:
+        try:
+            err_epoch = time.mktime(time.strptime(err_ts, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            return auth
+    last_sync = (meta or {}).get("last_sync")
+    try:
+        if last_sync and err_epoch < float(last_sync):
+            return auth
+    except ValueError:
+        pass
+    return {
+        "state": "stale",
+        "color": "31",
+        "detail": (
+            f" — locally trusted until {auth['trusted_until']}, but the daemon last hit "
+            f"an auth failure ({err_ts}); run `ifolder-sync auth`"
+        ),
+        "trusted_until": auth["trusted_until"],
+    }
 
 
 def _warn_tcc(path: Path) -> None:
@@ -337,6 +376,27 @@ def cmd_init(args):
     print(f"Next step: `ifolder-sync auth --profile {profile}` to authenticate with iCloud.")
 
 
+def _clear_stale_auth_error(profile: str) -> None:
+    """A successful trusted auth is direct counter-evidence for a recorded `auth:`-classified
+    last_error: clear it so `status` stops demoting the session this command just validated.
+    Without this, the demotion's own recovery hint ("run `ifolder-sync auth`") would keep
+    showing until the daemon's next completed pass — unbounded while it is stopped.
+    Best-effort: a meta write must never fail the auth itself."""
+    from .state import StateStore
+
+    db = baseline_path(profile)
+    if not db.exists():
+        return
+    try:
+        with StateStore(db) as store:
+            err = store.get_meta("last_error") or ""
+            if err[20:].startswith("auth:"):
+                store.set_meta("last_error_at", "", commit=False)
+                store.set_meta("last_error", "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def cmd_auth(args):
     from .icloud_client import ICloudClient
 
@@ -346,6 +406,7 @@ def cmd_auth(args):
     print(f"\nAuthenticated as {cfg.apple_id}.")
     client.print_diagnostics(include_phones=False)
     if client.api.is_trusted_session:
+        _clear_stale_auth_error(profile)
         print(f"Trusted session stored at {sessions_dir()}.")
         print(f"The daemon (`ifolder-sync start --profile {profile}`) now connects without 2FA.")
     else:
@@ -642,6 +703,7 @@ def _baseline_meta(profile: str) -> tuple[str, dict[str, Any]]:
             return "ok", {
                 "last_sync": store.get_meta("last_sync"),
                 "last_error": store.get_meta("last_error"),
+                "last_error_at": store.get_meta("last_error_at"),
                 "last_stats": store.get_meta("last_stats"),
             }
     except CorruptBaselineError:
@@ -655,8 +717,8 @@ def _profile_status_data(profile: str) -> dict[str, Any]:
     if not path.exists():
         return {"profile": profile, "configured": False}
     cfg = Config.load(path)
-    auth = _auth_status(cfg.apple_id)
     state, meta = _baseline_meta(profile)
+    auth = _demote_stale_session(_auth_status(cfg.apple_id), meta)
     last_sync = meta.get("last_sync")
     return {
         "profile": profile,
@@ -701,10 +763,11 @@ def _print_profile_status(profile: str) -> None:
     print(f"Obsidian:      {'on' if cfg.obsidian else 'off'}")
     print(f"Remote trash:  {'on' if cfg.remote_trash else 'off'}")
     print(f"State:         {state_dir(profile)}")
-    print(f"Session:       {_auth_state(cfg.apple_id)}")
+    state, meta = _baseline_meta(profile)
+    auth = _demote_stale_session(_auth_status(cfg.apple_id), meta)
+    print(f"Session:       {_color(auth['state'], auth['color'])}{auth['detail']}")
     print(f"Local trash:   {trash_count(trash_dir(profile))} file(s)")
 
-    state, meta = _baseline_meta(profile)
     if state == "corrupt":
         print(
             f"Baseline:      {_color('corrupt', '31')} — run "
