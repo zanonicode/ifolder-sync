@@ -716,6 +716,11 @@ class Syncer:
                 dir_actions, file_actions, cleanup_actions
             )
 
+        # Surface the whole pending file queue to the dashboard up front (best-effort) — before
+        # the dir phase, whose remote mkdirs are network-bound and can dominate a bootstrap —
+        # so the observer sees what is coming, not just the op the serial engine is on;
+        # each row then transitions queued -> uploading/downloading -> done as it is applied.
+        self._emit_queue(file_actions, covered, suppress_deletes)
         for relpath, op in dir_actions:
             if self._should_stop():
                 break
@@ -726,10 +731,6 @@ class Syncer:
                 break
             self._delete_remote_tree(root, covered, stats, dry_run)
             self._commit(dry_run)
-        # Surface the whole pending file queue to the dashboard up front (best-effort), so the
-        # observer sees what is coming, not just the one file the serial engine is on right now;
-        # each row then transitions queued -> uploading/downloading -> done as it is applied.
-        self._emit_queue(file_actions, covered, suppress_deletes)
         for relpath, op in file_actions:
             if self._should_stop():
                 break
@@ -1408,6 +1409,11 @@ class Syncer:
         if op == Op.LEAVE_DIR:
             return
         if op == Op.MKDIR_REMOTE:
+            # Announce before the blocking network call (the _apply_file bracket): a dir-heavy
+            # bootstrap is otherwise a silent "all synced" for its whole network-bound dir
+            # phase. MKDIR_LOCAL and RECORD_DIR stay silent — local-fs/baseline-only, no
+            # blind window to surface.
+            self._emit(relpath, op, "mkdir", kind="dir")
             stats.uploaded += 1
             if not dry_run:
                 try:
@@ -1415,6 +1421,7 @@ class Syncer:
                 except Exception as exc:  # noqa: BLE001
                     log.error("remote mkdir failed %s: %s", relpath, exc)
                     stats.errors += 1
+                    self._emit(relpath, op, "error", kind="dir", reason=str(exc)[:80])
                     return
         elif op == Op.MKDIR_LOCAL:
             if not dry_run:
@@ -1425,6 +1432,7 @@ class Syncer:
                     # nothing: a dir that was not created must not enter the baseline.
                     log.error("local mkdir failed %s: %s", relpath, exc)
                     stats.errors += 1
+                    self._emit(relpath, op, "error", kind="dir", reason=str(exc)[:80])
                     return
         elif op != Op.RECORD_DIR:
             # RECORD_DIR falls through to the shared upsert (both sides already have it);
@@ -1432,6 +1440,8 @@ class Syncer:
             raise ValueError(f"unhandled dir op {op!r}")
         if not dry_run:
             self.store.upsert(BaselineEntry(relpath, "dir", 0, 0, 0, 0))
+        if op == Op.MKDIR_REMOTE:
+            self._emit(relpath, op, "done", kind="dir")
 
     def _apply_cleanup(self, relpath: str, op: Op, stats: SyncStats, dry_run: bool) -> None:
         if op == Op.DROP_BASELINE_DIR:

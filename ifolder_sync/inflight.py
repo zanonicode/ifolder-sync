@@ -29,7 +29,7 @@ log = logging.getLogger("ifolder-sync.inflight")
 # planned set, emitted up front) and 'done' (a removal) are NOT active — they stay throttled so
 # enqueuing hundreds of files coalesces into a few writes.
 _ACTIVE_STATES = frozenset(
-    {"uploading", "downloading", "deleting-local", "deleting-remote", "conflict"}
+    {"mkdir", "uploading", "downloading", "deleting-local", "deleting-remote", "conflict"}
 )
 
 
