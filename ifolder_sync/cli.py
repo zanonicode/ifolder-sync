@@ -1132,6 +1132,7 @@ def _box(title: str, rows: list[str]) -> list[str]:
 # transfers (status.json) and the persisted stuck registries (the meta fold).
 _STATE_LABEL = {
     "queued": ("• queued", "90"),
+    "mkdir": ("+ mkdir", "36"),
     "uploading": ("↑ uploading", "36"),
     "downloading": ("↓ downloading", "36"),
     "deleting-local": ("✗ del local", "31"),
@@ -1145,6 +1146,7 @@ _STATE_LABEL = {
 # Render order in the activity/files table: active transfers on top, then the queue, then the
 # persisted stuck states. A path's queue position is otherwise dict-insertion (emit) order.
 _STATE_ORDER = {
+    "mkdir": 0,
     "uploading": 0,
     "downloading": 0,
     "deleting-local": 0,
@@ -1293,6 +1295,7 @@ def _render_multiprofile_frame(profiles: list[str], now: float) -> str:
 
 _RICH_STATE_STYLE = {
     "queued": "dim",
+    "mkdir": "cyan",
     "uploading": "cyan",
     "downloading": "cyan",
     "deleting-local": "red",

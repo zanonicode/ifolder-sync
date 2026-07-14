@@ -7,6 +7,16 @@ carry behavior changes).
 
 ## [Unreleased]
 
+### Fixed
+- **Dashboard blind window during the directory phase of a pass.** `status --watch` rendered
+  "all synced — 0 active" while the engine was creating remote folders (network-bound, seconds
+  each — on a directory-heavy bootstrap, hours of silent work): directory ops emitted no
+  dashboard event, and the pending file queue was only announced after ALL directories had been
+  applied. A remote mkdir now announces itself (new `mkdir` row state, force-flushed like a
+  transfer and closed out by done/error), and the file queue is surfaced before the dir phase
+  starts. Local mkdirs and baseline-only dir records stay silent by design (µs-fast, no blind
+  window to surface).
+
 ## [0.14.0] - 2026-07-14
 
 Three features land — the live status dashboard, the read-only `doctor` audit, and the

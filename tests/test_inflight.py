@@ -101,6 +101,56 @@ def test_engine_emits_queue_for_all_pending_transfers(tmp_path, fake, local_dir)
     store.close()
 
 
+def test_dir_phase_emits_mkdir_and_queue_first(tmp_path, fake, local_dir):
+    """A dir-heavy bootstrap must stay visible: every mkdir announces itself and closes out,
+    and the pending file queue is surfaced BEFORE the dir phase starts — with the queue only
+    after the dirs, a deep tree renders 'all synced' for the whole (network-bound) dir phase."""
+    events: list = []
+    syncer, store = _syncer_with_observer(tmp_path, fake, local_dir, events)
+    write_file(local_dir, "docs/notes/a.md", b"a", mtime=1000)
+    write_file(local_dir, "b.md", b"b", mtime=1000)
+
+    syncer.sync_once()
+
+    mkdirs = [e.relpath for e in events if e.state == "mkdir"]
+    assert set(mkdirs) == {"docs", "docs/notes"}
+    done_dirs = [e.relpath for e in events if e.state == "done" and e.kind == "dir"]
+    assert set(done_dirs) == {"docs", "docs/notes"}
+    first_queued = next(i for i, e in enumerate(events) if e.state == "queued")
+    first_mkdir = next(i for i, e in enumerate(events) if e.state == "mkdir")
+    assert first_queued < first_mkdir
+    store.close()
+
+
+def test_local_mkdir_stays_silent(tmp_path, fake, local_dir):
+    """Deliberate exclusion: MKDIR_LOCAL (µs local fs, no blind window) and RECORD_DIR
+    (baseline-only) emit nothing — only the network-bound MKDIR_REMOTE announces."""
+    events: list = []
+    syncer, store = _syncer_with_observer(tmp_path, fake, local_dir, events)
+    fake.put("r/sub/c.md", b"remote-body", mtime=2000)
+
+    syncer.sync_once()
+
+    assert not [e for e in events if e.state == "mkdir"]
+    assert (local_dir / "r" / "sub" / "c.md").exists()  # the local dirs were still created
+    store.close()
+
+
+def test_surface_mkdir_is_active_forces_flush(tmp_path):
+    """'mkdir' is an ACTIVE state: the engine emits it right before a blocking network call
+    (same shape as 'uploading'), so a throttled flush would hide the whole dir phase."""
+    surf = InflightSurface(tmp_path / "status.json", min_write_interval_ms=10_000)
+    surf.pass_started()
+
+    surf.record(SyncEvent(1.0, 1, "x.md", Op.UPLOAD, "queued", "file"))  # throttled
+    surf.record(SyncEvent(2.0, 1, "docs", Op.MKDIR_REMOTE, "mkdir", "dir"))  # active -> force
+
+    rows = json.loads((tmp_path / "status.json").read_text())["rows"]
+    assert {r["relpath"] for r in rows} == {"x.md", "docs"}
+    store_state = {r["relpath"]: r["state"] for r in rows}
+    assert store_state["docs"] == "mkdir"
+
+
 def test_surface_queued_is_throttled_active_forces(tmp_path):
     """'queued' coalesces (so enqueuing hundreds is a few writes); the first ACTIVE announce
     force-flushes and reveals the accumulated queue + the in-flight row."""

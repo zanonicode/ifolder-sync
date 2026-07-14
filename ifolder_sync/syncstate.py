@@ -29,6 +29,7 @@ SCHEMA = 1
 # dashboard, feature 04); the second is decide-only states (doctor, feature 05).
 State = Literal[
     "queued",
+    "mkdir",
     "uploading",
     "downloading",
     "deleting-local",
