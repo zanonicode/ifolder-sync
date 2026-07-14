@@ -300,7 +300,12 @@ class ICloudClient:
         and _srp_authentication() raises PyiCloudFailedLoginException("No password set")
         BEFORE any Apple request when _password_raw is None. So a first token-only attempt
         either succeeds (no Keychain touched) or surfaces that signal, at which point we
-        resolve the password our way and retry."""
+        resolve the password our way and retry.
+
+        A rejected KEYCHAIN password in interactive mode falls back to ONE prompt — the
+        only CLI recovery path after an Apple ID password change (the stored secret goes
+        stale and _resolve_password would keep returning it forever). The prompted retry
+        flows into the source == "prompt" store below, overwriting the stale item."""
         api = self.api
         if api is None:  # pragma: no cover - connect() always constructs api first
             raise RuntimeError("not connected to iCloud — call connect() first")
@@ -315,11 +320,40 @@ class ICloudClient:
                 pass  # token paths exhausted -> a real SRP login is needed; fall through
 
             password, source = self._resolve_password(interactive)
-            api._password_raw = password
-            try:
-                api.authenticate()
-            except PyiCloudFailedLoginException as exc:
-                raise AuthError("Apple ID or password rejected by Apple.") from exc
+            while True:
+                api._password_raw = password
+                try:
+                    api.authenticate()
+                    break
+                except PyiCloudFailedLoginException as exc:
+                    # A wrong password is the SRP-COMPLETE 401 (kept as __cause__) wrapped
+                    # with pyicloud's "Invalid email/password" message. The message anchor
+                    # matters: signin-INIT and token-login failures also chain a 401 cause
+                    # (a locked/throttled account, not a wrong password) and must not
+                    # trigger a lying re-prompt that burns another SRP attempt. A miss
+                    # fails closed (generic AuthError, the pre-fallback behavior).
+                    rejected = getattr(
+                        exc.__cause__, "code", None
+                    ) == 401 and "Invalid email/password" in str(exc)
+                    if rejected and source == "env":
+                        # A prompted replacement could not win over the env var next run,
+                        # so re-prompting here would only hide the real fix.
+                        raise AuthError(
+                            "The password in IFOLDER_SYNC_PASSWORD was rejected by Apple. "
+                            "Update or unset the variable, then retry."
+                        ) from exc
+                    if not (rejected and interactive and source == "keyring"):
+                        raise AuthError("Apple ID or password rejected by Apple.") from exc
+                    # One retry only: every SRP attempt is a real Apple login and repeated
+                    # failures risk an Apple ID lockout.
+                    print(
+                        "The password stored in the macOS Keychain was rejected by Apple "
+                        "(did you change your Apple ID password?)."
+                    )
+                    password = getpass.getpass(f"Current iCloud password for {self.apple_id}: ")
+                    if not password:
+                        raise AuthError("No password entered.") from exc
+                    source = "prompt"
         finally:
             os.umask(old_umask)
 

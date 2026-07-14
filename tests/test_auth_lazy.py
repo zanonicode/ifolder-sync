@@ -14,7 +14,7 @@ _password_raw, and fail loudly if the password is read on the token-valid path.
 from __future__ import annotations
 
 import pytest
-from pyicloud.exceptions import PyiCloudFailedLoginException
+from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 import ifolder_sync.icloud_client as ic_module
 from ifolder_sync.config import Config
@@ -71,6 +71,15 @@ class _FakePyiCloud:
 
 def _client(tmp_path) -> ICloudClient:
     return ICloudClient.from_config(Config(apple_id="x@y.com", local_folder=str(tmp_path)))
+
+
+def _reject_401(api) -> None:
+    """Mirror pyicloud 2.6.5's wrong-password shape: the SRP-complete 401 is kept as the
+    __cause__ of the login exception (base.py wraps with `raise ... from`). The 401 code is
+    what distinguishes a real rejection from a transient SRP failure."""
+    raise PyiCloudFailedLoginException(
+        "Invalid email/password combination."
+    ) from PyiCloudAPIResponseException("Invalid email/password combination.", code=401)
 
 
 def _no_password_read(monkeypatch):
@@ -198,3 +207,205 @@ def test_rejected_password_becomes_autherror(tmp_path, monkeypatch):
     with pytest.raises(AuthError, match="rejected by Apple"):
         client.connect(interactive=False)
     assert client.api._authenticate_calls == 2
+
+
+def test_stale_keyring_password_interactive_prompts_and_recovers(tmp_path, monkeypatch):
+    # After an Apple ID password change the Keychain still holds the OLD password. An
+    # interactive login must fall back to a prompt when Apple rejects the stored password,
+    # retry with the prompted one, and overwrite the stale Keychain item on success —
+    # otherwise `ifolder-sync auth` is unrecoverable without manual Keychain surgery.
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: "stale-pw")
+    stored: list[tuple[str, str]] = []
+    monkeypatch.setattr(ic_module, "store_password_in_keyring", lambda u, p: stored.append((u, p)))
+    prompts = {"n": 0}
+
+    def _prompt(_msg: str = "") -> str:
+        prompts["n"] += 1
+        return "new-pw"
+
+    monkeypatch.setattr(ic_module.getpass, "getpass", _prompt)
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    def _reject_stale(api):
+        assert api._password_raw == "stale-pw"
+        _reject_401(api)
+
+    def _succeed_new(api):
+        assert api._password_raw == "new-pw"
+
+    _FakePyiCloud.auth_script = [_fail, _reject_stale, _succeed_new]
+
+    client = _client(tmp_path)
+    client.connect(interactive=True)
+
+    assert prompts["n"] == 1
+    assert client.api._authenticate_calls == 3
+    assert stored == [("x@y.com", "new-pw")]
+
+
+def test_rejected_prompted_password_raises_without_reprompt(tmp_path, monkeypatch):
+    # A rejected PROMPT-sourced password must raise, not loop into another prompt: every
+    # SRP attempt is a real Apple login and repeated failures can lock the Apple ID.
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: None)
+    prompts = {"n": 0}
+
+    def _prompt(_msg: str = "") -> str:
+        prompts["n"] += 1
+        return "typo-pw"
+
+    monkeypatch.setattr(ic_module.getpass, "getpass", _prompt)
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    _FakePyiCloud.auth_script = [_fail, _reject_401]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="rejected by Apple"):
+        client.connect(interactive=True)
+    assert prompts["n"] == 1
+
+
+def test_stale_env_password_interactive_raises_without_prompt(tmp_path, monkeypatch):
+    # An env-sourced password wins precedence on EVERY run, so prompting (and storing to
+    # the Keychain) would not fix the next login — the error must name the variable instead.
+    monkeypatch.setenv("IFOLDER_SYNC_PASSWORD", "stale-env")
+
+    def _no_prompt(_msg: str = "") -> str:
+        raise AssertionError("must not prompt while IFOLDER_SYNC_PASSWORD is set")
+
+    monkeypatch.setattr(ic_module.getpass, "getpass", _no_prompt)
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    _FakePyiCloud.auth_script = [_fail, _reject_401]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="IFOLDER_SYNC_PASSWORD"):
+        client.connect(interactive=True)
+
+
+@pytest.mark.parametrize(
+    ("message", "cause_code"),
+    [
+        # Faithful transient: pyicloud 2.6.5 ALWAYS chains a cause on the signin-init
+        # wrap (base.py:594-595) — an Apple-side outage arrives as a 5xx cause.
+        ("Failed to initiate srp authentication.", 503),
+        # Locked/throttled account: the signin-INIT failure carries a 401 cause too, but
+        # it is NOT a wrong password — prompting "your stored password was rejected"
+        # would lie and burn another SRP attempt against an already-locked account.
+        ("Failed to initiate srp authentication.", 401),
+        # Defensive: a cause-less login failure must also never prompt.
+        ("Failed to initiate srp authentication.", None),
+    ],
+)
+def test_non_rejection_login_failure_interactive_does_not_prompt(
+    tmp_path, monkeypatch, message, cause_code
+):
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: "kc-pw")
+
+    def _no_prompt(_msg: str = "") -> str:
+        raise AssertionError("must not prompt on a non-rejection login failure")
+
+    monkeypatch.setattr(ic_module.getpass, "getpass", _no_prompt)
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    def _transient(api):
+        if cause_code is None:
+            raise PyiCloudFailedLoginException(message)
+        raise PyiCloudFailedLoginException(message) from PyiCloudAPIResponseException(
+            message, code=cause_code
+        )
+
+    _FakePyiCloud.auth_script = [_fail, _transient]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="rejected by Apple"):
+        client.connect(interactive=True)
+
+
+def test_empty_fallback_prompt_aborts_without_srp_attempt(tmp_path, monkeypatch):
+    # An empty answer to the fallback prompt aborts cleanly instead of sending an empty
+    # password to Apple (which would burn one of the bounded SRP attempts).
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: "stale-pw")
+    monkeypatch.setattr(ic_module.getpass, "getpass", lambda _msg="": "")
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    _FakePyiCloud.auth_script = [_fail, _reject_401]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="No password entered"):
+        client.connect(interactive=True)
+    assert client.api._authenticate_calls == 2
+
+
+def test_stale_keyring_password_noninteractive_never_prompts(tmp_path, monkeypatch):
+    # The daemon shape of the stale-password scenario (keyring-sourced + real 401 cause,
+    # interactive=False): must stay a clean AuthError — never a prompt under launchd.
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: "stale-pw")
+
+    def _no_prompt(_msg: str = "") -> str:
+        raise AssertionError("the daemon must never prompt")
+
+    monkeypatch.setattr(ic_module.getpass, "getpass", _no_prompt)
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    _FakePyiCloud.auth_script = [_fail, _reject_401]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="rejected by Apple"):
+        client.connect(interactive=False)
+    assert client.api._authenticate_calls == 2
+
+
+def test_stale_env_password_noninteractive_names_variable(tmp_path, monkeypatch):
+    # Deliberate behavior change over pre-fallback code, pinned on purpose: the env-401
+    # message names the variable in BOTH modes (better daemon logs; behavior class —
+    # AuthError, no prompt, no hang — unchanged).
+    monkeypatch.setenv("IFOLDER_SYNC_PASSWORD", "stale-env")
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    _FakePyiCloud.auth_script = [_fail, _reject_401]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="IFOLDER_SYNC_PASSWORD"):
+        client.connect(interactive=False)
+
+
+def test_stale_then_typoed_prompt_stops_after_one_prompt(tmp_path, monkeypatch):
+    # The full anti-lockout bound, end to end: stale keyring 401 -> ONE prompt -> the
+    # prompted password is ALSO rejected -> AuthError. Exactly 3 SRP calls, exactly one
+    # prompt, and nothing stored in the Keychain on failure.
+    monkeypatch.setattr(ic_module, "get_password_from_keyring", lambda *a, **k: "stale-pw")
+    stored: list[tuple[str, str]] = []
+    monkeypatch.setattr(ic_module, "store_password_in_keyring", lambda u, p: stored.append((u, p)))
+    prompts = {"n": 0}
+
+    def _prompt(_msg: str = "") -> str:
+        prompts["n"] += 1
+        return "typo-pw"
+
+    monkeypatch.setattr(ic_module.getpass, "getpass", _prompt)
+
+    def _fail(api):
+        raise PyiCloudFailedLoginException("No password set")
+
+    _FakePyiCloud.auth_script = [_fail, _reject_401, _reject_401]
+
+    client = _client(tmp_path)
+    with pytest.raises(AuthError, match="rejected by Apple"):
+        client.connect(interactive=True)
+    assert prompts["n"] == 1
+    assert client.api._authenticate_calls == 3
+    assert stored == []
