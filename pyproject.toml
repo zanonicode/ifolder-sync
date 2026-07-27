@@ -41,7 +41,7 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "hypothesis>=6.0",
-    "ruff>=0.15,<0.16",
+    "ruff>=0.15,<0.17",
     "mypy>=1.0,<3",
     "shtab>=1.6",
     "pydantic>=2",
@@ -51,7 +51,7 @@ dev = [
 # lazy-imported inside method bodies, so the unit tests run on `dev` alone (pydantic);
 # only the ai-guardian workflow installs this extra.
 ai = [
-    "google-genai==2.10.0",
+    "google-genai==2.14.0",
     "pydantic>=2",
     "PyGithub>=2",
 ]
