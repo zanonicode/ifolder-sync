@@ -33,7 +33,7 @@ jobs:
         # checkout sets up only the PR ref; changed_diff() needs the origin/main ref to
         # exist or `git diff origin/main...HEAD` returns nothing and the Guardian skips.
         run: git fetch --no-tags origin main:refs/remotes/origin/main
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: python -m pip install -e ".[ai]"
